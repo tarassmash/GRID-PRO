@@ -627,8 +627,25 @@ def shift_grid(grid: dict, last: float, bid: float, ask: float) -> str:
         ladder = ladder_of(lower, upper, grid["count"], grid["tick"])
         qty = grid["qty"]
         orders = grid_orders(symbol, ladder, last, bid, ask, qty, mode)
-    # лоти пораховані до зняття старих ліміток: помилка розрахунку не лишить сітку порожньою
-    cancel_grid_orders(grid, "shift")
+    # лоти пораховані до зняття старих ліміток: помилка розрахунку не лишить сітку порожньою.
+    # Знімаються лише входи; тейки вже набраної позиції лишаються на біржі, доки не виконаються
+    # («сироти»: після виконання закривають свою частину позиції, нового входу не ставлять).
+    kept = 0
+    for level in grid["levels"]:
+        if level["status"] != "open":
+            continue
+        if is_take_level(level):
+            level["orphan"] = True
+            kept += 1
+            continue
+        try:
+            cancel_link(symbol, level["orderLinkId"])
+        except BybitError as exc:
+            log(f"зняти {symbol} {level['orderLinkId']}: {exc}")
+            continue
+        level["status"] = "done"
+        level["note"] = "shift"
+        time.sleep(0.08)
     grid["qty"] = qty
     # не нарощувати один бік: бік, що вже тримає маржа × плече, нових ліміток не отримує
     budget = grid["margin"] * grid["lev"]
@@ -650,8 +667,13 @@ def shift_grid(grid: dict, last: float, bid: float, ask: float) -> str:
     return (
         f"Грід {symbol} іде за ціною {'вгору' if last > (old_lo + old_hi) / 2 else 'вниз'}: "
         f"{old_lo:g}–{old_hi:g} → {lower:g}–{upper:g}, лімітів {placed}."
+        + (f" Тейків набраної позиції лишилось: {kept}." if kept else "")
         + (f" Без {'/'.join(skipped)}: позиція вже повна." if skipped else "")
     )
+
+
+def is_take_level(level: dict) -> bool:
+    return level.get("role") == "take" or (level.get("role") is None and bool(level.get("pair")))
 
 
 def watch_grid(grid: dict) -> list[str]:
@@ -692,13 +714,15 @@ def watch_grid(grid: dict) -> list[str]:
         fill_px = float(row.get("avgPrice") or level["price"])
         fill_qty = float(row.get("cumExecQty") or level["qty"])
         grid["fills"] = int(grid.get("fills") or 0) + 1
-        is_take = level.get("role") == "take" or (level.get("role") is None and bool(level.get("pair")))
+        is_take = is_take_level(level)
         if is_take:
             # тейк попереднього входу: один цикл сітки = один мікротейк
             gain = (fill_px - float(level["pair"])) * fill_qty * (1 if level["side"] == "Sell" else -1)
             grid["takes"] = int(grid.get("takes") or 0) + 1
             grid["profit"] = float(grid.get("profit") or 0) + gain
             notes.append(f"Мікротейк {symbol}: {level['side']} @ {fill_px:g} (від {float(level['pair']):g}), +{gain:.4f} USDT до комісій.")
+            if level.get("orphan"):
+                continue  # тейк зі старого діапазону: позицію закрито, нових входів поза сіткою не ставимо
         # протилежна лімітка на сусідній лінії, тим самим лотом
         if level["price"] in ladder:
             i = ladder.index(level["price"])
