@@ -26,6 +26,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import webbrowser
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -1000,6 +1001,161 @@ def scalp_params(symbol: str, margin: float, data: dict) -> dict:
     }
 
 
+# ---------------- пошук монет для нейтрального гріду на годину ----------------
+# Сенс: за останні 5 хв ціна ходить широко, але туди-сюди (малий зсув), а за останню годину — без тренду,
+# часто перетинає середину каналу і зараз не на краю. Такі монети найчастіше дають мікротейки в сітці.
+
+SCAN_LOCK = threading.Lock()
+SCAN_CACHE: dict = {"at": 0.0, "margin": None, "result": None}
+ALL_SPECS = {"at": 0.0}
+SCAN_MIN_TURNOVER = env_float("SCAN_MIN_TURNOVER", 5_000_000, 0, 1e12)   # USDT за 24 год
+SCAN_POOL = env_int("SCAN_POOL", 80, 10, 300)                            # скільки найліквідніших монет перевіряти
+
+
+def load_all_specs() -> None:
+    """Параметри всіх USDT-перпів одним запитом (раз на 30 хв): тік, крок кількості, мін. сума, макс. плече."""
+    if time.time() - ALL_SPECS["at"] < 1800:
+        return
+    cursor = ""
+    for _ in range(5):
+        query = {"category": "linear", "limit": "1000"}
+        if cursor:
+            query["cursor"] = cursor
+        res = bybit("/v5/market/instruments-info", query=query)
+        for row in res.get("list") or []:
+            sym = str(row.get("symbol") or "")
+            if not sym.endswith("USDT") or row.get("contractType") not in (None, "LinearPerpetual") or row.get("status") not in (None, "Trading"):
+                continue
+            try:
+                SPECS[sym] = {
+                    "tick": row["priceFilter"]["tickSize"], "qty": row["lotSizeFilter"]["qtyStep"],
+                    "min_qty": float(row["lotSizeFilter"].get("minOrderQty") or 0),
+                    "min_notional": float(row["lotSizeFilter"].get("minNotionalValue") or 5),
+                    "max_lev": float((row.get("leverageFilter") or {}).get("maxLeverage") or 20),
+                }
+            except (KeyError, TypeError, ValueError):
+                continue
+        cursor = res.get("nextPageCursor") or ""
+        if not cursor:
+            break
+    ALL_SPECS["at"] = time.time()
+
+
+def judge_coin(t: dict, margin: float) -> dict | None:
+    symbol = t["symbol"]
+    spec = SPECS.get(symbol)
+    if not spec:
+        return None
+    rows = candles(symbol, "1", 61)  # остання година хвилинками (+ поточна)
+    if len(rows) < 30:
+        return None
+    last = float(t.get("lastPrice") or rows[-1]["close"])
+    if last <= 0:
+        return None
+    # 5 хв: розмах і чистий зсув
+    r5 = rows[-5:]
+    hi5, lo5 = max(c["high"] for c in r5), min(c["low"] for c in r5)
+    range5 = (hi5 - lo5) / last * 100
+    first_open = rows[-6]["close"] if len(rows) >= 6 else r5[0]["low"]
+    net5 = abs(rows[-1]["close"] - first_open) / last * 100
+    er5 = min(1.0, net5 / range5) if range5 > 0 else 1.0
+    # година: розмах, зсув, перетини середини, де ціна зараз
+    hi60, lo60 = max(c["high"] for c in rows), min(c["low"] for c in rows)
+    range60 = (hi60 - lo60) / last * 100
+    net60 = abs(rows[-1]["close"] - rows[0]["close"]) / last * 100
+    er60 = min(1.0, net60 / range60) if range60 > 0 else 1.0
+    mid = (hi60 + lo60) / 2
+    signs = [1 if c["close"] >= mid else -1 for c in rows]
+    crosses = sum(1 for a, b in zip(signs, signs[1:]) if a != b)
+    pos = (last - lo60) / (hi60 - lo60) if hi60 > lo60 else 0.5
+    centre = 1 - abs(pos - 0.5) * 2  # 1 = посередині, 0 = на краю
+    # пробій: за останні 5 хв ціна вийшла за канал попередніх 55 хв — це тренд, а не хвиля всередині каналу
+    prev = rows[:-5]
+    phi, plo = max(c["high"] for c in prev), min(c["low"] for c in prev)
+    prng = phi - plo
+    breakout = prng > 0 and (last > phi + prng * 0.1 or last < plo - prng * 0.1)
+    # сітка на годину: канал години (без шпильок) із запасом 20%, але не вужча за 1.5 × 5-хв розмаху; ціна посередині
+    channel = (pct_rank([c["high"] for c in rows], 0.9) - pct_rank([c["low"] for c in rows], 0.1)) / last * 100
+    width_pct = max(channel * 1.2, range5 * 1.5)
+    width_pct = max(0.8, min(6.0, width_pct))
+    trs = [max(rows[i]["high"] - rows[i]["low"], abs(rows[i]["high"] - rows[i - 1]["close"]), abs(rows[i]["low"] - rows[i - 1]["close"]))
+           for i in range(max(1, len(rows) - 15), len(rows))]
+    atr1 = sum(trs) / len(trs) / last * 100 if trs else 0
+    step_pct = min(0.5, max(CFG.scalp_min_step, atr1 * 0.6))
+    count = int(round(width_pct / step_pct))
+    lev = int(max(3, min(20, int(spec["max_lev"]), round(15 / width_pct))))
+    min_n = spec.get("min_notional") or 5
+    fit = int(margin * lev // max(min_n * 1.05, spec["min_qty"] * last * 1.05))
+    count = max(6, min(count, 100, fit)) if fit >= 6 else 0
+    lower, upper = last * (1 - width_pct / 200), last * (1 + width_pct / 200)
+    step = (upper - lower) / count if count else 0
+    takes = sum(int((c["high"] - c["low"]) // step) for c in rows) // 2 if step > 0 else 0
+    # за 5 хв одна хвиля коливання схожа на тренд, тому зсув 5 хв має меншу вагу, ніж тренд години й пробій
+    score = range5 * (1 - 0.5 * er5) * (1 - 0.7 * er60) * (0.5 + 0.5 * centre) * (1 + min(crosses, 20) / 20)
+    if breakout:
+        score *= 0.2
+    strict = range5 >= 0.2 and not breakout and er5 <= 0.85 and er60 <= 0.55 and centre >= 0.2 and count > 0
+    tick = spec["tick"]
+    return {
+        "symbol": symbol, "last": last, "turnover": float(t.get("turnover24h") or 0),
+        "range5": round(range5, 3), "net5": round(net5, 3), "trend5": round(er5 * 100),
+        "range60": round(range60, 3), "trend60": round(er60 * 100), "crosses": crosses, "pos": round(pos * 100),
+        "breakout": breakout,
+        "score": round(score, 4), "strict": strict,
+        "lower": align(lower, tick, False), "upper": align(upper, tick, True), "count": count, "leverage": lev,
+        "widthPct": round(width_pct, 2), "stepPct": round(width_pct / count, 3) if count else 0,
+        "profitPct": round((width_pct / count - 0.04) if count else 0, 3), "takesHour": takes,
+        "fit": fit,
+    }
+
+
+def scan_coins(data: dict) -> dict:
+    margin = parse_num(data.get("margin") or 20, "Маржа", 1, 1000000)
+    with SCAN_LOCK:
+        cached = SCAN_CACHE["result"]
+        if cached and time.time() - SCAN_CACHE["at"] < 20 and SCAN_CACHE["margin"] == margin:
+            return cached
+        started = time.time()
+        load_all_specs()
+        tickers = bybit("/v5/market/tickers", query={"category": "linear"}).get("list") or []
+        skip = ("USDCUSDT", "USDEUSDT", "FDUSDUSDT", "DAIUSDT", "TUSDUSDT")
+        pool = [
+            t for t in tickers
+            if str(t.get("symbol", "")).endswith("USDT") and t["symbol"] not in skip and t["symbol"] in SPECS
+            and float(t.get("turnover24h") or 0) >= SCAN_MIN_TURNOVER and float(t.get("lastPrice") or 0) > 0
+        ]
+        pool.sort(key=lambda t: float(t.get("turnover24h") or 0), reverse=True)
+        pool = pool[:SCAN_POOL]
+        found: list[dict] = []
+        errors = 0
+
+        def one(t: dict):
+            try:
+                return judge_coin(t, margin)
+            except BybitError:
+                return "err"
+
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            for res in ex.map(one, pool):
+                if res == "err":
+                    errors += 1
+                elif res:
+                    found.append(res)
+        strict = sorted([c for c in found if c["strict"]], key=lambda c: -c["score"])
+        relaxed = not strict
+        top = (strict or sorted([c for c in found if c["count"] > 0], key=lambda c: -c["score"]))[:12]
+        with LOCK:
+            busy = {g["symbol"] for g in STATE["grids"] if g["status"] == "active"}
+        for c in top:
+            c["busy"] = c["symbol"] in busy
+        result = {
+            "coins": top, "checked": len(found), "pool": len(pool), "errors": errors, "relaxed": relaxed,
+            "margin": margin, "sec": round(time.time() - started, 1), "at": int(time.time()),
+        }
+        SCAN_CACHE.update({"at": time.time(), "margin": margin, "result": result})
+        return result
+
+
 def price_of(symbol) -> dict:
     symbol = parse_symbol(symbol)
     spec = spec_of(symbol)
@@ -1225,6 +1381,7 @@ def serve() -> None:
             routes = {
                 "/api/auto": lambda: auto_params(data),
                 "/api/price": lambda: price_of(data.get("symbol")),
+                "/api/scan": lambda: scan_coins(data),
                 "/api/chart": lambda: chart_data(data.get("symbol"), data.get("interval")),
                 "/api/trades": lambda: recent_trades(data.get("symbol")),
                 "/api/preview": lambda: preview(data),
