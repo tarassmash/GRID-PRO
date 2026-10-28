@@ -26,6 +26,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import webbrowser
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -673,6 +674,92 @@ def shift_grid(grid: dict, last: float, bid: float, ask: float) -> str:
     )
 
 
+# ---------------- захист від пампів ----------------
+# 1) Детектор: ціна виросла на pct% за останні 60 с → знімаються всі Sell-входи (тейки лишаються),
+#    нові Sell і зсув сітки на паузі pauseMin хв; після паузи сітка відновлюється від нової ціни.
+# 2) Стоп на біржі над сіткою: стоп позиції не вище upper × (1 + stopAbove%) — спрацьовує на біржі миттєво.
+# 3) Пошук і автопілот не беруть монети з пампами (хвилинний сплеск ≥ pct% за годину або +20% за добу).
+# 4) closeOnPump — закривати позицію ринком одразу при пампі (за замовчуванням вимкнено).
+
+PUMP_DEFAULT = {
+    "pct": env_float("PUMP_PCT", 1.5, 0, 50), "pauseMin": env_int("PUMP_PAUSE_MIN", 15, 1, 240),
+    "stopAbove": env_float("PUMP_STOP_ABOVE", 3.0, 0, 50), "closeOnPump": False,
+}
+PUMP_WINDOW = 60
+PRICES: dict[str, deque] = {}
+
+
+def pump_cfg() -> dict:
+    cfg = STATE.setdefault("pump", {})
+    for k, v in PUMP_DEFAULT.items():
+        cfg.setdefault(k, v)
+    return cfg
+
+
+def pump_set(data: dict) -> dict:
+    cfg = pump_cfg()
+    pct = parse_num(data.get("pct", cfg["pct"]), "Памп: ріст за хвилину, %", 0, 50)
+    pause = int(parse_num(data.get("pauseMin", cfg["pauseMin"]), "Пауза після пампу, хв", 1, 240, integer=True))
+    above = parse_num(data.get("stopAbove", cfg["stopAbove"]), "Стоп над сіткою, %", 0, 50)
+    cfg.update({"pct": pct, "pauseMin": pause, "stopAbove": above, "closeOnPump": bool(data.get("closeOnPump", cfg["closeOnPump"]))})
+    with LOCK:
+        save_state()
+    add_event(f"🛡 Захист від пампів: поріг +{pct:g}%/хв, пауза {pause} хв, стоп +{above:g}% над сіткою, "
+              f"{'закривати позицію при пампі' if cfg['closeOnPump'] else 'позицію не закривати'}.")
+    return dict(cfg)
+
+
+def pump_check(grid: dict, last: float, now: float) -> str:
+    cfg = pump_cfg()
+    if cfg["pct"] <= 0 or last <= 0:
+        return ""
+    dq = PRICES.setdefault(grid["id"], deque())
+    dq.append((now, last))
+    while dq and dq[0][0] < now - PUMP_WINDOW:
+        dq.popleft()
+    t_low, low = min(dq, key=lambda x: x[1])
+    if low > 0 and last >= low * (1 + cfg["pct"] / 100):
+        dq.clear()
+        dq.append((now, last))
+        return f"+{(last / low - 1) * 100:.2f}% за {max(1, int(now - t_low))} с"
+    return ""
+
+
+def pump_trigger(grid: dict, hit: str) -> list[str]:
+    cfg = pump_cfg()
+    now = time.time()
+    symbol = grid["symbol"]
+    again = float(grid.get("pumpUntil") or 0) > now
+    grid["pumpUntil"] = now + cfg["pauseMin"] * 60
+    if not again:
+        grid["pumps"] = int(grid.get("pumps") or 0) + 1
+    removed = 0
+    for level in grid["levels"]:
+        if level["status"] != "open" or level["side"] != "Sell" or is_take_level(level):
+            continue
+        try:
+            cancel_link(symbol, level["orderLinkId"])
+        except BybitError as exc:
+            log(f"памп {symbol} {level['orderLinkId']}: {exc}")
+            continue
+        level["status"] = "done"
+        level["note"] = "pump"
+        removed += 1
+    head = f"🚀 ПАМП {symbol} {hit}{' — триває' if again else ''}: знято {removed} Sell-входів"
+    if cfg["closeOnPump"]:
+        grid["pumpClose"] = True
+        return [head + ", закриваю позицію ринком."]
+    stop = cfg["stopAbove"]
+    return [head + f"; нові Sell і зсув сітки на паузі {cfg['pauseMin']} хв. Тейки лишились."
+            + (f" Стоп на біржі: +{stop:g}% над сіткою ({grid['upper'] * (1 + stop / 100):g})." if stop > 0 else "")]
+
+
+def pump_cooldown(grid: dict) -> None:
+    """Сітка автопілота закрита пампом/стопом — монету автопілот 2 год не бере."""
+    if grid.get("auto"):
+        auto_cfg().setdefault("cooldown", {})[grid["symbol"]] = time.time() + AUTO_COOLDOWN_SEC
+
+
 def is_take_level(level: dict) -> bool:
     return level.get("role") == "take" or (level.get("role") is None and bool(level.get("pair")))
 
@@ -686,7 +773,22 @@ def watch_grid(grid: dict) -> list[str]:
     ask = float(live.get("ask1Price") or last)
     grid["last"] = last
     now = time.time()
-    if last > grid["upper"] or last < grid["lower"]:
+    if (grid.get("mode") or "both") != "buy":
+        hit = pump_check(grid, last, now)
+        if hit:
+            notes.extend(pump_trigger(grid, hit))
+            if grid.get("pumpClose"):
+                return notes
+    paused = float(grid.get("pumpUntil") or 0) > now
+    if not paused and grid.get("pumpUntil"):
+        # пауза після пампу скінчилась — сітка відновлюється від нової ціни (тейки набраного шорту лишаються)
+        grid["pumpUntil"] = 0
+        grid["outSince"] = None
+        notes.append("Пауза після пампу закінчилась. " + shift_grid(grid, last, bid, ask))
+        return notes
+    if paused:
+        grid["outSince"] = None
+    elif last > grid["upper"] or last < grid["lower"]:
         if not grid.get("outSince"):
             grid["outSince"] = now
             if grid.get("trail"):
@@ -724,6 +826,8 @@ def watch_grid(grid: dict) -> list[str]:
             notes.append(f"Мікротейк {symbol}: {level['side']} @ {fill_px:g} (від {float(level['pair']):g}), +{gain:.4f} USDT до комісій.")
             if level.get("orphan"):
                 continue  # тейк зі старого діапазону: позицію закрито, нових входів поза сіткою не ставимо
+            if paused:
+                continue  # пауза після пампу: повторний Sell не ставимо, сітка відновиться після паузи
         # протилежна лімітка на сусідній лінії, тим самим лотом
         if level["price"] in ladder:
             i = ladder.index(level["price"])
@@ -866,25 +970,29 @@ def stop_grid(grid_id: str, close: bool) -> str:
 def guard() -> list[str]:
     """Критичний стоп-лос лише для монет з живими сітками: стоп на біржі + програмна перевірка."""
     notes: list[str] = []
-    if CFG.sl_roi <= 0:
+    above = pump_cfg()["stopAbove"]
+    if CFG.sl_roi <= 0 and above <= 0:
         return notes
     with LOCK:
         active = {g["symbol"]: g for g in STATE["grids"] if g["status"] == "active"}
     if not active:
         return notes
     r = CFG.sl_roi / 100
+    seen: set[str] = set()
     for p in positions():
         symbol = p["symbol"]
         grid = active.get(symbol)
         if not grid:
             continue
+        seen.add(symbol)
+        grid["hadPos"] = True
         size = float(p.get("size") or 0)
         avg = float(p.get("avgPrice") or 0)
         lev = float(p.get("leverage") or 0) or float(grid.get("lev") or 1)
         upnl = float(p.get("unrealisedPnl") or 0)
         margin = avg * size / lev if lev > 0 else avg * size
         roi = upnl / margin * 100 if margin > 0 else 0.0
-        if roi <= -CFG.sl_roi:
+        if CFG.sl_roi > 0 and roi <= -CFG.sl_roi:
             with GRID_LOCK:
                 cancel_grid_orders(grid, "stoploss")
                 try:
@@ -894,29 +1002,66 @@ def guard() -> list[str]:
                     continue
                 finish_grid(grid, "stoploss")
             notes.append(f"СТОП-ЛОС {roi:.0f}% від маржі {symbol}: ліміти знято, позицію закрито ({closed}).")
+            pump_cooldown(grid)
             continue
         long = p.get("side") == "Buy"
-        raw = avg * (1 - r / lev) if long else avg * (1 + r / lev)
-        if raw <= 0 or avg <= 0:
+        cands = []
+        if CFG.sl_roi > 0:
+            cands.append(avg * (1 - r / lev) if long else avg * (1 + r / lev))
+        if not long and above > 0 and (grid.get("mode") or "both") != "buy":
+            cands.append(grid["upper"] * (1 + above / 100))  # стоп над сіткою: швидкий памп закриває шорт на біржі
+        if not cands or avg <= 0:
+            continue
+        raw = max(cands) if long else min(cands)
+        if raw <= 0:
+            continue
+        mark = float(p.get("markPrice") or 0)
+        if mark > 0 and ((not long and mark >= raw) or (long and mark <= raw)):
+            # ціна вже за стопом (біржа такий стоп не прийме) — закриваємо програмно
+            with GRID_LOCK:
+                cancel_grid_orders(grid, "stoploss")
+                try:
+                    closed = close_position(symbol)
+                except BybitError as exc:
+                    notes.append(f"СТОП {symbol}: не вдалося закрити ({exc}), повторюю.")
+                    continue
+                finish_grid(grid, "stoploss")
+            notes.append(f"🛡 СТОП {symbol}: ціна {mark:g} за стопом {raw:g} — ліміти знято, позицію закрито ({closed}).")
+            pump_cooldown(grid)
             continue
         tick = spec_of(symbol)["tick"]
         price = align(raw, tick, not long)
         current = float(p.get("stopLoss") or 0)
         if current and abs(current - float(price)) <= float(tick) * 1.5:
+            grid["slPx"] = float(price)
             continue
         try:
             bybit("/v5/position/trading-stop", "POST", body={
                 "category": "linear", "symbol": symbol, "stopLoss": price, "slTriggerBy": "MarkPrice",
                 "tpslMode": "Full", "positionIdx": int(p.get("positionIdx") or 0),
             }, auth=True)
-            log(f"стоп {symbol} {p.get('side')} -> {price} (-{CFG.sl_roi:.0f}% від маржі)")
+            grid["slPx"] = float(price)
+            log(f"стоп {symbol} {p.get('side')} -> {price}")
         except BybitError as exc:
             if "not modified" in str(exc).lower() or exc.code == 34040:
+                grid["slPx"] = float(price)
                 continue
             key = f"{symbol}:{price}"
             if grid.get("slErr") != key:
                 grid["slErr"] = key
                 notes.append(f"{symbol}: біржа не прийняла стоп {price} ({exc}). Програмний стоп працює, але краще зменшити плече.")
+    # позиція зникла біля ціни стопу — спрацював стоп на біржі: зупинити сітку, щоб вона не відкрила шорт знову
+    for symbol, grid in active.items():
+        if symbol in seen or not grid.get("hadPos"):
+            continue
+        grid["hadPos"] = False
+        sl, last = float(grid.get("slPx") or 0), float(grid.get("last") or 0)
+        if sl > 0 and last > 0 and last >= sl * 0.997:
+            with GRID_LOCK:
+                cancel_grid_orders(grid, "stoploss")
+                finish_grid(grid, "stoploss")
+            notes.append(f"🛡 Спрацював стоп на біржі {symbol} ({sl:g}): сітку зупинено, лімітки знято.")
+            pump_cooldown(grid)
     return notes
 
 
@@ -1126,13 +1271,22 @@ def judge_coin(t: dict, margin: float) -> dict | None:
     up_break = breakout and last > phi
     if breakout:
         score *= 0.05 if up_break else 0.3
-    strict = range5 >= 0.2 and not breakout and er5 <= 0.85 and er60 <= 0.55 and centre >= 0.2 and count > 0
+    # пампи: найбільший хвилинний ривок угору за годину і ріст за добу — такі монети під шорт не беремо
+    max_up1 = max(((c["high"] - p["close"]) / p["close"] * 100 for p, c in zip(rows, rows[1:]) if p["close"] > 0), default=0.0)
+    ch24 = float(t.get("price24hPcnt") or 0) * 100
+    pump_pct = pump_cfg()["pct"] or 1.5
+    pumpy = max_up1 >= pump_pct or ch24 >= 20
+    if pumpy:
+        score *= 0.05
+    strict = (range5 >= 0.2 and not breakout and not pumpy and er5 <= 0.85 and er60 <= 0.55
+              and centre >= 0.2 and count > 0)
     tick = spec["tick"]
     return {
         "symbol": symbol, "last": last, "turnover": float(t.get("turnover24h") or 0),
         "range5": round(range5, 3), "net5": round(net5, 3), "trend5": round(er5 * 100),
         "range60": round(range60, 3), "trend60": round(er60 * 100), "crosses": crosses, "pos": round(pos * 100),
         "breakout": breakout, "upBreak": up_break, "up60": up60,
+        "pumpy": pumpy, "maxUp1": round(max_up1, 2), "ch24": round(ch24, 1),
         "score": round(score, 4), "strict": strict,
         "lower": align(lower, tick, False), "upper": align(upper, tick, True), "count": count, "leverage": lev,
         "widthPct": round(width_pct, 2), "stepPct": round(width_pct / count, 3) if count else 0,
@@ -1325,7 +1479,7 @@ def chart_data(symbol, interval) -> dict:
 # ---------------- цикл ----------------
 
 def loop() -> None:
-    """Кожні POLL_SEC секунд: виконання ліміток → протилежна лімітка; раз на ~10 с — стоп-лос."""
+    """Кожні POLL_SEC секунд: виконання ліміток → протилежна лімітка, детектор пампу; раз на ~3 с — стоп-лос."""
     last_guard = 0.0
     while not STOP.is_set():
         HEART["tick"] = time.time()
@@ -1338,9 +1492,13 @@ def loop() -> None:
                     with GRID_LOCK:
                         if grid["status"] == "active":
                             notes.extend(watch_grid(grid))
+                    if grid.get("pumpClose") and grid["status"] == "active":
+                        grid["pumpClose"] = False
+                        notes.append(emergency_close(grid, quiet=True))
+                        pump_cooldown(grid)
                 except Exception as exc:  # noqa: BLE001 — одна монета не зупиняє інші
                     log(f"{grid['symbol']}: {exc}")
-            if grids and time.time() - last_guard >= 10:
+            if grids and time.time() - last_guard >= 3:
                 last_guard = time.time()
                 try:
                     notes.extend(guard())
@@ -1391,6 +1549,8 @@ def grid_rows() -> list[dict]:
             "fills": g.get("fills") or 0, "takes": g.get("takes") or 0, "profit": round(float(g.get("profit") or 0), 6),
             "shifts": g.get("shifts") or 0, "out": bool(g.get("outSince")), "created": g.get("created"),
             "geo": bool(g.get("geo")), "geoMult": g.get("geoMult"), "mode": g.get("mode") or "both", "auto": bool(g.get("auto")),
+            "pauseIn": max(0, int(float(g.get("pumpUntil") or 0) - time.time())), "pumps": int(g.get("pumps") or 0),
+            "slPx": g.get("slPx"),
             "stepPct": round(((g["upper"] / g["lower"]) ** (1 / g["count"]) - 1) * 100, 3) if g.get("geo") else None,
         })
     return rows
@@ -1501,11 +1661,14 @@ def coin_turned_up(symbol: str, margin: float) -> str:
     """Порожній рядок — монета ще годиться під Sell; інакше — причина закрити."""
     load_all_specs()
     t = ticker(symbol)
-    c = judge_coin({"symbol": symbol, "lastPrice": t.get("lastPrice"), "turnover24h": t.get("turnover24h")}, margin)
+    c = judge_coin({"symbol": symbol, "lastPrice": t.get("lastPrice"), "turnover24h": t.get("turnover24h"),
+                    "price24hPcnt": t.get("price24hPcnt")}, margin)
     if not c:
         return ""
     if c["upBreak"]:
         return f"{symbol} пробив годинний канал угору."
+    if c["pumpy"]:
+        return f"{symbol}: пампи (ривок +{c['maxUp1']}% за хвилину, за добу {c['ch24']:+}%)."
     if c["up60"] and c["trend60"] >= 55:
         return f"{symbol} росте: тренд години {c['trend60']}% угору."
     return ""
@@ -1572,7 +1735,7 @@ def snapshot() -> dict:
         "env": CFG.env, "keys": bool(CFG.api_key and CFG.api_secret), "slRoi": CFG.sl_roi,
         "loopAgo": int(time.time() - HEART["tick"]) if HEART["tick"] else -1,
         "upMin": int((time.time() - HEART["started"]) // 60),
-        "grids": grid_rows(), "events": events, "auto": auto_status(),
+        "grids": grid_rows(), "events": events, "auto": auto_status(), "pump": dict(pump_cfg()),
         "account": {k: ACCOUNT[k] for k in ("equity", "available", "positions", "error")},
     }
 
@@ -1622,6 +1785,7 @@ def serve() -> None:
                 "/api/scan": lambda: scan_coins(data),
                 "/api/sellplan": lambda: sell_plan(data),
                 "/api/autopilot": lambda: autopilot_set(data),
+                "/api/pump": lambda: pump_set(data),
                 "/api/chart": lambda: chart_data(data.get("symbol"), data.get("interval")),
                 "/api/trades": lambda: recent_trades(data.get("symbol")),
                 "/api/preview": lambda: preview(data),
