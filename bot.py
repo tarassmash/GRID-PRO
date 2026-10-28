@@ -214,6 +214,11 @@ def bybit(path: str, method: str = "GET", query: dict | None = None, body: dict 
         low = full.lower()
         if exc.code == 403 and ("country" in low or "cloudfront" in low or low.lstrip().startswith("<")):
             raise BybitError("Bybit блокує країну сервера (HTTP 403). Railway → сервіс → Settings → Deploy → Regions: оберіть EU West (Amsterdam) або Southeast Asia (Singapore), не US, і перезапустіть.") from exc
+        if exc.code == 401:
+            raise BybitError(
+                f"Bybit не прийняв ключ (HTTP 401) на {CFG.env}. Перевірте: BYBIT_ENV = mainnet чи testnet під ваш ключ; "
+                "ключ і секрет без пробілів; ключ без прив'язки до IP або з IP цього сервера."
+            ) from exc
         raise BybitError(f"HTTP {exc.code} {detail}".strip()) from exc
     except urllib.error.URLError as exc:
         raise BybitError(f"мережа: {exc.reason}") from exc
