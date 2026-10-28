@@ -285,6 +285,40 @@ def instrument(symbol: str) -> dict:
     }
 
 
+# ---------------- комісія і мінімальний крок ----------------
+# Тейк (крок сітки) завжди ≥ TAKE_FEE_MULT × комісія циклу (вхід + тейк, обидва мейкер).
+# Ставка мейкера — з рахунку Bybit (з урахуванням VIP), інакше стандартна 0.02%.
+TAKE_FEE_MULT = env_float("TAKE_FEE_MULT", 10, 1, 100)
+DEFAULT_MAKER = 0.0002
+FEES: dict = {"at": 0.0, "map": {}}
+
+
+def maker_fee(symbol: str) -> float:
+    if CFG.api_key and CFG.api_secret and time.time() - FEES["at"] > 3600:
+        FEES["at"] = time.time()
+        try:
+            res = bybit("/v5/account/fee-rate", query={"category": "linear"}, auth=True)
+            FEES["map"] = {r.get("symbol"): float(r.get("makerFeeRate") or 0) for r in res.get("list") or [] if r.get("symbol")}
+        except (BybitError, TypeError, ValueError) as exc:
+            log(f"комісія: {exc} — беру {DEFAULT_MAKER * 100:g}%")
+    fee = FEES["map"].get(symbol, 0)
+    return fee if fee > 0 else DEFAULT_MAKER  # від'ємна/нульова (ребейт) — рахуємо як стандартну, із запасом
+
+
+def min_step(symbol: str) -> float:
+    """Мінімальний крок сітки, частка ціни: TAKE_FEE_MULT × (мейкер вхід + мейкер тейк)."""
+    return TAKE_FEE_MULT * 2 * maker_fee(symbol)
+
+
+def max_lines(lower: float, upper: float, geo: bool, step_min: float) -> int:
+    """Скільки сіток вміщається в діапазон, щоб крок (у % від ціни) був ≥ step_min."""
+    if upper <= lower or step_min <= 0:
+        return 0
+    if geo:
+        return int(math.log(upper / lower) / math.log(1 + step_min) + 1e-9)
+    return int((upper - lower) / (upper * step_min) + 1e-9)  # найменший % кроку — біля верхньої межі
+
+
 def spec_of(symbol: str) -> dict:
     if symbol not in SPECS:
         SPECS[symbol] = instrument(symbol)
@@ -508,8 +542,22 @@ def geo_sizes(orders: list[dict], ladder: list[str], last: float, budget: float,
     return f"{qtys[0]:g}–{qtys[-1]:g}" if qtys[0] != qtys[-1] else f"{qtys[0]:g}"
 
 
+def fit_count(symbol: str, lower: float, upper: float, count: int, geo: bool) -> int:
+    """Кількість сіток, зменшена так, щоб тейк був ≥ TAKE_FEE_MULT × комісії."""
+    step_min = min_step(symbol)
+    limit = max_lines(lower, upper, geo, step_min)
+    if limit < 2:
+        need = (upper * step_min * 2) if not geo else lower * ((1 + step_min) ** 2 - 1)
+        raise BybitError(
+            f"Діапазон завузький: щоб тейк був ≥ {TAKE_FEE_MULT:g}× комісії, крок має бути ≥ {step_min * 100:.2f}%, "
+            f"тобто ширина діапазону має бути не менше {need:.6g} (зараз {upper - lower:.6g})."
+        )
+    return min(count, limit)
+
+
 def build(symbol: str, lower: float, upper: float, count: int, margin: float, lev: int, geo: bool, mult: float,
           spec: dict, last: float, bid: float, ask: float, mode: str = "both") -> tuple[list[str], list[dict], str]:
+    """Кількість сіток уже має пройти fit_count (preview і start_grid роблять це самі)."""
     ladder = ladder_of(lower, upper, count, spec["tick"], geo)
     if geo:
         orders = grid_orders(symbol, ladder, last, bid, ask, "0", mode)
@@ -533,12 +581,17 @@ def preview(data: dict) -> dict:
     live = ticker(prm["symbol"])
     last = float(live["lastPrice"])
     lev = min(prm["lev"], int(spec["max_lev"]))
+    wanted = prm["count"]
+    prm["count"] = fit_count(prm["symbol"], prm["lower"], prm["upper"], wanted, prm["geo"])
     _, orders, qty = build(prm["symbol"], prm["lower"], prm["upper"], prm["count"], prm["margin"], lev, prm["geo"],
                            prm["geoMult"], spec, last, float(live.get("bid1Price") or last), float(live.get("ask1Price") or last), prm["mode"])
     step = (prm["upper"] - prm["lower"]) / prm["count"]
-    fee = 0.0002 * 2  # мейкер з обох боків
+    fee = 2 * maker_fee(prm["symbol"])  # мейкер з обох боків
     out = {
         "symbol": prm["symbol"], "last": last, "lev": lev, "qty": qty, "step": step, "geo": prm["geo"], "mode": prm["mode"],
+        "count": prm["count"], "countWanted": wanted, "feePct": round(fee * 100, 4),
+        "minStepPct": round(min_step(prm["symbol"]) * 100, 3), "feeMult": TAKE_FEE_MULT,
+        "stepPct": round(step / prm["upper"] * 100, 3),
         "buys": sum(1 for o in orders if o["side"] == "Buy"), "sells": sum(1 for o in orders if o["side"] == "Sell"),
         "profitLow": round((step / prm["upper"] - fee) * 100, 3), "profitHigh": round((step / prm["lower"] - fee) * 100, 3),
         "inside": prm["lower"] < last < prm["upper"],
@@ -555,9 +608,25 @@ def preview(data: dict) -> dict:
 
 
 def place_counter(symbol: str, order: dict, bid: float, ask: float) -> None:
-    """PostOnly; якщо ціна вже перетнула лінію — GTC, щоб мікротейк не пропав."""
-    cross = (order["side"] == "Sell" and float(order["price"]) <= ask) or (order["side"] == "Buy" and float(order["price"]) >= bid)
-    place_limit(symbol, order, post_only=not cross)
+    """Завжди мейкер (PostOnly), щоб комісія не з'їла тейк. Якщо ціна вже перетнула лінію — лімітка стає на найкращу
+    ціну стакану (Buy — на bid, Sell — на ask): це мейкер і навіть вигідніше за лінію. Лише якщо біржа двічі
+    відхилила PostOnly — GTC на лінії, щоб тейк не пропав."""
+    side = order["side"]
+    tick = spec_of(symbol)["tick"]
+    for attempt in range(2):
+        cross = (side == "Sell" and float(order["price"]) <= ask) or (side == "Buy" and float(order["price"]) >= bid)
+        if cross:
+            order["price"] = align(bid, tick, False) if side == "Buy" else align(ask, tick, True)
+            order["orderLinkId"] = link_id(symbol, side, order["price"])
+        try:
+            place_limit(symbol, order, post_only=True)
+            return
+        except BybitError as exc:
+            log(f"PostOnly {symbol} {side} {order['price']}: {exc}")
+            live = ticker(symbol)
+            last = float(live["lastPrice"])
+            bid, ask = float(live.get("bid1Price") or last), float(live.get("ask1Price") or last)
+    place_limit(symbol, order, post_only=False)
 
 
 def start_grid(data: dict) -> str:
@@ -573,6 +642,8 @@ def start_grid(data: dict) -> str:
     bid = float(live.get("bid1Price") or last)
     ask = float(live.get("ask1Price") or last)
     lev = min(prm["lev"], int(spec["max_lev"]))
+    wanted = prm["count"]
+    prm["count"] = fit_count(symbol, prm["lower"], prm["upper"], wanted, prm["geo"])
     ladder, orders, qty = build(symbol, prm["lower"], prm["upper"], prm["count"], prm["margin"], lev,
                                 prm["geo"], prm["geoMult"], spec, last, bid, ask, prm["mode"])
     if not orders:
@@ -607,6 +678,8 @@ def start_grid(data: dict) -> str:
     lots = f", геометрична (лот ×{prm['geoMult']:g}, {qty})" if prm["geo"] else f", лот {qty}"
     side = f", {MODES[prm['mode']]}" if prm["mode"] != "both" else ""
     text = f"Грід {symbol}: {prm['lower']:g}–{prm['upper']:g}, {prm['count']} сіток{side}{lots}, Buy {buys} / Sell {len(opened) - buys}, x{lev}"
+    if prm["count"] < wanted:
+        text += f" (сіток зменшено з {wanted}: тейк ≥ {TAKE_FEE_MULT:g}× комісії, крок ≥ {min_step(symbol) * 100:.2f}%)"
     add_event(text)
     return text
 
@@ -1098,7 +1171,8 @@ def auto_params(data: dict) -> dict:
     width_pct = width / last * 100
     trs = [max(m5[i]["high"] - m5[i]["low"], abs(m5[i]["high"] - m5[i - 1]["close"]), abs(m5[i]["low"] - m5[i - 1]["close"])) for i in range(1, len(m5))]
     atr_pct = sum(trs[-14:]) / 14 / last * 100
-    step_pct = min(1.0, max(0.15, atr_pct * 0.5))
+    step_floor = min_step(symbol) * 100
+    step_pct = max(step_floor, min(1.0, atr_pct * 0.5))
     count = int(round(width_pct / step_pct))
     lev = int(max(2, min(25, int(spec["max_lev"]), round(20 / max(width_pct, 0.5)))))
     if str(data.get("leverage") or "").strip():
@@ -1107,7 +1181,7 @@ def auto_params(data: dict) -> dict:
     fit = int(margin * lev // max(min_n * 1.05, spec["min_qty"] * last * 1.05))
     if fit < 4:
         raise BybitError(f"Замало маржі для {symbol}: {margin:g} USDT × x{lev} вистачає лише на {fit} ліміток по мін. {min_n:g} USDT")
-    count = max(4, min(count, 100, fit))
+    count = max(2, min(count, 100, fit, max_lines(lower, upper, False, step_floor / 100)))
     step = width / count
     takes = sum(int((c["high"] - c["low"]) // step) for c in m5) // 2
     tick = spec["tick"]
@@ -1116,10 +1190,10 @@ def auto_params(data: dict) -> dict:
         "lower": align(lower, tick, False), "upper": align(upper, tick, True),
         "count": count, "leverage": lev, "margin": margin, "trail": True, "shiftMin": 0,
         "widthPct": round(width_pct, 2), "atrPct": round(atr_pct, 3), "stepPct": round(step / last * 100, 3),
-        "profitPct": round((step / upper - 0.0004) * 100, 3), "takes12h": takes,
+        "profitPct": round((step / upper - 2 * maker_fee(symbol)) * 100, 3), "takes12h": takes,
         "why": (
             f"Канал за 24 год без шпильок: {width_pct:.2f}%. Волатильність 5 хв (ATR): {atr_pct:.3f}%. "
-            f"Крок {step / last * 100:.3f}% ≈ половина 5-хв руху — лінії перетинаються часто, але крок вищий за комісії. "
+            f"Крок {step / last * 100:.3f}% ≈ половина 5-хв руху, але не менше {step_floor:.2f}% ({TAKE_FEE_MULT:g}× комісії). "
             f"Плече x{lev} під ширину каналу. Сітка йде за ціною одразу."
         ),
     }
@@ -1139,7 +1213,8 @@ def scalp_params(symbol: str, margin: float, data: dict) -> dict:
     lower, upper = last * (1 - width_pct / 200), last * (1 + width_pct / 200)
     trs = [max(m1[i]["high"] - m1[i]["low"], abs(m1[i]["high"] - m1[i - 1]["close"]), abs(m1[i]["low"] - m1[i - 1]["close"])) for i in range(1, len(m1))]
     atr1_pct = sum(trs[-30:]) / 30 / last * 100
-    step_pct = min(0.4, max(CFG.scalp_min_step, atr1_pct * 0.7))
+    step_floor = max(CFG.scalp_min_step, min_step(symbol) * 100)
+    step_pct = max(step_floor, min(0.4, atr1_pct * 0.7))
     count = int(round(width_pct / step_pct))
     lev = int(max(3, min(20, int(spec["max_lev"]), round(15 / width_pct))))
     if str(data.get("leverage") or "").strip():
@@ -1151,7 +1226,7 @@ def scalp_params(symbol: str, margin: float, data: dict) -> dict:
             f"Для скальпінгу на {symbol} замало маржі: {margin:g} USDT × x{lev} вистачає лише на {fit} ліміток по мін. {min_n:g} USDT. "
             f"Потрібно хоча б ~{math.ceil(min_n * 1.05 * 12 / lev):g} USDT маржі."
         )
-    count = max(6, min(count, 100, fit))
+    count = max(2, min(count, 100, fit, max_lines(lower, upper, False, step_floor / 100)))
     step = (upper - lower) / count
     tick = spec["tick"]
     if step < float(tick) * 3:
@@ -1162,10 +1237,10 @@ def scalp_params(symbol: str, margin: float, data: dict) -> dict:
         "lower": align(lower, tick, False), "upper": align(upper, tick, True),
         "count": count, "leverage": lev, "margin": margin, "trail": True, "shiftMin": 0,
         "widthPct": round(width_pct, 2), "atrPct": round(atr1_pct, 3), "stepPct": round(step / last * 100, 3),
-        "profitPct": round((step / upper - 0.0004) * 100, 3), "takes12h": takes, "takesWindow": "2 год",
+        "profitPct": round((step / upper - 2 * maker_fee(symbol)) * 100, 3), "takes12h": takes, "takesWindow": "2 год",
         "why": (
             f"Скальпінг: вузький канал {width_pct:.2f}% навколо ціни (за 4 год). Рух за 1 хв: {atr1_pct:.3f}%. "
-            f"Крок {step / last * 100:.3f}% (≈70% хвилинного руху, не менше {CFG.scalp_min_step:g}%). "
+            f"Крок {step / last * 100:.3f}% (≈70% хвилинного руху, не менше {step_floor:.2f}% — {TAKE_FEE_MULT:g}× комісії). "
             f"{count} ліній, плече x{lev}, сітка йде за ціною одразу."
         ),
     }
@@ -1251,14 +1326,17 @@ def judge_coin(t: dict, margin: float) -> dict | None:
     trs = [max(rows[i]["high"] - rows[i]["low"], abs(rows[i]["high"] - rows[i - 1]["close"]), abs(rows[i]["low"] - rows[i - 1]["close"]))
            for i in range(max(1, len(rows) - 15), len(rows))]
     atr1 = sum(trs) / len(trs) / last * 100 if trs else 0
-    step_pct = min(0.5, max(CFG.scalp_min_step, atr1 * 0.6))
+    step_floor = max(CFG.scalp_min_step, min_step(symbol) * 100)  # тейк ≥ 10× комісії
+    step_pct = max(step_floor, min(0.5, atr1 * 0.6))
     count = int(round(width_pct / step_pct))
     lev = int(max(3, min(20, int(spec["max_lev"]), round(15 / width_pct))))
     min_n = spec.get("min_notional") or 5
     fit = int(margin * lev // max(min_n * 1.05, spec["min_qty"] * last * 1.05))
-    count = max(6, min(count, 100, fit)) if fit >= 6 else 0
     # Sell-сітка: ціна біля низу діапазону (10% ширини нижче — місце для першого тейку), 90% — вище
     lower, upper = last * (1 - width_pct * 0.1 / 100), last * (1 + width_pct * 0.9 / 100)
+    count = min(count, 100, fit, max_lines(lower, upper, False, step_floor / 100))
+    if count < 3:
+        count = 0  # замало руху, щоб тейк був ≥ 10× комісії хоча б на 3 лініях
     step = (upper - lower) / count if count else 0
     takes = sum(int((c["high"] - c["low"]) // step) for c in rows) // 2 if step > 0 else 0
     # за 5 хв одна хвиля коливання схожа на тренд, тому зсув 5 хв має меншу вагу, ніж тренд години й пробій
@@ -1290,7 +1368,7 @@ def judge_coin(t: dict, margin: float) -> dict | None:
         "score": round(score, 4), "strict": strict,
         "lower": align(lower, tick, False), "upper": align(upper, tick, True), "count": count, "leverage": lev,
         "widthPct": round(width_pct, 2), "stepPct": round(width_pct / count, 3) if count else 0,
-        "profitPct": round((width_pct / count - 0.04) if count else 0, 3), "takesHour": takes,
+        "profitPct": round((width_pct / count - 200 * maker_fee(symbol)) if count else 0, 3), "takesHour": takes,
         "fit": fit,
     }
 

@@ -347,12 +347,15 @@ async function previewGrid() {
   const plan = $("n-plan");
   try {
     const p = await api("/api/preview", form());
+    if (p.count < p.countWanted) $("n-count").value = p.count;  // сервер зменшив кількість, щоб тейк був ≥ 10× комісії
     plan.classList.remove("hidden");
     plan.innerHTML = `<b class="font-mono">${esc(p.symbol)}</b> · ціна ${px(p.last)} · плече x${p.lev}<br>
       ${p.geo
         ? `Геометрична: ${p.sells} Sell-лімітів вище ціни, лоти <b class="font-mono">${esc(p.qty)}</b> (×${p.geoMult} на лінію) · крок ${p.stepPct}%`
         : `${p.sells} Sell-лімітів вище ціни по <b class="font-mono">${esc(p.qty)}</b> · крок ${px(p.step)}`} · усього ≈ ${p.notional} USDT<br>
-      Прибуток на одну сітку (мікротейк): <b class="text-up">${p.profitLow === p.profitHigh ? p.profitLow + "%" : p.profitLow + "% – " + p.profitHigh + "%"}</b> після комісій мейкера
+      Прибуток на одну сітку (мікротейк): <b class="text-up">${p.profitLow === p.profitHigh ? p.profitLow + "%" : p.profitLow + "% – " + p.profitHigh + "%"}</b> після комісій мейкера<br>
+      <span class="text-xs text-mute">Тейк ≥ ${p.feeMult}× комісії: комісія циклу ${p.feePct}% (мейкер × 2) → крок не менше ${p.minStepPct}%. Зараз крок ${p.stepPct}%.</span>
+      ${p.count < p.countWanted ? `<br><span class="text-gold">Кількість сіток зменшено з ${p.countWanted} до ${p.count}, щоб тейк був ≥ ${p.feeMult}× комісії.</span>` : ""}
       ${p.inside ? "" : '<br><span class="text-gold">Ціна зараз поза діапазоном — з одного боку лімітів не буде.</span>'}
       ${p.geo && p.lots ? `<div class="mt-2 max-h-48 overflow-y-auto font-mono text-xs">${p.lots.map(o => `<div class="flex justify-between gap-3"><span class="${o.side === "Buy" ? "text-up" : "text-down"}">${o.side}</span><span>${o.price}</span><span>${o.qty}</span></div>`).join("")}</div>` : ""}`;
     return p;
