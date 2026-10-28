@@ -54,7 +54,14 @@ tailwind.config = { theme: { extend: { colors: {
         <h2 class="text-base font-semibold">Пошук монети для нейтрального гріду на 1 годину</h2>
         <p class="mt-1 text-xs text-mute">Найліквідніші USDT-перпи Bybit. За останні 5 хв — широкий рух туди-сюди без зсуву; за останню годину — без тренду, ціна часто перетинає середину і зараз не на краю. Сітка на годину рахується одразу під вашу маржу.</p>
       </div>
-      <button type="button" id="s-run" class="min-h-11 shrink-0 rounded-lg bg-gold px-4 text-sm font-semibold text-desk">🔍 Знайти монети</button>
+      <div class="flex flex-wrap items-center gap-2">
+        <button type="button" id="s-run" class="min-h-11 shrink-0 rounded-lg bg-gold px-4 text-sm font-semibold text-desk">🔍 Знайти монети</button>
+        <div class="flex items-stretch overflow-hidden rounded-lg border border-down">
+          <button type="button" id="s-sell" class="min-h-11 bg-down px-4 text-sm font-semibold text-white">⚡ Знайти і запустити Sell-сітку</button>
+          <label class="flex items-center gap-1 bg-desk px-2 text-xs text-mute" title="Скільки капіталу віддати під сітку. Решта лишається вільною для перестановки ліміток">на
+            <input id="s-pct" inputmode="decimal" value="90" autocomplete="off" class="w-10 bg-transparent text-center font-mono text-sm text-ink outline-none">% депозиту</label>
+        </div>
+      </div>
     </div>
     <div id="s-note" class="mt-2 hidden text-xs"></div>
     <div id="s-box" class="mt-3 hidden max-h-[420px] overflow-auto rounded-xl border border-line">
@@ -985,6 +992,41 @@ async function takeCoin(c) {
     Через годину перевірте монету пошуком ще раз.</div>`;
 }
 $("s-run").onclick = runScan;
+try { const v = localStorage.getItem("sPct"); if (v) $("s-pct").value = v; } catch (e) {}
+async function autoSell() {
+  const btn = $("s-sell"), label = btn.textContent;
+  const pct = $("s-pct").value.trim() || "90";
+  try { localStorage.setItem("sPct", pct); } catch (e) {}
+  btn.disabled = true; btn.textContent = "Шукаю монету…";
+  try {
+    const r = await api("/api/sellplan", { pct });
+    const pl = r.plan, pv = r.preview, c = r.coin;
+    // параметри — у форму, щоб їх було видно і можна було змінити
+    $("n-symbol").value = pl.symbol; $("n-lower").value = pl.lower; $("n-upper").value = pl.upper;
+    $("n-count").value = pl.count; $("n-lev").value = pl.leverage; $("n-margin").value = pl.margin; $("n-shift").value = 0;
+    NTRAIL = true; NGEO = false; NMODE = "sell";
+    try { localStorage.setItem("nGeo", "0"); localStorage.setItem("nMode", "sell"); } catch (e) {}
+    renderToggles(); renderMode();
+    showChart(pl.symbol);
+    await previewGrid();
+    $("form-box").scrollIntoView({ behavior: "smooth", block: "start" });
+    const msg = `⚡ Sell-сітка на ${r.pct}% депозиту${S && S.env === "mainnet" ? " — MAINNET, реальні гроші" : " (testnet)"}\n\n`
+      + `Монета: ${pl.symbol}, ціна ${px(pv.last)}${r.relaxed ? " (ринок трендовий — найкраще з наявного)" : ""}\n`
+      + `За 5 хв рух ${c.range5}%, година: тренд ${c.trend60}%, ціна на ${c.pos}% каналу\n\n`
+      + `Маржа: ${pl.margin} USDT з капіталу ${r.equity} (вільними лишиться ≈ ${r.reserve} USDT)\n`
+      + `Плече x${pv.lev} → ${pv.sells} Sell-лімітів по ${pv.qty}, разом ≈ ${pv.notional} USDT\n`
+      + `Діапазон ${pl.lower} – ${pl.upper}, мікротейк ≈ ${pv.profitLow}%\n\n`
+      + `Увага: при сильному рості вся маржа піде в шорт, а стоп −${r.slRoi}% від маржі при такій частці депозиту може не встигнути до ліквідації.\n\n`
+      + `Запустити?`;
+    if (!confirm(msg)) { toast("Не запущено. Параметри у формі — можна змінити й запустити вручну."); return; }
+    btn.textContent = "Запускаю…";
+    toast((await api("/api/start", pl)).text);
+    await pull();
+    showChart(pl.symbol);
+  } catch (e) { toast(e.message, true); }
+  finally { btn.disabled = false; btn.textContent = label; }
+}
+$("s-sell").onclick = autoSell;
 
 renderToggles();
 renderMode();

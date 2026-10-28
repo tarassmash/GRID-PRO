@@ -1156,6 +1156,43 @@ def scan_coins(data: dict) -> dict:
         return result
 
 
+def sell_plan(data: dict) -> dict:
+    """Знайти монету і скласти Sell-сітку на pct% капіталу; решта (100 - pct)% капіталу завжди лишається вільною
+    для перестановки ліміток. Нічого не ставить — лише план (запуск після підтвердження через /api/start)."""
+    pct = parse_num(data.get("pct") or 90, "Відсоток депозиту", 10, 95)
+    wallet = bybit("/v5/account/wallet-balance", query={"accountType": "UNIFIED"}, auth=True)
+    acct = (wallet.get("list") or [{}])[0]
+    equity = float(acct.get("totalEquity") or 0)
+    available = float(acct.get("totalAvailableBalance") or 0)
+    reserve = equity * (100 - pct) / 100
+    margin = math.floor(min(equity * pct / 100, available - reserve) * 100) / 100
+    if margin < 5:
+        raise BybitError(
+            f"Замало вільних коштів: капітал {equity:.2f}, вільно {available:.2f} USDT, резерв {100 - pct:g}% = {reserve:.2f}. "
+            f"Під нову сітку лишається {max(margin, 0):.2f} USDT."
+        )
+    scan = scan_coins({"margin": margin})
+    pool = [c for c in scan["coins"] if not c.get("busy") and c["count"] > 0]
+    if not pool:
+        raise BybitError("Не знайшов вільної монети під сітку (усі зайняті або замало маржі)")
+    # для Sell краще, коли ціна у верхній половині годинного каналу
+    coin = next((c for c in pool if c["pos"] >= 50), None) or pool[0]
+    symbol = coin["symbol"]
+    spec = spec_of(symbol)
+    last = float(ticker(symbol)["lastPrice"])
+    width = last * coin["widthPct"] / 100
+    plan = {
+        "symbol": symbol, "mode": "sell", "geo": False, "trail": True, "shiftMin": 0,
+        "lower": align(last - width * 0.1, spec["tick"], False), "upper": align(last + width * 0.9, spec["tick"], True),
+        "count": coin["count"], "leverage": coin["leverage"], "margin": margin,
+    }
+    return {
+        "plan": plan, "preview": preview(plan), "coin": coin, "pct": pct,
+        "equity": round(equity, 2), "available": round(available, 2), "reserve": round(reserve, 2),
+        "relaxed": scan["relaxed"], "slRoi": CFG.sl_roi,
+    }
+
+
 def price_of(symbol) -> dict:
     symbol = parse_symbol(symbol)
     spec = spec_of(symbol)
@@ -1382,6 +1419,7 @@ def serve() -> None:
                 "/api/auto": lambda: auto_params(data),
                 "/api/price": lambda: price_of(data.get("symbol")),
                 "/api/scan": lambda: scan_coins(data),
+                "/api/sellplan": lambda: sell_plan(data),
                 "/api/chart": lambda: chart_data(data.get("symbol"), data.get("interval")),
                 "/api/trades": lambda: recent_trades(data.get("symbol")),
                 "/api/preview": lambda: preview(data),
