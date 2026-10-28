@@ -314,20 +314,24 @@ def set_leverage(symbol: str, leverage: int) -> None:
 
 
 def create_order(body: dict, side: str) -> None:
-    """One-way режим (positionIdx 0), а якщо на рахунку hedge — 1 для Buy, 2 для Sell."""
+    """One-way режим (positionIdx 0), а якщо на рахунку hedge — 1 для Buy, 2 для Sell
+    (для reduce-only навпаки: Buy закриває шорт = 2, Sell закриває лонг = 1)."""
     try:
         bybit("/v5/order/create", "POST", body={**body, "positionIdx": 0}, auth=True)
     except BybitError as exc:
         if "position idx" not in str(exc).lower():
             raise
-        bybit("/v5/order/create", "POST", body={**body, "positionIdx": 1 if side == "Buy" else 2}, auth=True)
+        long_idx = side == "Buy"
+        if body.get("reduceOnly"):
+            long_idx = not long_idx
+        bybit("/v5/order/create", "POST", body={**body, "positionIdx": 1 if long_idx else 2}, auth=True)
 
 
 def place_limit(symbol: str, order: dict, post_only: bool = True) -> None:
     create_order({
         "category": "linear", "symbol": symbol, "side": order["side"], "orderType": "Limit",
         "qty": order["qty"], "price": order["price"], "timeInForce": "PostOnly" if post_only else "GTC",
-        "orderLinkId": order["orderLinkId"], "reduceOnly": False,
+        "orderLinkId": order["orderLinkId"], "reduceOnly": bool(order.get("reduce")),
     }, order["side"])
 
 
@@ -422,10 +426,18 @@ def grid_params(data: dict) -> dict:
     shift_min = int(parse_num(data.get("shiftMin", 0), "Іти за ціною через, хв", 0, 1440, integer=True))
     geo = bool(data.get("geo"))
     geo_mult = parse_num(data.get("geoMult") or 1.3, "Множник лота", 1, 3) if geo else 1.0
+    mode = str(data.get("mode") or "both")
+    if mode not in MODES:
+        raise BybitError("Режим: both, sell або buy")
     return {
         "symbol": symbol, "lower": lower, "upper": upper, "count": count, "margin": margin, "lev": lev,
-        "trail": bool(data.get("trail", True)), "shiftMin": shift_min, "geo": geo, "geoMult": geo_mult,
+        "trail": bool(data.get("trail", True)), "shiftMin": shift_min, "geo": geo, "geoMult": geo_mult, "mode": mode,
     }
+
+
+# both — Buy нижче і Sell вище ціни; sell — лише Sell вище (шорт-сітка); buy — лише Buy нижче (лонг-сітка).
+# В однобічному режимі протилежна лімітка — це тейк reduce-only: закриває виконану лімітку і не відкриває зустрічну позицію.
+MODES = {"both": "Buy + Sell", "sell": "Тільки Sell", "buy": "Тільки Buy"}
 
 
 def ladder_of(lower: float, upper: float, count: int, tick: str, geo: bool = False) -> list[str]:
@@ -452,8 +464,9 @@ def equal_qty(margin: float, lev: int, count: int, mid: float, spec: dict) -> st
     return qty
 
 
-def grid_orders(symbol: str, ladder: list[str], last: float, bid: float, ask: float, qty: str) -> list[dict]:
-    """Buy на кожній лінії нижче ціни, Sell — вище; лінія біля ціни лишається порожньою."""
+def grid_orders(symbol: str, ladder: list[str], last: float, bid: float, ask: float, qty: str, mode: str = "both") -> list[dict]:
+    """Buy на кожній лінії нижче ціни, Sell — вище; лінія біля ціни лишається порожньою.
+    mode=sell — лише Sell, mode=buy — лише Buy."""
     nearest = min(ladder, key=lambda p: abs(float(p) - last))
     orders = []
     for price in ladder:
@@ -462,6 +475,8 @@ def grid_orders(symbol: str, ladder: list[str], last: float, bid: float, ask: fl
             continue
         side = "Buy" if n < last else "Sell"
         if (side == "Buy" and n >= bid) or (side == "Sell" and n <= ask):
+            continue
+        if (mode == "sell" and side == "Buy") or (mode == "buy" and side == "Sell"):
             continue
         orders.append({"side": side, "price": price, "qty": qty, "orderLinkId": link_id(symbol, side, price), "status": "open", "note": "grid"})
     return orders
@@ -493,13 +508,22 @@ def geo_sizes(orders: list[dict], ladder: list[str], last: float, budget: float,
 
 
 def build(symbol: str, lower: float, upper: float, count: int, margin: float, lev: int, geo: bool, mult: float,
-          spec: dict, last: float, bid: float, ask: float) -> tuple[list[str], list[dict], str]:
+          spec: dict, last: float, bid: float, ask: float, mode: str = "both") -> tuple[list[str], list[dict], str]:
     ladder = ladder_of(lower, upper, count, spec["tick"], geo)
     if geo:
-        orders = grid_orders(symbol, ladder, last, bid, ask, "0")
+        orders = grid_orders(symbol, ladder, last, bid, ask, "0", mode)
         return ladder, orders, geo_sizes(orders, ladder, last, margin * lev, mult, spec)
-    qty = equal_qty(margin, lev, count, (lower + upper) / 2, spec)
-    return ladder, grid_orders(symbol, ladder, last, bid, ask, qty), qty
+    if mode == "both":
+        qty = equal_qty(margin, lev, count, (lower + upper) / 2, spec)
+        return ladder, grid_orders(symbol, ladder, last, bid, ask, qty, mode), qty
+    # однобічна сітка: уся маржа × плече ділиться лише на лімітки одного боку
+    orders = grid_orders(symbol, ladder, last, bid, ask, "0", mode)
+    if not orders:
+        return ladder, orders, "0"
+    qty = equal_qty(margin, lev, len(orders), sum(float(o["price"]) for o in orders) / len(orders), spec)
+    for o in orders:
+        o["qty"] = qty
+    return ladder, orders, qty
 
 
 def preview(data: dict) -> dict:
@@ -509,11 +533,11 @@ def preview(data: dict) -> dict:
     last = float(live["lastPrice"])
     lev = min(prm["lev"], int(spec["max_lev"]))
     _, orders, qty = build(prm["symbol"], prm["lower"], prm["upper"], prm["count"], prm["margin"], lev, prm["geo"],
-                           prm["geoMult"], spec, last, float(live.get("bid1Price") or last), float(live.get("ask1Price") or last))
+                           prm["geoMult"], spec, last, float(live.get("bid1Price") or last), float(live.get("ask1Price") or last), prm["mode"])
     step = (prm["upper"] - prm["lower"]) / prm["count"]
     fee = 0.0002 * 2  # мейкер з обох боків
     out = {
-        "symbol": prm["symbol"], "last": last, "lev": lev, "qty": qty, "step": step, "geo": prm["geo"],
+        "symbol": prm["symbol"], "last": last, "lev": lev, "qty": qty, "step": step, "geo": prm["geo"], "mode": prm["mode"],
         "buys": sum(1 for o in orders if o["side"] == "Buy"), "sells": sum(1 for o in orders if o["side"] == "Sell"),
         "profitLow": round((step / prm["upper"] - fee) * 100, 3), "profitHigh": round((step / prm["lower"] - fee) * 100, 3),
         "inside": prm["lower"] < last < prm["upper"],
@@ -549,9 +573,10 @@ def start_grid(data: dict) -> str:
     ask = float(live.get("ask1Price") or last)
     lev = min(prm["lev"], int(spec["max_lev"]))
     ladder, orders, qty = build(symbol, prm["lower"], prm["upper"], prm["count"], prm["margin"], lev,
-                                prm["geo"], prm["geoMult"], spec, last, bid, ask)
+                                prm["geo"], prm["geoMult"], spec, last, bid, ask, prm["mode"])
     if not orders:
-        raise BybitError("Немає ліній для лімітів: ціна поза діапазоном або діапазон замалий")
+        where = {"sell": " вище ціни", "buy": " нижче ціни"}.get(prm["mode"], "")
+        raise BybitError(f"Немає ліній для лімітів{where}: ціна поза діапазоном або діапазон замалий")
     set_leverage(symbol, lev)
     opened = []
     with GRID_LOCK:
@@ -569,7 +594,7 @@ def start_grid(data: dict) -> str:
         "lower": prm["lower"], "upper": prm["upper"], "count": prm["count"], "ladder": ladder,
         "step": (prm["upper"] - prm["lower"]) / prm["count"], "tick": spec["tick"], "qty": qty, "lev": lev,
         "margin": prm["margin"], "trail": prm["trail"], "shiftMin": prm["shiftMin"],
-        "geo": prm["geo"], "geoMult": prm["geoMult"],
+        "geo": prm["geo"], "geoMult": prm["geoMult"], "mode": prm["mode"],
         "levels": opened, "status": "active", "created": int(time.time()), "last": last,
         "fills": 0, "takes": 0, "profit": 0.0, "shifts": 0, "outSince": None,
     }
@@ -577,8 +602,9 @@ def start_grid(data: dict) -> str:
         STATE["grids"].insert(0, grid)
         save_state()
     buys = sum(1 for o in opened if o["side"] == "Buy")
-    mode = f", геометрична (лот ×{prm['geoMult']:g}, {qty})" if prm["geo"] else f", лот {qty}"
-    text = f"Грід {symbol}: {prm['lower']:g}–{prm['upper']:g}, {prm['count']} сіток{mode}, Buy {buys} / Sell {len(opened) - buys}, x{lev}"
+    lots = f", геометрична (лот ×{prm['geoMult']:g}, {qty})" if prm["geo"] else f", лот {qty}"
+    side = f", {MODES[prm['mode']]}" if prm["mode"] != "both" else ""
+    text = f"Грід {symbol}: {prm['lower']:g}–{prm['upper']:g}, {prm['count']} сіток{side}{lots}, Buy {buys} / Sell {len(opened) - buys}, x{lev}"
     add_event(text)
     return text
 
@@ -586,18 +612,21 @@ def start_grid(data: dict) -> str:
 def shift_grid(grid: dict, last: float, bid: float, ask: float) -> str:
     symbol = grid["symbol"]
     old_lo, old_hi = grid["lower"], grid["upper"]
+    mode = grid.get("mode") or "both"
+    # частка ширини нижче ціни: нейтральна — посередині, Sell — ціна біля низу, Buy — біля верху
+    below = {"both": 0.5, "sell": 0.1, "buy": 0.9}[mode]
     if grid.get("geo"):
-        half = math.sqrt(old_hi / old_lo)  # той самий % ширини, ціна посередині
-        lower, upper = last / half, last * half
+        ratio = old_hi / old_lo  # той самий % ширини
+        lower, upper = last / ratio ** below, last * ratio ** (1 - below)
         ladder = ladder_of(lower, upper, grid["count"], grid["tick"], True)
-        orders = grid_orders(symbol, ladder, last, bid, ask, "0")
+        orders = grid_orders(symbol, ladder, last, bid, ask, "0", mode)
         qty = geo_sizes(orders, ladder, last, grid["margin"] * grid["lev"], float(grid.get("geoMult") or 1.3), spec_of(symbol))
     else:
         width = old_hi - old_lo
-        lower, upper = max(last - width / 2, last * 0.05), last + width / 2
+        lower, upper = max(last - width * below, last * 0.05), last + width * (1 - below)
         ladder = ladder_of(lower, upper, grid["count"], grid["tick"])
         qty = grid["qty"]
-        orders = grid_orders(symbol, ladder, last, bid, ask, qty)
+        orders = grid_orders(symbol, ladder, last, bid, ask, qty, mode)
     # лоти пораховані до зняття старих ліміток: помилка розрахунку не лишить сітку порожньою
     cancel_grid_orders(grid, "shift")
     grid["qty"] = qty
@@ -663,8 +692,9 @@ def watch_grid(grid: dict) -> list[str]:
         fill_px = float(row.get("avgPrice") or level["price"])
         fill_qty = float(row.get("cumExecQty") or level["qty"])
         grid["fills"] = int(grid.get("fills") or 0) + 1
-        if level.get("pair"):
-            # протилежна лімітка попереднього виконання: один цикл сітки = один мікротейк
+        is_take = level.get("role") == "take" or (level.get("role") is None and bool(level.get("pair")))
+        if is_take:
+            # тейк попереднього входу: один цикл сітки = один мікротейк
             gain = (fill_px - float(level["pair"])) * fill_qty * (1 if level["side"] == "Sell" else -1)
             grid["takes"] = int(grid.get("takes") or 0) + 1
             grid["profit"] = float(grid.get("profit") or 0) + gain
@@ -681,8 +711,15 @@ def watch_grid(grid: dict) -> list[str]:
         price = ladder[j]
         if any(l["status"] == "open" and l["price"] == price for l in grid["levels"]):
             continue
-        new = {"side": side, "price": price, "qty": level["qty"], "orderLinkId": link_id(symbol, side, price),
-               "status": "open", "note": "counter", "pair": f"{fill_px}"}
+        one_side = (grid.get("mode") or "both") != "both"
+        if is_take:
+            # тейк виконався — на сусідній лінії знову вхід (у режимі Sell це знову Sell)
+            new = {"side": side, "price": price, "qty": level["qty"], "orderLinkId": link_id(symbol, side, price),
+                   "status": "open", "note": "grid", "role": "entry"}
+        else:
+            # вхід виконався — тейк на сусідній лінії; в однобічному режимі reduce-only (не відкриє зустрічну позицію)
+            new = {"side": side, "price": price, "qty": level["qty"], "orderLinkId": link_id(symbol, side, price),
+                   "status": "open", "note": "counter", "role": "take", "pair": f"{fill_px}", "reduce": one_side}
         try:
             place_counter(symbol, new, bid, ask)
             grid["levels"].append(new)
@@ -1127,7 +1164,7 @@ def grid_rows() -> list[dict]:
             "buys": sum(1 for l in opened if l["side"] == "Buy"), "sells": sum(1 for l in opened if l["side"] == "Sell"),
             "fills": g.get("fills") or 0, "takes": g.get("takes") or 0, "profit": round(float(g.get("profit") or 0), 6),
             "shifts": g.get("shifts") or 0, "out": bool(g.get("outSince")), "created": g.get("created"),
-            "geo": bool(g.get("geo")), "geoMult": g.get("geoMult"),
+            "geo": bool(g.get("geo")), "geoMult": g.get("geoMult"), "mode": g.get("mode") or "both",
             "stepPct": round(((g["upper"] / g["lower"]) ** (1 / g["count"]) - 1) * 100, 3) if g.get("geo") else None,
         })
     return rows

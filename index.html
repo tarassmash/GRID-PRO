@@ -51,6 +51,10 @@ tailwind.config = { theme: { extend: { colors: {
   <section class="rounded-2xl border border-line bg-panel p-4">
     <h2 class="text-base font-semibold">Нова сітка</h2>
     <p class="mt-1 text-xs text-mute">Buy ставляться на лініях нижче ціни, Sell — вище. Щойно лімітка виконалась (перевірка кожні 2 с), на сусідній лінії ставиться протилежна — це мікротейк, прибуток одного кроку. Коли ціна виходить з діапазону, сітка (якщо увімкнено) переїжджає за ціною.</p>
+    <div class="mt-3 flex flex-wrap items-center gap-2 text-xs text-mute">Лімітки
+      <div id="n-mode" class="flex overflow-hidden rounded-lg border border-line text-sm"></div>
+      <span id="n-mode-hint" class="text-xs"></span>
+    </div>
     <div class="mt-3 grid grid-cols-2 gap-3 md:grid-cols-4">
       <label class="flex flex-col gap-1 text-xs text-mute">Монета<input id="n-symbol" placeholder="BTCUSDT" autocomplete="off" class="min-h-11 rounded-lg border border-line bg-desk px-3 font-mono text-sm uppercase text-ink"></label>
       <label class="flex flex-col gap-1 text-xs text-mute">Нижня ціна<input id="n-lower" inputmode="decimal" autocomplete="off" class="min-h-11 rounded-lg border border-line bg-desk px-3 font-mono text-sm text-ink"></label>
@@ -67,7 +71,7 @@ tailwind.config = { theme: { extend: { colors: {
     <div class="mt-3 flex flex-wrap items-center gap-2">
       <button type="button" id="n-scalp" class="min-h-11 rounded-lg border border-gold bg-gold/15 px-3 text-sm font-semibold text-gold">⚡ Скальпінг: часто по трохи</button>
       <button type="button" id="n-auto" class="min-h-11 rounded-lg border border-up/50 bg-up/10 px-3 text-sm font-semibold text-up">Авто: канал і параметри</button>
-      <button type="button" id="n-range" class="min-h-11 rounded-lg border border-line px-3 text-sm">Діапазон ±3% від ціни</button>
+      <button type="button" id="n-range" class="min-h-11 rounded-lg border border-line px-3 text-sm">Діапазон 6% від ціни</button>
       <button type="button" id="n-preview" class="min-h-11 rounded-lg border border-gold/40 px-3 text-sm text-gold">Перевірити</button>
       <button type="button" id="n-start" class="min-h-11 rounded-lg bg-gold px-4 text-sm font-semibold text-desk">Запустити сітку</button>
     </div>
@@ -176,8 +180,43 @@ function form() {
   return {
     symbol: $("n-symbol").value.trim().toUpperCase(), lower: $("n-lower").value, upper: $("n-upper").value,
     count: $("n-count").value, margin: $("n-margin").value, leverage: $("n-lev").value, shiftMin: $("n-shift").value,
-    trail: NTRAIL, geo: NGEO, geoMult: $("n-geo-mult").value
+    trail: NTRAIL, geo: NGEO, geoMult: $("n-geo-mult").value, mode: NMODE
   };
+}
+let NMODE = "both";
+try { const m = localStorage.getItem("nMode"); if (["both", "sell", "buy"].includes(m)) NMODE = m; } catch (e) {}
+const MODE_NAMES = { both: "Buy + Sell", sell: "Тільки Sell", buy: "Тільки Buy" };
+const MODE_HINTS = {
+  both: "Buy нижче ціни, Sell вище — нейтральна сітка.",
+  sell: "Лише Sell вище ціни (шорт). Після виконання — Buy-тейк на лінію нижче (reduce-only), потім знову Sell.",
+  buy: "Лише Buy нижче ціни (лонг). Після виконання — Sell-тейк на лінію вище (reduce-only), потім знову Buy."
+};
+// частка діапазону нижче ціни: однобічна сітка тримає ціну біля свого краю
+const BELOW = { both: 0.5, sell: 0.1, buy: 0.9 };
+function placeRange(last, width) {
+  const d = last >= 100 ? 2 : last >= 1 ? 4 : 6;
+  $("n-lower").value = (last - width * BELOW[NMODE]).toFixed(d);
+  $("n-upper").value = (last + width * (1 - BELOW[NMODE])).toFixed(d);
+}
+function renderMode() {
+  $("n-mode").innerHTML = Object.entries(MODE_NAMES).map(([v, t]) => {
+    const on = v === NMODE;
+    const color = v === "sell" ? "bg-down text-white" : v === "buy" ? "bg-up text-desk" : "bg-gold text-desk";
+    return `<button type="button" data-nmode="${v}" class="min-h-10 px-3 ${on ? color + " font-semibold" : "text-mute"}">${t}</button>`;
+  }).join("");
+  $("n-mode-hint").textContent = MODE_HINTS[NMODE];
+  document.querySelectorAll("[data-nmode]").forEach(b => b.onclick = async () => {
+    const was = NMODE;
+    NMODE = b.dataset.nmode;
+    try { localStorage.setItem("nMode", NMODE); } catch (e) {}
+    renderMode();
+    // діапазон, уже вписаний у форму, зсуваємо так, щоб лінії були з потрібного боку ціни
+    const lo = Number($("n-lower").value), hi = Number($("n-upper").value), sym = $("n-symbol").value.trim();
+    if (was !== NMODE && lo > 0 && hi > lo && sym) {
+      try { const r = await api("/api/price", { symbol: sym.toUpperCase() }); placeRange(Number(r.last), hi - lo); } catch (e) {}
+    }
+    if ($("n-lower").value && $("n-upper").value) previewGrid();
+  });
 }
 function renderToggles() {
   $("n-trail").innerHTML = tog(NTRAIL, "Сітка йде за ціною (трейлінг)");
@@ -202,7 +241,9 @@ function render() {
     const upnl = pos ? Number(pos.pnl || 0) : 0;
     return `<div class="rounded-2xl border border-line bg-panel p-4">
       <div class="flex flex-wrap items-center justify-between gap-2">
-        <div class="font-mono text-base font-semibold">${esc(g.symbol)} <span class="text-xs text-mute">x${g.lev} · маржа ${g.margin}${g.geo ? " · геометрична" : ""}</span></div>
+        <div class="font-mono text-base font-semibold">${esc(g.symbol)}
+          ${g.mode === "sell" ? '<span class="rounded bg-down px-1.5 py-0.5 text-xs text-white">Тільки Sell</span>' : g.mode === "buy" ? '<span class="rounded bg-up px-1.5 py-0.5 text-xs text-desk">Тільки Buy</span>' : ""}
+          <span class="text-xs text-mute">x${g.lev} · маржа ${g.margin}${g.geo ? " · геометрична" : ""}</span></div>
         <div class="flex gap-2">
           <button data-chart="${esc(g.symbol)}" class="min-h-11 rounded-lg border px-3 text-xs ${g.symbol === C.symbol ? "border-gold text-gold" : "border-line"}">📈 Графік</button>
           <button data-stop="${esc(g.id)}" class="min-h-11 rounded-lg border border-line px-3 text-xs">Зняти ліміти</button>
@@ -265,8 +306,8 @@ async function previewGrid() {
     plan.classList.remove("hidden");
     plan.innerHTML = `<b class="font-mono">${esc(p.symbol)}</b> · ціна ${px(p.last)} · плече x${p.lev}<br>
       ${p.geo
-        ? `Геометрична: Buy ${p.buys} / Sell ${p.sells} лімітів, лоти <b class="font-mono">${esc(p.qty)}</b> (×${p.geoMult} на лінію) · крок ${p.stepPct}%`
-        : `Buy ${p.buys} / Sell ${p.sells} лімітів по <b class="font-mono">${esc(p.qty)}</b> · крок ${px(p.step)}`} · усього ≈ ${p.notional} USDT<br>
+        ? `${p.mode !== "both" ? MODE_NAMES[p.mode] + " · " : ""}Геометрична: Buy ${p.buys} / Sell ${p.sells} лімітів, лоти <b class="font-mono">${esc(p.qty)}</b> (×${p.geoMult} на лінію) · крок ${p.stepPct}%`
+        : `${p.mode !== "both" ? MODE_NAMES[p.mode] + " · " : ""}Buy ${p.buys} / Sell ${p.sells} лімітів по <b class="font-mono">${esc(p.qty)}</b> · крок ${px(p.step)}`} · усього ≈ ${p.notional} USDT<br>
       Прибуток на одну сітку (мікротейк): <b class="text-up">${p.profitLow === p.profitHigh ? p.profitLow + "%" : p.profitLow + "% – " + p.profitHigh + "%"}</b> після комісій мейкера
       ${p.inside ? "" : '<br><span class="text-gold">Ціна зараз поза діапазоном — з одного боку лімітів не буде.</span>'}
       ${p.geo && p.lots ? `<div class="mt-2 max-h-48 overflow-y-auto font-mono text-xs">${p.lots.map(o => `<div class="flex justify-between gap-3"><span class="${o.side === "Buy" ? "text-up" : "text-down"}">${o.side}</span><span>${o.price}</span><span>${o.qty}</span></div>`).join("")}</div>` : ""}`;
@@ -289,7 +330,7 @@ async function rangeGrid() {
     const r = await api("/api/price", { symbol: sym });
     const last = Number(r.last);
     const d = last >= 100 ? 2 : last >= 1 ? 4 : 6;
-    $("n-lower").value = (last * 0.97).toFixed(d); $("n-upper").value = (last * 1.03).toFixed(d);
+    placeRange(last, last * 0.06);
     previewGrid();
   } catch (e) { toast("Ціну не отримав: " + e.message, true); }
 }
@@ -302,6 +343,7 @@ async function autoGrid(profile) {
     const a = await api("/api/auto", { symbol: $("n-symbol").value.trim().toUpperCase(), margin: $("n-margin").value, leverage: "", profile });
     $("n-symbol").value = a.symbol; $("n-lower").value = a.lower; $("n-upper").value = a.upper;
     $("n-count").value = a.count; $("n-lev").value = a.leverage; $("n-shift").value = a.shiftMin;
+    if (NMODE !== "both") placeRange(Number(a.last), Number(a.upper) - Number(a.lower));
     NTRAIL = true; renderToggles();
     const p = await previewGrid();
     if (p) $("n-plan").innerHTML += `<div class="mt-2 border-t border-line pt-2 text-xs text-mute">
@@ -859,6 +901,7 @@ render = function () {
 };
 
 renderToggles();
+renderMode();
 renderChartBar();
 pull().then(() => { renderChartBar(); loadChart(); });
 setInterval(pull, 4000);
