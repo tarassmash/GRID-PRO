@@ -209,9 +209,11 @@ def bybit(path: str, method: str = "GET", query: dict | None = None, body: dict 
         with urllib.request.urlopen(req, timeout=20) as resp:
             raw = json.loads(resp.read().decode())
     except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", "ignore")[:180].strip()
-        if "country" in detail.lower() or "cloudfront" in detail.lower():
-            raise BybitError("Bybit блокує країну сервера. У Railway оберіть регіон Amsterdam або Singapore, не US.") from exc
+        full = exc.read().decode("utf-8", "ignore")
+        detail = full[:180].strip()
+        low = full.lower()
+        if exc.code == 403 and ("country" in low or "cloudfront" in low or low.lstrip().startswith("<")):
+            raise BybitError("Bybit блокує країну сервера (HTTP 403). Railway → сервіс → Settings → Deploy → Regions: оберіть EU West (Amsterdam) або Southeast Asia (Singapore), не US, і перезапустіть.") from exc
         raise BybitError(f"HTTP {exc.code} {detail}".strip()) from exc
     except urllib.error.URLError as exc:
         raise BybitError(f"мережа: {exc.reason}") from exc
