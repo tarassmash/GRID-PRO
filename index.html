@@ -86,10 +86,11 @@ tailwind.config = { theme: { extend: { colors: {
       <span><span class="inline-block h-0.5 w-4 align-middle" style="background:#848e9c"></span> межі сітки</span>
       <button type="button" id="c-oi" class="inline-flex items-center gap-1.5 rounded-md border border-line px-2 py-0.5"></button>
       <button type="button" id="c-cvd" class="inline-flex items-center gap-1.5 rounded-md border border-line px-2 py-0.5"></button>
+      <button type="button" id="c-vp" class="inline-flex items-center gap-1.5 rounded-md border border-line px-2 py-0.5"></button>
       <span id="c-live" class="font-mono"></span>
       <span id="c-info" class="font-mono text-ink"></span>
     </div>
-    <div id="c-chart" class="mt-2 h-[480px] w-full overflow-hidden rounded-xl border border-line bg-desk"></div>
+    <div id="c-chart" class="relative mt-2 h-[480px] w-full overflow-hidden rounded-xl border border-line bg-desk"></div>
     <div class="mt-3 flex items-center justify-between">
       <h3 class="text-sm font-semibold">Відкриті заявки <span id="o-count" class="font-mono text-mute"></span></h3>
       <span id="o-sum" class="font-mono text-xs text-mute"></span>
@@ -303,8 +304,11 @@ $("n-auto").onclick = () => autoGrid("");
 $("n-scalp").onclick = () => autoGrid("scalp");
 // ---------------- графік і заявки ----------------
 const C = { symbol: "", tf: "5", chart: null, series: null, lines: [], key: "", busy: false, extra: [],
-  oiS: null, cvdS: null, bars: [], oiHist: [], drawnSec: 0, showOi: true, showCvd: true };
-try { C.showOi = localStorage.getItem("cOi") !== "0"; C.showCvd = localStorage.getItem("cCvd") !== "0"; } catch (e) {}
+  oiS: null, cvdS: null, bars: [], oiHist: [], drawnSec: 0, showOi: true, showCvd: true, showVp: true, vpCanvas: null, shown: [] };
+try {
+  C.showOi = localStorage.getItem("cOi") !== "0"; C.showCvd = localStorage.getItem("cCvd") !== "0";
+  C.showVp = localStorage.getItem("cVp") !== "0";
+} catch (e) {}
 const TFS = [["1s", "1с"], ["1", "1х"], ["5", "5х"], ["15", "15х"], ["60", "1г"], ["240", "4г"], ["D", "1д"]];
 function chartSymbols() {
   const list = (S && S.grids || []).map(g => g.symbol);
@@ -360,12 +364,19 @@ function ensureChart() {
     priceFormat: { type: "custom", formatter: compact, minMove: 0.001 }, priceLineVisible: false });
   C.cvdS = C.chart.addLineSeries({ priceScaleId: "cvd", color: "#38bdf8", lineWidth: 2, title: "CVD",
     priceFormat: { type: "custom", formatter: compact, minMove: 0.001 }, priceLineVisible: false });
+  // полотно для горизонтальних обсягів поверх графіка (кліки проходять крізь нього)
+  const cv = document.createElement("canvas");
+  cv.style.cssText = "position:absolute;left:0;top:0;width:100%;height:100%;pointer-events:none;z-index:3";
+  box.style.position = "relative";
+  box.appendChild(cv);
+  C.vpCanvas = cv;
   applyLayout();
   return true;
 }
 function applyLayout() {
   $("c-oi").innerHTML = tog(C.showOi, '<span style="color:#a855f7">OI</span> відкритий інтерес');
   $("c-cvd").innerHTML = tog(C.showCvd, '<span style="color:#38bdf8">CVD</span> дельта обсягу');
+  $("c-vp").innerHTML = tog(C.showVp, '<span style="color:#f7a600">▤</span> горизонтальні обсяги');
   if (!C.chart) return;
   const both = C.showOi && C.showCvd, one = C.showOi || C.showCvd;
   C.series.priceScale().applyOptions({ scaleMargins: { top: 0.05, bottom: both ? 0.4 : one ? 0.24 : 0.06 } });
@@ -375,6 +386,7 @@ function applyLayout() {
   C.chart.priceScale("cvd").applyOptions({ scaleMargins: { top: both ? 0.82 : 0.79, bottom: 0.01 } });
 }
 $("c-oi").onclick = () => { C.showOi = !C.showOi; try { localStorage.setItem("cOi", C.showOi ? "1" : "0"); } catch (e) {} applyLayout(); };
+$("c-vp").onclick = () => { C.showVp = !C.showVp; try { localStorage.setItem("cVp", C.showVp ? "1" : "0"); } catch (e) {} applyLayout(); drawVp(); };
 $("c-cvd").onclick = () => { C.showCvd = !C.showCvd; try { localStorage.setItem("cCvd", C.showCvd ? "1" : "0"); } catch (e) {} applyLayout(); };
 applyLayout();
 
@@ -398,13 +410,14 @@ function addTrade(id, t, p, v, side) {
   const d = side === "Buy" ? v : -v;
   const s = Math.floor(t / 1000);
   let b = L.sec.get(s);
-  if (!b) { b = { time: s, open: p, high: p, low: p, close: p, t0: t, t1: t, delta: 0 }; L.sec.set(s, b); }
+  if (!b) { b = { time: s, open: p, high: p, low: p, close: p, t0: t, t1: t, delta: 0, buy: 0, sell: 0 }; L.sec.set(s, b); }
   else {
     b.high = Math.max(b.high, p); b.low = Math.min(b.low, p);
     if (t < b.t0) { b.t0 = t; b.open = p; }
     if (t >= b.t1) { b.t1 = t; b.close = p; }
   }
   b.delta += d;
+  if (d > 0) b.buy += v; else b.sell += v;
   const m = Math.floor(t / 60000) * 60;
   L.min.set(m, (L.min.get(m) || 0) + d);
   if (!L.since || t < L.since) L.since = t;
@@ -427,7 +440,7 @@ function prune() {
 }
 function sortedKeys(map) { return [...map.keys()].sort((a, b) => a - b); }
 function secBars() {
-  return sortedKeys(L.sec).slice(-900).map(k => { const b = L.sec.get(k); return { time: b.time, open: b.open, high: b.high, low: b.low, close: b.close }; });
+  return sortedKeys(L.sec).slice(-900).map(k => { const b = L.sec.get(k); return { time: b.time, open: b.open, high: b.high, low: b.low, close: b.close, buy: b.buy, sell: b.sell, v: b.buy + b.sell }; });
 }
 function cvdPoints(first) {
   const pts = [];
@@ -453,6 +466,7 @@ function drawLive(full) {
   if (C.tf === "1s") {
     const bars = secBars();
     first = bars.length ? bars[0].time : 0;
+    C.shown = bars;
     if (full || !C.drawnSec) C.series.setData(bars);
     else bars.filter(b => b.time >= C.drawnSec).forEach(b => C.series.update(b));
     C.drawnSec = bars.length ? bars[bars.length - 1].time : 0;
@@ -477,6 +491,86 @@ function drawLive(full) {
     : `<span class="text-mute">○ потік угод перепідключається…</span>`;
 }
 setInterval(() => { if (L.dirty) { L.dirty = false; prune(); drawLive(false); } }, 300);
+
+// ---------------- горизонтальні обсяги (профіль обсягу видимої частини графіка) ----------------
+// Обсяг кожної свічки розкладається рівномірно від її low до high. На 1с — з поділом на покупки/продажі.
+function drawVp() {
+  const cv = C.vpCanvas;
+  if (!cv || !C.chart) return;
+  const dpr = window.devicePixelRatio || 1;
+  const w = cv.clientWidth, h = cv.clientHeight;
+  if (cv.width !== Math.round(w * dpr) || cv.height !== Math.round(h * dpr)) { cv.width = Math.round(w * dpr); cv.height = Math.round(h * dpr); }
+  const ctx = cv.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+  const bars = C.shown || [];
+  if (!C.showVp || !bars.length) return;
+  const range = C.chart.timeScale().getVisibleLogicalRange();
+  const from = Math.max(0, Math.floor(range ? range.from : 0)), to = Math.min(bars.length - 1, Math.ceil(range ? range.to : bars.length - 1));
+  const vis = bars.slice(from, to + 1).filter(b => (b.v || 0) > 0 && b.high >= b.low);
+  if (!vis.length) return;
+  let lo = Infinity, hi = -Infinity;
+  vis.forEach(b => { lo = Math.min(lo, b.low); hi = Math.max(hi, b.high); });
+  const yLo = C.series.priceToCoordinate(lo), yHi = C.series.priceToCoordinate(hi);
+  if (yLo == null || yHi == null) return;
+  const rows = Math.max(12, Math.min(90, Math.round(Math.abs(yLo - yHi) / 5)));  // рядок ≈ 5 px
+  const step = (hi - lo) / rows || 1;
+  const buy = new Array(rows).fill(0), sell = new Array(rows).fill(0);
+  const split = C.tf === "1s";
+  vis.forEach(b => {
+    const i0 = Math.min(rows - 1, Math.floor((b.low - lo) / step)), i1 = Math.min(rows - 1, Math.floor((b.high - lo) / step));
+    const n = i1 - i0 + 1;
+    for (let i = i0; i <= i1; i++) {
+      if (split) { buy[i] += (b.buy || 0) / n; sell[i] += (b.sell || 0) / n; } else buy[i] += b.v / n;
+    }
+  });
+  const tot = buy.map((v, i) => v + sell[i]);
+  const max = Math.max(...tot);
+  if (!(max > 0)) return;
+  // POC і зона 70% обсягу (value area), що розширюється від POC
+  const poc = tot.indexOf(max);
+  const all = tot.reduce((a, v) => a + v, 0);
+  let a = poc, z = poc, acc = tot[poc];
+  while (acc < all * 0.7 && (a > 0 || z < rows - 1)) {
+    const down = a > 0 ? tot[a - 1] : -1, up = z < rows - 1 ? tot[z + 1] : -1;
+    if (up >= down) acc += tot[++z]; else acc += tot[--a];
+  }
+  // профіль притиснутий до лівого краю, щоб не ховатись під підписами заявок справа
+  const right = C.chart.timeScale().width();
+  const maxLen = Math.min(260, right * 0.3);
+  for (let i = 0; i < rows; i++) {
+    if (!tot[i]) continue;
+    const y1 = C.series.priceToCoordinate(lo + step * i), y2 = C.series.priceToCoordinate(lo + step * (i + 1));
+    if (y1 == null || y2 == null) continue;
+    const top = Math.min(y1, y2) + 0.5, height = Math.max(1, Math.abs(y1 - y2) - 1);
+    const inVa = i >= a && i <= z, len = tot[i] / max * maxLen;
+    if (i === poc) {
+      ctx.fillStyle = "rgba(247,166,0,.8)";
+      ctx.fillRect(0, top, len, height);
+      continue;
+    }
+    if (split) {
+      const lb = buy[i] / max * maxLen;
+      ctx.fillStyle = inVa ? "rgba(14,203,129,.6)" : "rgba(14,203,129,.32)";
+      ctx.fillRect(0, top, lb, height);
+      ctx.fillStyle = inVa ? "rgba(246,70,93,.6)" : "rgba(246,70,93,.32)";
+      ctx.fillRect(lb, top, len - lb, height);
+    } else {
+      ctx.fillStyle = inVa ? "rgba(160,170,184,.55)" : "rgba(132,142,156,.3)";
+      ctx.fillRect(0, top, len, height);
+    }
+  }
+  // лінія POC через увесь графік
+  const yp = C.series.priceToCoordinate(lo + step * (poc + 0.5));
+  if (yp != null) {
+    ctx.strokeStyle = "rgba(247,166,0,.55)"; ctx.setLineDash([2, 3]); ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(0, Math.round(yp) + 0.5); ctx.lineTo(right, Math.round(yp) + 0.5); ctx.stroke(); ctx.setLineDash([]);
+    ctx.font = "10px IBM Plex Mono, monospace"; ctx.fillStyle = "#f7a600"; ctx.textAlign = "left";
+    ctx.fillText("POC " + px(lo + step * (poc + 0.5)), 4, Math.max(10, yp - 3));
+  }
+}
+// перемальовувати при прокрутці/масштабуванні (вертикальний масштаб подій не має — тому ще й таймер)
+setInterval(() => { if (C.showVp && C.chart) drawVp(); }, 250);
 function liveConnect() {
   const env = (S && S.env) || "testnet";
   if (!C.symbol || typeof WebSocket === "undefined") return;
@@ -588,7 +682,7 @@ async function loadChart() {
     const dec = Math.min(10, decimalsOf(d.tick));
     C.series.applyOptions({ priceFormat: { type: "price", precision: dec, minMove: Number(d.tick) || Math.pow(10, -dec) } });
     C.oiHist = d.oi || [];
-    if (C.tf !== "1s") { C.bars = d.candles; C.series.setData(d.candles); }
+    if (C.tf !== "1s") { C.bars = d.candles; C.shown = d.candles; C.series.setData(d.candles); }
     liveConnect();
     drawLive(true);
     drawLines(d);

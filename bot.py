@@ -947,7 +947,8 @@ def chart_data(symbol, interval) -> dict:
     if interval != "1s":  # секундні свічки браузер будує сам з потоку угод
         res = bybit("/v5/market/kline", query={"category": "linear", "symbol": symbol, "interval": interval, "limit": "300"})
         candles_ = [
-            {"time": int(k[0]) // 1000, "open": float(k[1]), "high": float(k[2]), "low": float(k[3]), "close": float(k[4])}
+            {"time": int(k[0]) // 1000, "open": float(k[1]), "high": float(k[2]), "low": float(k[3]), "close": float(k[4]),
+             "v": float(k[5] or 0)}
             for k in reversed(res.get("list") or [])
         ]
     try:
