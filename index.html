@@ -7,6 +7,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
 <script src="https://cdn.tailwindcss.com"></script>
+<script src="https://unpkg.com/lightweight-charts@4.2.3/dist/lightweight-charts.standalone.production.js"></script>
 <script>
 tailwind.config = { theme: { extend: { colors: {
   desk: "#0b0e11", panel: "#161a1e", line: "#2b3139", ink: "#eaecef",
@@ -68,6 +69,37 @@ tailwind.config = { theme: { extend: { colors: {
       <button type="button" id="n-start" class="min-h-11 rounded-lg bg-gold px-4 text-sm font-semibold text-desk">Запустити сітку</button>
     </div>
     <div id="n-plan" class="mt-3 hidden rounded-xl border border-line bg-desk p-3 text-sm"></div>
+  </section>
+
+  <section class="rounded-2xl border border-line bg-panel p-4">
+    <div class="flex flex-wrap items-center justify-between gap-2">
+      <h2 class="text-base font-semibold">Графік і заявки</h2>
+      <div class="flex flex-wrap items-center gap-2">
+        <div id="c-symbols" class="flex flex-wrap gap-1"></div>
+        <div id="c-tf" class="flex overflow-hidden rounded-lg border border-line text-xs"></div>
+      </div>
+    </div>
+    <div class="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-xs text-mute">
+      <span><span class="inline-block h-0.5 w-4 align-middle" style="background:#0ecb81"></span> Buy</span>
+      <span><span class="inline-block h-0.5 w-4 align-middle" style="background:#f6465d"></span> Sell</span>
+      <span><span class="inline-block h-0.5 w-4 align-middle" style="background:#f7a600"></span> позиція</span>
+      <span><span class="inline-block h-0.5 w-4 align-middle" style="background:#848e9c"></span> межі сітки</span>
+      <span id="c-info" class="font-mono text-ink"></span>
+    </div>
+    <div id="c-chart" class="mt-2 h-[380px] w-full overflow-hidden rounded-xl border border-line bg-desk"></div>
+    <div class="mt-3 flex items-center justify-between">
+      <h3 class="text-sm font-semibold">Відкриті заявки <span id="o-count" class="font-mono text-mute"></span></h3>
+      <span id="o-sum" class="font-mono text-xs text-mute"></span>
+    </div>
+    <div class="mt-2 max-h-80 overflow-auto rounded-xl border border-line">
+      <table class="w-full min-w-[520px] text-left font-mono text-xs">
+        <thead class="sticky top-0 bg-panel text-mute"><tr>
+          <th class="px-3 py-2">Бік</th><th class="px-3 py-2 text-right">Ціна</th><th class="px-3 py-2 text-right">К-сть</th>
+          <th class="px-3 py-2 text-right">Сума, USDT</th><th class="px-3 py-2 text-right">Від ціни</th><th class="px-3 py-2">Тип</th>
+        </tr></thead>
+        <tbody id="o-body"></tbody>
+      </table>
+    </div>
   </section>
 
   <section>
@@ -266,9 +298,146 @@ $("n-start").onclick = startGrid;
 $("n-range").onclick = rangeGrid;
 $("n-auto").onclick = () => autoGrid("");
 $("n-scalp").onclick = () => autoGrid("scalp");
+// ---------------- графік і заявки ----------------
+const C = { symbol: "", tf: "5", chart: null, series: null, lines: [], key: "", busy: false, extra: [] };
+const TFS = [["1", "1х"], ["5", "5х"], ["15", "15х"], ["60", "1г"], ["240", "4г"], ["D", "1д"]];
+function chartSymbols() {
+  const list = (S && S.grids || []).map(g => g.symbol);
+  const typed = $("n-symbol").value.trim().toUpperCase();
+  if (/^[A-Z0-9]{2,}USDT$/.test(typed) && !list.includes(typed)) list.push(typed);
+  return list;
+}
+function renderChartBar() {
+  const list = chartSymbols();
+  if (!C.symbol || !list.includes(C.symbol)) C.symbol = list[0] || "";
+  $("c-symbols").innerHTML = list.map(s => `<button data-csym="${esc(s)}" class="min-h-9 rounded-lg border px-2 font-mono text-xs ${s === C.symbol ? "border-gold bg-gold text-desk" : "border-line text-mute"}">${esc(s)}</button>`).join("");
+  document.querySelectorAll("[data-csym]").forEach(b => b.onclick = () => { C.symbol = b.dataset.csym; C.key = ""; renderChartBar(); loadChart(); });
+  $("c-tf").innerHTML = TFS.map(([v, t]) => `<button data-tf="${v}" class="min-h-9 px-2.5 ${v === C.tf ? "bg-gold font-semibold text-desk" : "text-mute"}">${t}</button>`).join("");
+  document.querySelectorAll("[data-tf]").forEach(b => b.onclick = () => { C.tf = b.dataset.tf; C.key = ""; renderChartBar(); loadChart(); });
+}
+function ensureChart() {
+  if (C.chart) return true;
+  if (!window.LightweightCharts) { $("c-chart").innerHTML = '<p class="p-4 text-sm text-mute">Бібліотека графіків не завантажилась. Оновіть сторінку.</p>'; return false; }
+  const box = $("c-chart");
+  C.chart = LightweightCharts.createChart(box, {
+    autoSize: true,
+    layout: { background: { type: "solid", color: "#0b0e11" }, textColor: "#848e9c", fontFamily: "IBM Plex Mono, monospace" },
+    grid: { vertLines: { color: "#1b2026" }, horzLines: { color: "#1b2026" } },
+    rightPriceScale: { borderColor: "#2b3139" },
+    timeScale: { borderColor: "#2b3139", timeVisible: true, secondsVisible: false },
+    crosshair: { mode: 0 },
+    localization: { locale: "uk-UA" }
+  });
+  C.series = C.chart.addCandlestickSeries({
+    upColor: "#0ecb81", downColor: "#f6465d", borderVisible: false, wickUpColor: "#0ecb81", wickDownColor: "#f6465d",
+    // масштаб охоплює весь діапазон сітки, позицію та заявки, а не лише свічки
+    autoscaleInfoProvider: (original) => {
+      const r = original();
+      if (!r || !r.priceRange || !C.extra.length) return r;
+      return { ...r, priceRange: {
+        minValue: Math.min(r.priceRange.minValue, ...C.extra),
+        maxValue: Math.max(r.priceRange.maxValue, ...C.extra)
+      } };
+    }
+  });
+  return true;
+}
+function decimalsOf(tick) {
+  const s = String(tick || "0.01");
+  return s.includes(".") ? s.split(".")[1].replace(/0+$/, "").length || 0 : 0;
+}
+function drawLines(d) {
+  // заявки цього бота та межі сітки — у масштаб; чужі далекі заявки не стискають графік
+  C.extra = [
+    ...(d.grid ? [d.grid.lower, d.grid.upper] : []),
+    ...(d.orders || []).filter(o => o.kind !== "чужа").map(o => Number(o.price)),
+    ...(d.position ? [d.position.avg] : [])
+  ].filter(v => v > 0);
+  C.lines.forEach(l => C.series.removePriceLine(l));
+  C.lines = [];
+  const add = (price, color, title, style, width) => {
+    if (!(price > 0)) return;
+    C.lines.push(C.series.createPriceLine({ price, color, lineWidth: width || 1, lineStyle: style, axisLabelVisible: true, title }));
+  };
+  if (d.grid) {
+    add(d.grid.lower, "#848e9c", "низ", 2, 1);
+    add(d.grid.upper, "#848e9c", "верх", 2, 1);
+  }
+  d.orders.forEach(o => {
+    const buy = o.side === "Buy";
+    add(Number(o.price), buy ? "#0ecb81" : "#f6465d", `${buy ? "B" : "S"} ${o.qty}${o.kind === "тейк" ? " тейк" : o.kind === "чужа" ? " ·" : ""}`, o.kind === "чужа" ? 1 : 0, 1);
+  });
+  if (d.position) {
+    add(d.position.avg, "#f7a600", `${d.position.side} ${d.position.size}`, 0, 2);
+    add(d.position.sl, "#f6465d", "стоп", 3, 1);
+    add(d.position.liq, "#a855f7", "ліквідація", 3, 1);
+  }
+}
+function renderOrders(d) {
+  const rows = d.orders.slice().sort((a, b) => Number(b.price) - Number(a.price));
+  $("o-count").textContent = rows.length ? `(${rows.length})` : "";
+  let buy = 0, sell = 0, placedLast = false;
+  const html = [];
+  rows.forEach(o => {
+    const price = Number(o.price), sum = price * Number(o.qty);
+    if (o.side === "Buy") buy += sum; else sell += sum;
+    if (!placedLast && price < d.last) {
+      html.push(`<tr class="bg-gold/10"><td colspan="6" class="px-3 py-1 text-center text-gold">ціна ${px(d.last)}</td></tr>`);
+      placedLast = true;
+    }
+    const dist = (price / d.last - 1) * 100;
+    html.push(`<tr class="border-t border-line">
+      <td class="px-3 py-1.5 ${o.side === "Buy" ? "text-up" : "text-down"}">${esc(o.side)}</td>
+      <td class="px-3 py-1.5 text-right">${esc(o.price)}</td>
+      <td class="px-3 py-1.5 text-right">${esc(o.qty)}${Number(o.filled) > 0 ? ` <span class="text-gold">(${esc(o.filled)})</span>` : ""}</td>
+      <td class="px-3 py-1.5 text-right">${sum.toFixed(2)}</td>
+      <td class="px-3 py-1.5 text-right">${dist >= 0 ? "+" : ""}${dist.toFixed(2)}%</td>
+      <td class="px-3 py-1.5 ${o.kind === "чужа" ? "text-mute" : ""}">${esc(o.kind)}${o.reduce ? " · reduce" : ""}</td>
+    </tr>`);
+  });
+  if (rows.length && !placedLast) html.push(`<tr class="bg-gold/10"><td colspan="6" class="px-3 py-1 text-center text-gold">ціна ${px(d.last)}</td></tr>`);
+  $("o-body").innerHTML = html.join("") || `<tr><td colspan="6" class="px-3 py-3 text-mute">${S && S.keys ? "Відкритих заявок немає." : "Немає ключів Bybit — заявки не видно."}</td></tr>`;
+  $("o-sum").textContent = rows.length ? `Buy ${buy.toFixed(2)} · Sell ${sell.toFixed(2)} USDT` : "";
+  const p = d.position;
+  $("c-info").innerHTML = `${esc(d.symbol)} ${px(d.last)}` + (p ? ` · <span class="text-gold">${esc(p.side)} ${esc(p.size)} @ ${px(p.avg)}</span> · <span class="${p.pnl >= 0 ? "text-up" : "text-down"}">${p.pnl >= 0 ? "+" : ""}${p.pnl.toFixed(4)}</span>` : "");
+}
+async function loadChart() {
+  if (!C.symbol) {
+    $("c-info").textContent = "";
+    $("o-body").innerHTML = `<tr><td colspan="6" class="px-3 py-3 text-mute">Запустіть сітку або впишіть монету у формі.</td></tr>`;
+    $("o-count").textContent = ""; $("o-sum").textContent = "";
+    if (C.series) { C.series.setData([]); drawLines({ orders: [] }); }
+    return;
+  }
+  if (C.busy || !ensureChart()) return;
+  C.busy = true;
+  const want = C.symbol + ":" + C.tf;
+  try {
+    const d = await api("/api/chart", { symbol: C.symbol, interval: C.tf });
+    if (want !== C.symbol + ":" + C.tf) return;
+    const dec = Math.min(10, decimalsOf(d.tick));
+    C.series.applyOptions({ priceFormat: { type: "price", precision: dec, minMove: Number(d.tick) || Math.pow(10, -dec) } });
+    C.series.setData(d.candles);
+    drawLines(d);
+    renderOrders(d);
+    if (C.key !== want) { C.chart.timeScale().fitContent(); C.key = want; }
+  } catch (e) {
+    $("c-info").innerHTML = `<span class="text-down">${esc(e.message)}</span>`;
+  } finally { C.busy = false; }
+}
+$("n-symbol").addEventListener("change", () => {
+  const s = $("n-symbol").value.trim().toUpperCase();
+  if (/^[A-Z0-9]{2,}USDT$/.test(s)) { C.symbol = s; C.key = ""; }
+  renderChartBar(); loadChart();
+});
+const _render = render;
+render = function () { _render(); renderChartBar(); };
+
 renderToggles();
-pull();
+renderChartBar();
+pull().then(() => { renderChartBar(); loadChart(); });
 setInterval(pull, 4000);
+setInterval(loadChart, 5000);
 </script>
 </body>
 </html>

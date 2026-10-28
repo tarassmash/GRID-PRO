@@ -888,6 +888,64 @@ def price_of(symbol) -> dict:
     return {"symbol": symbol, "last": float(ticker(symbol)["lastPrice"]), "tick": spec["tick"], "maxLev": spec["max_lev"]}
 
 
+# ---------------- графік і заявки ----------------
+
+INTERVALS = {"1", "5", "15", "60", "240", "D"}
+
+
+def open_orders(symbol: str) -> list[dict]:
+    """Усі відкриті заявки на монеті (до 200), з позначкою, чи це заявка цього бота."""
+    out: list[dict] = []
+    cursor = ""
+    for _ in range(4):
+        query = {"category": "linear", "symbol": symbol, "limit": "50"}
+        if cursor:
+            query["cursor"] = cursor
+        res = bybit("/v5/order/realtime", query=query, auth=True)
+        for o in res.get("list") or []:
+            out.append({
+                "side": o.get("side"), "price": o.get("price") or o.get("triggerPrice"), "qty": o.get("qty"),
+                "filled": o.get("cumExecQty") or "0", "type": o.get("orderType"), "link": o.get("orderLinkId") or "",
+                "reduce": bool(o.get("reduceOnly")), "stop": o.get("stopOrderType") or "",
+            })
+        cursor = res.get("nextPageCursor") or ""
+        if not cursor:
+            break
+    return out
+
+
+def chart_data(symbol, interval) -> dict:
+    symbol = parse_symbol(symbol)
+    interval = str(interval or "5")
+    if interval not in INTERVALS:
+        interval = "5"
+    res = bybit("/v5/market/kline", query={"category": "linear", "symbol": symbol, "interval": interval, "limit": "300"})
+    candles_ = [
+        {"time": int(k[0]) // 1000, "open": float(k[1]), "high": float(k[2]), "low": float(k[3]), "close": float(k[4])}
+        for k in reversed(res.get("list") or [])
+    ]
+    with LOCK:
+        grid = next((g for g in STATE["grids"] if g["symbol"] == symbol and g["status"] == "active"), None)
+        notes = {l["orderLinkId"]: l.get("note") for l in (grid or {}).get("levels") or []}
+        grid_info = {"lower": grid["lower"], "upper": grid["upper"], "ladder": list(grid.get("ladder") or [])} if grid else None
+    orders: list[dict] = []
+    position = None
+    if CFG.api_key and CFG.api_secret:
+        for o in open_orders(symbol):
+            o["mine"] = o["link"].startswith(LINK_PREFIX)
+            o["kind"] = "тейк" if notes.get(o["link"]) == "counter" else "сітка" if o["mine"] else "чужа"
+            orders.append(o)
+        pos = positions(symbol)
+        if pos:
+            p = pos[0]
+            position = {"side": p.get("side"), "size": p.get("size"), "avg": float(p.get("avgPrice") or 0),
+                        "liq": float(p.get("liqPrice") or 0), "sl": float(p.get("stopLoss") or 0),
+                        "pnl": float(p.get("unrealisedPnl") or 0)}
+    last = candles_[-1]["close"] if candles_ else float(ticker(symbol)["lastPrice"])
+    return {"symbol": symbol, "interval": interval, "last": last, "tick": spec_of(symbol)["tick"], "candles": candles_,
+            "orders": orders, "position": position, "grid": grid_info}
+
+
 # ---------------- цикл ----------------
 
 def loop() -> None:
@@ -1017,6 +1075,7 @@ def serve() -> None:
             routes = {
                 "/api/auto": lambda: auto_params(data),
                 "/api/price": lambda: price_of(data.get("symbol")),
+                "/api/chart": lambda: chart_data(data.get("symbol"), data.get("interval")),
                 "/api/preview": lambda: preview(data),
                 "/api/start": lambda: {"ok": True, "text": start_grid(data)},
                 "/api/stop": lambda: {"ok": True, "text": stop_grid(str(data.get("id") or ""), bool(data.get("close")))},
