@@ -87,6 +87,8 @@ tailwind.config = { theme: { extend: { colors: {
       <button type="button" id="c-oi" class="inline-flex items-center gap-1.5 rounded-md border border-line px-2 py-0.5"></button>
       <button type="button" id="c-cvd" class="inline-flex items-center gap-1.5 rounded-md border border-line px-2 py-0.5"></button>
       <button type="button" id="c-vp" class="inline-flex items-center gap-1.5 rounded-md border border-line px-2 py-0.5"></button>
+      <button type="button" id="c-scale" class="inline-flex items-center gap-1.5 rounded-md border border-gold/40 px-2 py-0.5 text-gold"></button>
+      <span id="c-hidden" class="text-gold"></span>
       <span id="c-live" class="font-mono"></span>
       <span id="c-info" class="font-mono text-ink"></span>
     </div>
@@ -304,10 +306,12 @@ $("n-auto").onclick = () => autoGrid("");
 $("n-scalp").onclick = () => autoGrid("scalp");
 // ---------------- графік і заявки ----------------
 const C = { symbol: "", tf: "5", chart: null, series: null, lines: [], key: "", busy: false, extra: [],
-  oiS: null, cvdS: null, bars: [], oiHist: [], drawnSec: 0, showOi: true, showCvd: true, showVp: true, vpCanvas: null, shown: [] };
+  oiS: null, cvdS: null, bars: [], oiHist: [], drawnSec: 0, showOi: true, showCvd: true, showVp: true, vpCanvas: null, shown: [],
+  scale: "grid" };
 try {
   C.showOi = localStorage.getItem("cOi") !== "0"; C.showCvd = localStorage.getItem("cCvd") !== "0";
   C.showVp = localStorage.getItem("cVp") !== "0";
+  C.scale = localStorage.getItem("cScale") === "near" ? "near" : "grid";
 } catch (e) {}
 const TFS = [["1s", "1с"], ["1", "1х"], ["5", "5х"], ["15", "15х"], ["60", "1г"], ["240", "4г"], ["D", "1д"]];
 function chartSymbols() {
@@ -376,6 +380,7 @@ function ensureChart() {
 function applyLayout() {
   $("c-oi").innerHTML = tog(C.showOi, '<span style="color:#a855f7">OI</span> відкритий інтерес');
   $("c-cvd").innerHTML = tog(C.showCvd, '<span style="color:#38bdf8">CVD</span> дельта обсягу');
+  $("c-scale").textContent = C.scale === "grid" ? "⇕ масштаб: вся сітка" : "⇕ масштаб: біля ціни";
   $("c-vp").innerHTML = tog(C.showVp, '<span style="color:#f7a600">▤</span> горизонтальні обсяги');
   if (!C.chart) return;
   const both = C.showOi && C.showCvd, one = C.showOi || C.showCvd;
@@ -386,6 +391,12 @@ function applyLayout() {
   C.chart.priceScale("cvd").applyOptions({ scaleMargins: { top: both ? 0.82 : 0.79, bottom: 0.01 } });
 }
 $("c-oi").onclick = () => { C.showOi = !C.showOi; try { localStorage.setItem("cOi", C.showOi ? "1" : "0"); } catch (e) {} applyLayout(); };
+$("c-scale").onclick = () => {
+  C.scale = C.scale === "grid" ? "near" : "grid";
+  try { localStorage.setItem("cScale", C.scale); } catch (e) {}
+  applyLayout();
+  if (C.lastData && C.lastData.symbol === C.symbol && C.series) drawLines(C.lastData);
+};
 $("c-vp").onclick = () => { C.showVp = !C.showVp; try { localStorage.setItem("cVp", C.showVp ? "1" : "0"); } catch (e) {} applyLayout(); drawVp(); };
 $("c-cvd").onclick = () => { C.showCvd = !C.showCvd; try { localStorage.setItem("cCvd", C.showCvd ? "1" : "0"); } catch (e) {} applyLayout(); };
 applyLayout();
@@ -607,27 +618,34 @@ function decimalsOf(tick) {
 function drawLines(d) {
   C.lastData = d;
   const mine = (d.orders || []).filter(o => o.kind !== "чужа").map(o => Number(o.price));
+  // лінії сітки: усі ціни ladder + заявки бота (тейки можуть стояти на лінії, якої вже немає після зсуву)
+  const gridLines = [...new Set([...((d.grid && d.grid.ladder) || []).map(Number), ...mine])].filter(v => v > 0);
   let lo = -Infinity, hi = Infinity;
-  if (C.tf === "1s") {
-    // секунди: масштаб за найближчими заявками навколо ціни, далекі лінії не показуємо
-    const below = mine.filter(v => v < d.last), above = mine.filter(v => v > d.last);
-    lo = below.length ? Math.max(...below) : d.last * 0.997;
-    hi = above.length ? Math.min(...above) : d.last * 1.003;
+  if (C.scale === "near") {
+    // біля ціни: по 3 найближчі лінії з кожного боку; далекі ховаємо, щоб не залазили на OI/CVD
+    const below = gridLines.filter(v => v < d.last).sort((a, b) => b - a);
+    const above = gridLines.filter(v => v > d.last).sort((a, b) => a - b);
+    lo = below.length ? below[Math.min(2, below.length - 1)] : d.last * 0.997;
+    hi = above.length ? above[Math.min(2, above.length - 1)] : d.last * 1.003;
     C.extra = [lo, hi];
   } else {
-    // заявки цього бота та межі сітки — у масштаб; чужі далекі заявки не стискають графік
-    C.extra = [...(d.grid ? [d.grid.lower, d.grid.upper] : []), ...mine, ...(d.position ? [d.position.avg] : [])].filter(v => v > 0);
+    // вся сітка: межі, кожна лінія, заявки бота й позиція — у масштабі
+    C.extra = [...(d.grid ? [d.grid.lower, d.grid.upper] : []), ...gridLines, ...(d.position ? [d.position.avg] : [])].filter(v => v > 0);
   }
+  let hidden = 0;
   C.lines.forEach(l => C.series.removePriceLine(l));
   C.lines = [];
   const add = (price, color, title, style, width) => {
-    if (!(price > 0) || price < lo * 0.9999 || price > hi * 1.0001) return;
+    if (!(price > 0)) return;
+    if (price < lo * 0.9999 || price > hi * 1.0001) { hidden++; return; }
     C.lines.push(C.series.createPriceLine({ price, color, lineWidth: width || 1, lineStyle: style, axisLabelVisible: true, title }));
   };
   if (d.grid) {
     add(d.grid.lower, "#848e9c", "низ", 2, 1);
     add(d.grid.upper, "#848e9c", "верх", 2, 1);
   }
+  const withOrder = new Set((d.orders || []).map(o => Number(o.price)));
+  ((d.grid && d.grid.ladder) || []).map(Number).filter(v => !withOrder.has(v)).forEach(v => add(v, "rgba(132,142,156,.45)", "", 1, 1));
   d.orders.forEach(o => {
     const buy = o.side === "Buy";
     add(Number(o.price), buy ? "#0ecb81" : "#f6465d", `${buy ? "B" : "S"} ${o.qty}${o.kind === "тейк" ? " тейк" : o.kind === "чужа" ? " ·" : ""}`, o.kind === "чужа" ? 1 : 0, 1);
@@ -635,6 +653,8 @@ function drawLines(d) {
   if (d.position) {
     add(d.position.avg, "#f7a600", `${d.position.side} ${d.position.size}`, 0, 2);
   }
+  $("c-hidden").textContent = hidden ? `приховано ліній: ${hidden}` : "";
+  if (C.series) C.series.priceScale().applyOptions({ autoScale: true });
 }
 function renderOrders(d) {
   const rows = d.orders.slice().sort((a, b) => Number(b.price) - Number(a.price));
