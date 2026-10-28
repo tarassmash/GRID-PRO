@@ -84,9 +84,12 @@ tailwind.config = { theme: { extend: { colors: {
       <span><span class="inline-block h-0.5 w-4 align-middle" style="background:#f6465d"></span> Sell</span>
       <span><span class="inline-block h-0.5 w-4 align-middle" style="background:#f7a600"></span> позиція</span>
       <span><span class="inline-block h-0.5 w-4 align-middle" style="background:#848e9c"></span> межі сітки</span>
+      <button type="button" id="c-oi" class="inline-flex items-center gap-1.5 rounded-md border border-line px-2 py-0.5"></button>
+      <button type="button" id="c-cvd" class="inline-flex items-center gap-1.5 rounded-md border border-line px-2 py-0.5"></button>
+      <span id="c-live" class="font-mono"></span>
       <span id="c-info" class="font-mono text-ink"></span>
     </div>
-    <div id="c-chart" class="mt-2 h-[380px] w-full overflow-hidden rounded-xl border border-line bg-desk"></div>
+    <div id="c-chart" class="mt-2 h-[480px] w-full overflow-hidden rounded-xl border border-line bg-desk"></div>
     <div class="mt-3 flex items-center justify-between">
       <h3 class="text-sm font-semibold">Відкриті заявки <span id="o-count" class="font-mono text-mute"></span></h3>
       <span id="o-sum" class="font-mono text-xs text-mute"></span>
@@ -299,8 +302,10 @@ $("n-range").onclick = rangeGrid;
 $("n-auto").onclick = () => autoGrid("");
 $("n-scalp").onclick = () => autoGrid("scalp");
 // ---------------- графік і заявки ----------------
-const C = { symbol: "", tf: "5", chart: null, series: null, lines: [], key: "", busy: false, extra: [] };
-const TFS = [["1", "1х"], ["5", "5х"], ["15", "15х"], ["60", "1г"], ["240", "4г"], ["D", "1д"]];
+const C = { symbol: "", tf: "5", chart: null, series: null, lines: [], key: "", busy: false, extra: [],
+  oiS: null, cvdS: null, bars: [], oiHist: [], drawnSec: 0, showOi: true, showCvd: true };
+try { C.showOi = localStorage.getItem("cOi") !== "0"; C.showCvd = localStorage.getItem("cCvd") !== "0"; } catch (e) {}
+const TFS = [["1s", "1с"], ["1", "1х"], ["5", "5х"], ["15", "15х"], ["60", "1г"], ["240", "4г"], ["D", "1д"]];
 function chartSymbols() {
   const list = (S && S.grids || []).map(g => g.symbol);
   const typed = $("n-symbol").value.trim().toUpperCase();
@@ -313,7 +318,11 @@ function renderChartBar() {
   $("c-symbols").innerHTML = list.map(s => `<button data-csym="${esc(s)}" class="min-h-9 rounded-lg border px-2 font-mono text-xs ${s === C.symbol ? "border-gold bg-gold text-desk" : "border-line text-mute"}">${esc(s)}</button>`).join("");
   document.querySelectorAll("[data-csym]").forEach(b => b.onclick = () => { C.symbol = b.dataset.csym; C.key = ""; renderChartBar(); loadChart(); });
   $("c-tf").innerHTML = TFS.map(([v, t]) => `<button data-tf="${v}" class="min-h-9 px-2.5 ${v === C.tf ? "bg-gold font-semibold text-desk" : "text-mute"}">${t}</button>`).join("");
-  document.querySelectorAll("[data-tf]").forEach(b => b.onclick = () => { C.tf = b.dataset.tf; C.key = ""; renderChartBar(); loadChart(); });
+  document.querySelectorAll("[data-tf]").forEach(b => b.onclick = () => {
+    C.tf = b.dataset.tf; C.key = ""; C.drawnSec = 0; renderChartBar();
+    if (C.lastData && C.lastData.symbol === C.symbol && C.series) drawLines(C.lastData);
+    loadChart();
+  });
 }
 function ensureChart() {
   if (C.chart) return true;
@@ -340,23 +349,185 @@ function ensureChart() {
       } };
     }
   });
+  const compact = (v) => {
+    const a = Math.abs(v), sg = v < 0 ? "-" : "";
+    if (a >= 1e9) return sg + (a / 1e9).toFixed(2) + "B";
+    if (a >= 1e6) return sg + (a / 1e6).toFixed(2) + "M";
+    if (a >= 1e4) return sg + (a / 1e3).toFixed(1) + "K";
+    return sg + a.toFixed(a < 10 ? 3 : a < 1000 ? 1 : 0);
+  };
+  C.oiS = C.chart.addLineSeries({ priceScaleId: "oi", color: "#a855f7", lineWidth: 2, title: "OI",
+    priceFormat: { type: "custom", formatter: compact, minMove: 0.001 }, priceLineVisible: false });
+  C.cvdS = C.chart.addLineSeries({ priceScaleId: "cvd", color: "#38bdf8", lineWidth: 2, title: "CVD",
+    priceFormat: { type: "custom", formatter: compact, minMove: 0.001 }, priceLineVisible: false });
+  applyLayout();
   return true;
 }
+function applyLayout() {
+  $("c-oi").innerHTML = tog(C.showOi, '<span style="color:#a855f7">OI</span> відкритий інтерес');
+  $("c-cvd").innerHTML = tog(C.showCvd, '<span style="color:#38bdf8">CVD</span> дельта обсягу');
+  if (!C.chart) return;
+  const both = C.showOi && C.showCvd, one = C.showOi || C.showCvd;
+  C.series.priceScale().applyOptions({ scaleMargins: { top: 0.05, bottom: both ? 0.4 : one ? 0.24 : 0.06 } });
+  C.oiS.applyOptions({ visible: C.showOi });
+  C.cvdS.applyOptions({ visible: C.showCvd });
+  C.chart.priceScale("oi").applyOptions({ scaleMargins: both ? { top: 0.62, bottom: 0.21 } : { top: 0.79, bottom: 0.01 } });
+  C.chart.priceScale("cvd").applyOptions({ scaleMargins: { top: both ? 0.82 : 0.79, bottom: 0.01 } });
+}
+$("c-oi").onclick = () => { C.showOi = !C.showOi; try { localStorage.setItem("cOi", C.showOi ? "1" : "0"); } catch (e) {} applyLayout(); };
+$("c-cvd").onclick = () => { C.showCvd = !C.showCvd; try { localStorage.setItem("cCvd", C.showCvd ? "1" : "0"); } catch (e) {} applyLayout(); };
+applyLayout();
+
+// ---------------- живі угоди Bybit: секундні свічки, CVD, OI ----------------
+// Браузер підключається до публічного потоку Bybit напряму (без ключів).
+const L = { ws: null, sym: "", env: "", sec: new Map(), min: new Map(), ids: new Set(), idq: [], oi: new Map(),
+  lastT: 0, lastPrice: 0, hi: 0, lo: 0, since: 0, dirty: false, live: false };
+const TF_SEC = { "1": 60, "5": 300, "15": 900, "60": 3600, "240": 14400, "D": 86400 };
+function liveReset(sym, env) {
+  Object.assign(L, { sym, env, sec: new Map(), min: new Map(), ids: new Set(), idq: [], oi: new Map(),
+    lastT: 0, lastPrice: 0, hi: 0, lo: 0, since: 0, dirty: true });
+  C.drawnSec = 0;
+}
+function addTrade(id, t, p, v, side) {
+  if (!(t > 0 && p > 0 && v > 0)) return;
+  if (id) {
+    if (L.ids.has(id)) return;
+    L.ids.add(id); L.idq.push(id);
+    if (L.idq.length > 8000) L.ids.delete(L.idq.shift());
+  }
+  const d = side === "Buy" ? v : -v;
+  const s = Math.floor(t / 1000);
+  let b = L.sec.get(s);
+  if (!b) { b = { time: s, open: p, high: p, low: p, close: p, t0: t, t1: t, delta: 0 }; L.sec.set(s, b); }
+  else {
+    b.high = Math.max(b.high, p); b.low = Math.min(b.low, p);
+    if (t < b.t0) { b.t0 = t; b.open = p; }
+    if (t >= b.t1) { b.t1 = t; b.close = p; }
+  }
+  b.delta += d;
+  const m = Math.floor(t / 60000) * 60;
+  L.min.set(m, (L.min.get(m) || 0) + d);
+  if (!L.since || t < L.since) L.since = t;
+  if (t >= L.lastT) {
+    if (!L.hi || Math.floor(t / 1000) !== Math.floor(L.lastT / 1000)) { L.hi = p; L.lo = p; }
+    L.lastT = t; L.lastPrice = p; L.hi = Math.max(L.hi, p); L.lo = Math.min(L.lo, p);
+  }
+  L.dirty = true;
+}
+function addOi(v) {
+  if (!(v > 0)) return;
+  L.oi.set(Math.floor(Date.now() / 1000), v);
+  if (L.oi.size > 4000) L.oi.delete(L.oi.keys().next().value);
+  L.dirty = true;
+}
+function prune() {
+  const nowS = Math.floor(Date.now() / 1000);
+  for (const k of L.sec.keys()) { if (k < nowS - 1800) L.sec.delete(k); else break; }
+  for (const k of L.min.keys()) { if (k < nowS - 4 * 86400) L.min.delete(k); else break; }
+}
+function sortedKeys(map) { return [...map.keys()].sort((a, b) => a - b); }
+function secBars() {
+  return sortedKeys(L.sec).slice(-900).map(k => { const b = L.sec.get(k); return { time: b.time, open: b.open, high: b.high, low: b.low, close: b.close }; });
+}
+function cvdPoints(first) {
+  const pts = [];
+  let cum = 0;
+  if (C.tf === "1s") {
+    for (const k of sortedKeys(L.sec)) { cum += L.sec.get(k).delta; if (k >= first) pts.push({ time: k, value: cum }); }
+    return pts;
+  }
+  const B = TF_SEC[C.tf] || 60, agg = new Map();
+  for (const [m, d] of L.min) { const k = Math.floor(m / B) * B; agg.set(k, (agg.get(k) || 0) + d); }
+  for (const k of sortedKeys(agg)) { cum += agg.get(k); if (k >= first) pts.push({ time: k, value: cum }); }
+  return pts;
+}
+function oiPoints(first) {
+  const B = C.tf === "1s" ? 1 : (TF_SEC[C.tf] || 60), merged = new Map();
+  (C.oiHist || []).forEach(p => merged.set(Math.floor(p.time / B) * B, p.value));
+  for (const k of sortedKeys(L.oi)) merged.set(Math.floor(k / B) * B, L.oi.get(k));
+  return sortedKeys(merged).filter(k => k >= first).map(k => ({ time: k, value: merged.get(k) }));
+}
+function drawLive(full) {
+  if (!C.chart || !C.symbol || L.sym !== C.symbol) return;
+  let first = 0;
+  if (C.tf === "1s") {
+    const bars = secBars();
+    first = bars.length ? bars[0].time : 0;
+    if (full || !C.drawnSec) C.series.setData(bars);
+    else bars.filter(b => b.time >= C.drawnSec).forEach(b => C.series.update(b));
+    C.drawnSec = bars.length ? bars[bars.length - 1].time : 0;
+    if (!bars.length) $("c-info").textContent = `${C.symbol} · чекаю угоди…`;
+  } else if (C.bars.length) {
+    first = C.bars[0].time;
+    if (L.lastT && L.lastPrice) {
+      const B = TF_SEC[C.tf] || 60, k = Math.floor(L.lastT / 1000 / B) * B;
+      let bar = C.bars[C.bars.length - 1];
+      if (k > bar.time) { bar = { time: k, open: L.lastPrice, high: L.hi, low: L.lo, close: L.lastPrice }; C.bars.push(bar); }
+      if (k === bar.time) {
+        bar.close = L.lastPrice; bar.high = Math.max(bar.high, L.hi); bar.low = Math.min(bar.low, L.lo);
+        C.series.update(bar);
+      }
+    }
+  }
+  C.cvdS.setData(cvdPoints(first));
+  C.oiS.setData(oiPoints(first));
+  const since = L.since ? new Date(L.since).toLocaleTimeString("uk-UA") : "—";
+  $("c-live").innerHTML = L.live
+    ? `<span class="text-up">● наживо</span> <span class="text-mute">CVD з ${since}</span>`
+    : `<span class="text-mute">○ потік угод перепідключається…</span>`;
+}
+setInterval(() => { if (L.dirty) { L.dirty = false; prune(); drawLive(false); } }, 300);
+function liveConnect() {
+  const env = (S && S.env) || "testnet";
+  if (!C.symbol || typeof WebSocket === "undefined") return;
+  if (L.ws && L.sym === C.symbol && L.env === env && L.ws.readyState <= 1) return;
+  if (L.ws) { const old = L.ws; L.ws = null; old.onclose = null; try { old.close(); } catch (e) {} }
+  if (L.sym !== C.symbol || L.env !== env) {
+    liveReset(C.symbol, env);
+    const sym = C.symbol;
+    api("/api/trades", { symbol: sym }).then(d => {
+      if (L.sym !== sym) return;
+      (d.trades || []).forEach(t => addTrade(t.id, t.t, t.p, t.v, t.s));
+      drawLive(true);
+    }).catch(() => {});
+  }
+  const sym = C.symbol;
+  const ws = new WebSocket(env === "mainnet" ? "wss://stream.bybit.com/v5/public/linear" : "wss://stream-testnet.bybit.com/v5/public/linear");
+  L.ws = ws; L.live = false;
+  ws.onopen = () => { L.live = true; L.dirty = true; ws.send(JSON.stringify({ op: "subscribe", args: [`publicTrade.${sym}`, `tickers.${sym}`] })); };
+  ws.onmessage = (ev) => {
+    let m;
+    try { m = JSON.parse(ev.data); } catch (e) { return; }
+    if (!m.topic || L.sym !== sym) return;
+    if (m.topic.startsWith("publicTrade.")) (m.data || []).forEach(t => addTrade(t.i, Number(t.T), Number(t.p), Number(t.v), t.S));
+    else if (m.topic.startsWith("tickers.") && m.data && m.data.openInterest != null) addOi(Number(m.data.openInterest));
+  };
+  ws.onclose = () => { if (L.ws !== ws) return; L.live = false; L.dirty = true; L.ws = null; setTimeout(liveConnect, 3000); };
+  ws.onerror = () => {};
+}
+setInterval(() => { if (L.ws && L.ws.readyState === 1) L.ws.send(JSON.stringify({ op: "ping" })); }, 20000);
 function decimalsOf(tick) {
   const s = String(tick || "0.01");
   return s.includes(".") ? s.split(".")[1].replace(/0+$/, "").length || 0 : 0;
 }
 function drawLines(d) {
-  // заявки цього бота та межі сітки — у масштаб; чужі далекі заявки не стискають графік
-  C.extra = [
-    ...(d.grid ? [d.grid.lower, d.grid.upper] : []),
-    ...(d.orders || []).filter(o => o.kind !== "чужа").map(o => Number(o.price)),
-    ...(d.position ? [d.position.avg] : [])
-  ].filter(v => v > 0);
+  C.lastData = d;
+  const mine = (d.orders || []).filter(o => o.kind !== "чужа").map(o => Number(o.price));
+  let lo = -Infinity, hi = Infinity;
+  if (C.tf === "1s") {
+    // секунди: масштаб за найближчими заявками навколо ціни, далекі лінії не показуємо
+    const below = mine.filter(v => v < d.last), above = mine.filter(v => v > d.last);
+    lo = below.length ? Math.max(...below) : d.last * 0.997;
+    hi = above.length ? Math.min(...above) : d.last * 1.003;
+    C.extra = [lo, hi];
+  } else {
+    // заявки цього бота та межі сітки — у масштаб; чужі далекі заявки не стискають графік
+    C.extra = [...(d.grid ? [d.grid.lower, d.grid.upper] : []), ...mine, ...(d.position ? [d.position.avg] : [])].filter(v => v > 0);
+  }
   C.lines.forEach(l => C.series.removePriceLine(l));
   C.lines = [];
   const add = (price, color, title, style, width) => {
-    if (!(price > 0)) return;
+    if (!(price > 0) || price < lo * 0.9999 || price > hi * 1.0001) return;
     C.lines.push(C.series.createPriceLine({ price, color, lineWidth: width || 1, lineStyle: style, axisLabelVisible: true, title }));
   };
   if (d.grid) {
@@ -369,8 +540,6 @@ function drawLines(d) {
   });
   if (d.position) {
     add(d.position.avg, "#f7a600", `${d.position.side} ${d.position.size}`, 0, 2);
-    add(d.position.sl, "#f6465d", "стоп", 3, 1);
-    add(d.position.liq, "#a855f7", "ліквідація", 3, 1);
   }
 }
 function renderOrders(d) {
@@ -399,7 +568,8 @@ function renderOrders(d) {
   $("o-body").innerHTML = html.join("") || `<tr><td colspan="6" class="px-3 py-3 text-mute">${S && S.keys ? "Відкритих заявок немає." : "Немає ключів Bybit — заявки не видно."}</td></tr>`;
   $("o-sum").textContent = rows.length ? `Buy ${buy.toFixed(2)} · Sell ${sell.toFixed(2)} USDT` : "";
   const p = d.position;
-  $("c-info").innerHTML = `${esc(d.symbol)} ${px(d.last)}` + (p ? ` · <span class="text-gold">${esc(p.side)} ${esc(p.size)} @ ${px(p.avg)}</span> · <span class="${p.pnl >= 0 ? "text-up" : "text-down"}">${p.pnl >= 0 ? "+" : ""}${p.pnl.toFixed(4)}</span>` : "");
+  $("c-info").innerHTML = `${esc(d.symbol)} ${px(d.last)}` + (p ? ` · <span class="text-gold">${esc(p.side)} ${esc(p.size)} @ ${px(p.avg)}</span> · <span class="${p.pnl >= 0 ? "text-up" : "text-down"}">${p.pnl >= 0 ? "+" : ""}${p.pnl.toFixed(4)}</span>`
+    + (p.sl ? ` · <span class="text-down">стоп ${px(p.sl)}</span>` : "") + (p.liq ? ` · <span style="color:#a855f7">ліквідація ${px(p.liq)}</span>` : "") : "");
 }
 async function loadChart() {
   if (!C.symbol) {
@@ -417,9 +587,13 @@ async function loadChart() {
     if (want !== C.symbol + ":" + C.tf) return;
     const dec = Math.min(10, decimalsOf(d.tick));
     C.series.applyOptions({ priceFormat: { type: "price", precision: dec, minMove: Number(d.tick) || Math.pow(10, -dec) } });
-    C.series.setData(d.candles);
+    C.oiHist = d.oi || [];
+    if (C.tf !== "1s") { C.bars = d.candles; C.series.setData(d.candles); }
+    liveConnect();
+    drawLive(true);
     drawLines(d);
     renderOrders(d);
+    if (C.tf === "1s" && !L.sec.size) $("c-info").textContent = `${d.symbol} ${px(d.last)} · чекаю угоди…`;
     if (C.key !== want) { C.chart.timeScale().fitContent(); C.key = want; }
   } catch (e) {
     $("c-info").innerHTML = `<span class="text-down">${esc(e.message)}</span>`;

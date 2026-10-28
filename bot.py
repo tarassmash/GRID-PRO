@@ -890,7 +890,31 @@ def price_of(symbol) -> dict:
 
 # ---------------- графік і заявки ----------------
 
-INTERVALS = {"1", "5", "15", "60", "240", "D"}
+INTERVALS = {"1s", "1", "5", "15", "60", "240", "D"}
+OI_INTERVAL = {"1s": "5min", "1": "5min", "5": "5min", "15": "15min", "60": "1h", "240": "4h", "D": "1d"}
+
+
+def open_interest(symbol: str, interval: str) -> list[dict]:
+    res = bybit("/v5/market/open-interest", query={
+        "category": "linear", "symbol": symbol, "intervalTime": OI_INTERVAL.get(interval, "5min"), "limit": "200",
+    })
+    return [
+        {"time": int(r["timestamp"]) // 1000, "value": float(r["openInterest"])}
+        for r in reversed(res.get("list") or []) if r.get("timestamp") and r.get("openInterest")
+    ]
+
+
+def recent_trades(symbol) -> dict:
+    """Останні 1000 угод — стартова точка для секундних свічок і CVD (далі браузер бере угоди наживо)."""
+    symbol = parse_symbol(symbol)
+    res = bybit("/v5/market/recent-trade", query={"category": "linear", "symbol": symbol, "limit": "1000"})
+    trades = [
+        {"id": r.get("execId"), "t": int(r.get("time") or 0), "p": float(r.get("price") or 0),
+         "v": float(r.get("size") or 0), "s": r.get("side")}
+        for r in res.get("list") or [] if not r.get("isBlockTrade")
+    ]
+    trades.sort(key=lambda r: r["t"])
+    return {"symbol": symbol, "trades": trades}
 
 
 def open_orders(symbol: str) -> list[dict]:
@@ -919,11 +943,18 @@ def chart_data(symbol, interval) -> dict:
     interval = str(interval or "5")
     if interval not in INTERVALS:
         interval = "5"
-    res = bybit("/v5/market/kline", query={"category": "linear", "symbol": symbol, "interval": interval, "limit": "300"})
-    candles_ = [
-        {"time": int(k[0]) // 1000, "open": float(k[1]), "high": float(k[2]), "low": float(k[3]), "close": float(k[4])}
-        for k in reversed(res.get("list") or [])
-    ]
+    candles_: list[dict] = []
+    if interval != "1s":  # секундні свічки браузер будує сам з потоку угод
+        res = bybit("/v5/market/kline", query={"category": "linear", "symbol": symbol, "interval": interval, "limit": "300"})
+        candles_ = [
+            {"time": int(k[0]) // 1000, "open": float(k[1]), "high": float(k[2]), "low": float(k[3]), "close": float(k[4])}
+            for k in reversed(res.get("list") or [])
+        ]
+    try:
+        oi = open_interest(symbol, interval)
+    except BybitError as exc:
+        log(f"OI {symbol}: {exc}")
+        oi = []
     with LOCK:
         grid = next((g for g in STATE["grids"] if g["symbol"] == symbol and g["status"] == "active"), None)
         notes = {l["orderLinkId"]: l.get("note") for l in (grid or {}).get("levels") or []}
@@ -942,7 +973,7 @@ def chart_data(symbol, interval) -> dict:
                         "liq": float(p.get("liqPrice") or 0), "sl": float(p.get("stopLoss") or 0),
                         "pnl": float(p.get("unrealisedPnl") or 0)}
     last = candles_[-1]["close"] if candles_ else float(ticker(symbol)["lastPrice"])
-    return {"symbol": symbol, "interval": interval, "last": last, "tick": spec_of(symbol)["tick"], "candles": candles_,
+    return {"symbol": symbol, "interval": interval, "last": last, "tick": spec_of(symbol)["tick"], "candles": candles_, "oi": oi,
             "orders": orders, "position": position, "grid": grid_info}
 
 
@@ -1076,6 +1107,7 @@ def serve() -> None:
                 "/api/auto": lambda: auto_params(data),
                 "/api/price": lambda: price_of(data.get("symbol")),
                 "/api/chart": lambda: chart_data(data.get("symbol"), data.get("interval")),
+                "/api/trades": lambda: recent_trades(data.get("symbol")),
                 "/api/preview": lambda: preview(data),
                 "/api/start": lambda: {"ok": True, "text": start_grid(data)},
                 "/api/stop": lambda: {"ok": True, "text": stop_grid(str(data.get("id") or ""), bool(data.get("close")))},
