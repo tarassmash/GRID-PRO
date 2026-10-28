@@ -427,9 +427,8 @@ def grid_params(data: dict) -> dict:
     shift_min = int(parse_num(data.get("shiftMin", 0), "Іти за ціною через, хв", 0, 1440, integer=True))
     geo = bool(data.get("geo"))
     geo_mult = parse_num(data.get("geoMult") or 1.3, "Множник лота", 1, 3) if geo else 1.0
-    mode = str(data.get("mode") or "both")
-    if mode not in MODES:
-        raise BybitError("Режим: both, sell або buy")
+    # застосунок лише під Sell: нові сітки завжди «Тільки Sell» (старі сітки інших режимів доробляють як були)
+    mode = "sell"
     return {
         "symbol": symbol, "lower": lower, "upper": upper, "count": count, "margin": margin, "lev": lev,
         "trail": bool(data.get("trail", True)), "shiftMin": shift_min, "geo": geo, "geoMult": geo_mult, "mode": mode,
@@ -1087,20 +1086,27 @@ def judge_coin(t: dict, margin: float) -> dict | None:
     min_n = spec.get("min_notional") or 5
     fit = int(margin * lev // max(min_n * 1.05, spec["min_qty"] * last * 1.05))
     count = max(6, min(count, 100, fit)) if fit >= 6 else 0
-    lower, upper = last * (1 - width_pct / 200), last * (1 + width_pct / 200)
+    # Sell-сітка: ціна біля низу діапазону (10% ширини нижче — місце для першого тейку), 90% — вище
+    lower, upper = last * (1 - width_pct * 0.1 / 100), last * (1 + width_pct * 0.9 / 100)
     step = (upper - lower) / count if count else 0
     takes = sum(int((c["high"] - c["low"]) // step) for c in rows) // 2 if step > 0 else 0
     # за 5 хв одна хвиля коливання схожа на тренд, тому зсув 5 хв має меншу вагу, ніж тренд години й пробій
     score = range5 * (1 - 0.5 * er5) * (1 - 0.7 * er60) * (0.5 + 0.5 * centre) * (1 + min(crosses, 20) / 20)
+    # під Sell: краще, коли ціна у верхній частині каналу; година, що росте, — гірше (шорт проти тренду)
+    up60 = rows[-1]["close"] > rows[0]["close"]
+    score *= 0.6 + 0.8 * pos
+    if up60:
+        score *= 1 - 0.5 * er60
+    up_break = breakout and last > phi
     if breakout:
-        score *= 0.2
+        score *= 0.05 if up_break else 0.3
     strict = range5 >= 0.2 and not breakout and er5 <= 0.85 and er60 <= 0.55 and centre >= 0.2 and count > 0
     tick = spec["tick"]
     return {
         "symbol": symbol, "last": last, "turnover": float(t.get("turnover24h") or 0),
         "range5": round(range5, 3), "net5": round(net5, 3), "trend5": round(er5 * 100),
         "range60": round(range60, 3), "trend60": round(er60 * 100), "crosses": crosses, "pos": round(pos * 100),
-        "breakout": breakout,
+        "breakout": breakout, "upBreak": up_break, "up60": up60,
         "score": round(score, 4), "strict": strict,
         "lower": align(lower, tick, False), "upper": align(upper, tick, True), "count": count, "leverage": lev,
         "widthPct": round(width_pct, 2), "stepPct": round(width_pct / count, 3) if count else 0,

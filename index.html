@@ -29,7 +29,7 @@ tailwind.config = { theme: { extend: { colors: {
       <div class="flex size-10 items-center justify-center rounded-xl border border-gold/40 bg-gold/10 text-gold">⌁</div>
       <div>
         <h1 class="text-lg font-semibold tracking-tight">Grid Pro</h1>
-        <p class="text-xs text-mute">Bybit USDT-perp · ручний нейтральний грід</p>
+        <p class="text-xs text-mute">Bybit USDT-perp · Sell-грід (шорт)</p>
       </div>
     </div>
     <div class="flex flex-wrap items-center gap-2">
@@ -51,8 +51,8 @@ tailwind.config = { theme: { extend: { colors: {
   <section class="rounded-2xl border border-line bg-panel p-4">
     <div class="flex flex-wrap items-center justify-between gap-2">
       <div>
-        <h2 class="text-base font-semibold">Пошук монети для нейтрального гріду на 1 годину</h2>
-        <p class="mt-1 text-xs text-mute">Найліквідніші USDT-перпи Bybit. За останні 5 хв — широкий рух туди-сюди без зсуву; за останню годину — без тренду, ціна часто перетинає середину і зараз не на краю. Сітка на годину рахується одразу під вашу маржу.</p>
+        <h2 class="text-base font-semibold">Пошук монети для Sell-гріду на 1 годину</h2>
+        <p class="mt-1 text-xs text-mute">Найліквідніші USDT-перпи Bybit. За останні 5 хв — широкий рух туди-сюди без зсуву; за останню годину — без тренду, ціна часто перетинає середину і зараз не на краю. Перевага — коли ціна у верхній частині каналу і година не росте. Sell-сітка на годину рахується одразу під вашу маржу.</p>
       </div>
       <div class="flex flex-wrap items-center gap-2">
         <button type="button" id="s-run" class="min-h-11 shrink-0 rounded-lg bg-gold px-4 text-sm font-semibold text-desk">🔍 Знайти монети</button>
@@ -72,9 +72,9 @@ tailwind.config = { theme: { extend: { colors: {
           <th class="px-3 py-2 text-right" title="Чистий зсув за 5 хв / розмах. «пробій» — ціна вийшла за канал попередніх 55 хв">Тренд 5хв</th>
           <th class="px-3 py-2 text-right" title="Розмах за годину / тренд години">Година</th>
           <th class="px-3 py-2 text-right" title="Скільки разів за годину ціна перетнула середину каналу">Перетинів</th>
-          <th class="px-3 py-2 text-right" title="Де ціна в годинному каналі: 50% = посередині">Позиція</th>
+          <th class="px-3 py-2 text-right" title="Де ціна в годинному каналі: 0% = низ, 100% = верх. Для Sell краще у верхній половині">Позиція</th>
           <th class="px-3 py-2 text-right">Обсяг 24г</th>
-          <th class="px-3 py-2" title="Сітка на годину">Сітка</th>
+          <th class="px-3 py-2" title="Sell-сітка на годину: межі від ціни, ліній, крок, плече">Sell-сітка</th>
           <th class="px-3 py-2 text-right" title="Оцінка за останню годину">≈тейків/год</th>
           <th class="px-3 py-2"></th>
         </tr></thead>
@@ -84,12 +84,8 @@ tailwind.config = { theme: { extend: { colors: {
   </section>
 
   <section id="form-box" class="rounded-2xl border border-line bg-panel p-4">
-    <h2 class="text-base font-semibold">Нова сітка</h2>
-    <p class="mt-1 text-xs text-mute">Buy ставляться на лініях нижче ціни, Sell — вище. Щойно лімітка виконалась (перевірка кожні 2 с), на сусідній лінії ставиться протилежна — це мікротейк, прибуток одного кроку. Коли ціна виходить з діапазону, сітка (якщо увімкнено) переїжджає за ціною.</p>
-    <div class="mt-3 flex flex-wrap items-center gap-2 text-xs text-mute">Лімітки
-      <div id="n-mode" class="flex overflow-hidden rounded-lg border border-line text-sm"></div>
-      <span id="n-mode-hint" class="text-xs"></span>
-    </div>
+    <h2 class="text-base font-semibold">Нова Sell-сітка</h2>
+    <p class="mt-1 text-xs text-mute">Sell-лімітки ставляться лише на лініях вище ціни. Щойно Sell виконався (перевірка кожні 2 с), на лінію нижче ставиться Buy-тейк reduce-only — він лише закриває цей шорт і ніколи не відкриє лонг. Тейк виконався — на тій самій лінії знову Sell. Діапазон ставиться так, що ціна біля його низу; коли ціна виходить з діапазону, сітка (якщо увімкнено) переїжджає за ціною.</p>
     <div class="mt-3 grid grid-cols-2 gap-3 md:grid-cols-4">
       <label class="flex flex-col gap-1 text-xs text-mute">Монета<input id="n-symbol" placeholder="BTCUSDT" autocomplete="off" class="min-h-11 rounded-lg border border-line bg-desk px-3 font-mono text-sm uppercase text-ink"></label>
       <label class="flex flex-col gap-1 text-xs text-mute">Нижня ціна<input id="n-lower" inputmode="decimal" autocomplete="off" class="min-h-11 rounded-lg border border-line bg-desk px-3 font-mono text-sm text-ink"></label>
@@ -108,7 +104,7 @@ tailwind.config = { theme: { extend: { colors: {
       <button type="button" id="n-auto" class="min-h-11 rounded-lg border border-up/50 bg-up/10 px-3 text-sm font-semibold text-up">Авто: канал і параметри</button>
       <button type="button" id="n-range" class="min-h-11 rounded-lg border border-line px-3 text-sm">Діапазон 6% від ціни</button>
       <button type="button" id="n-preview" class="min-h-11 rounded-lg border border-gold/40 px-3 text-sm text-gold">Перевірити</button>
-      <button type="button" id="n-start" class="min-h-11 rounded-lg bg-gold px-4 text-sm font-semibold text-desk">Запустити сітку</button>
+      <button type="button" id="n-start" class="min-h-11 rounded-lg bg-down px-4 text-sm font-semibold text-white">Запустити Sell-сітку</button>
     </div>
     <div id="n-plan" class="mt-3 hidden rounded-xl border border-line bg-desk p-3 text-sm"></div>
   </section>
@@ -125,8 +121,8 @@ tailwind.config = { theme: { extend: { colors: {
       </div>
     </div>
     <div class="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-xs text-mute">
-      <span><span class="inline-block h-0.5 w-4 align-middle" style="background:#0ecb81"></span> Buy</span>
       <span><span class="inline-block h-0.5 w-4 align-middle" style="background:#f6465d"></span> Sell</span>
+      <span><span class="inline-block h-0.5 w-4 align-middle" style="background:#0ecb81"></span> Buy-тейк</span>
       <span><span class="inline-block h-0.5 w-4 align-middle" style="background:#f7a600"></span> позиція</span>
       <span><span class="inline-block h-0.5 w-4 align-middle" style="background:#848e9c"></span> межі сітки</span>
       <button type="button" id="c-oi" class="inline-flex items-center gap-1.5 rounded-md border border-line px-2 py-0.5"></button>
@@ -218,40 +214,14 @@ function form() {
     trail: NTRAIL, geo: NGEO, geoMult: $("n-geo-mult").value, mode: NMODE
   };
 }
-let NMODE = "both";
-try { const m = localStorage.getItem("nMode"); if (["both", "sell", "buy"].includes(m)) NMODE = m; } catch (e) {}
-const MODE_NAMES = { both: "Buy + Sell", sell: "Тільки Sell", buy: "Тільки Buy" };
-const MODE_HINTS = {
-  both: "Buy нижче ціни, Sell вище — нейтральна сітка.",
-  sell: "Лише Sell вище ціни (шорт). Після виконання — Buy-тейк на лінію нижче (reduce-only), потім знову Sell.",
-  buy: "Лише Buy нижче ціни (лонг). Після виконання — Sell-тейк на лінію вище (reduce-only), потім знову Buy."
-};
-// частка діапазону нижче ціни: однобічна сітка тримає ціну біля свого краю
-const BELOW = { both: 0.5, sell: 0.1, buy: 0.9 };
+// застосунок лише під Sell: нові сітки завжди «Тільки Sell»
+const NMODE = "sell";
+const MODE_NAMES = { both: "Buy + Sell", sell: "Sell", buy: "Тільки Buy" };
+// ціна біля низу діапазону: 10% ширини нижче ціни (місце для першого тейку), 90% — вище, під Sell
 function placeRange(last, width) {
   const d = last >= 100 ? 2 : last >= 1 ? 4 : 6;
-  $("n-lower").value = (last - width * BELOW[NMODE]).toFixed(d);
-  $("n-upper").value = (last + width * (1 - BELOW[NMODE])).toFixed(d);
-}
-function renderMode() {
-  $("n-mode").innerHTML = Object.entries(MODE_NAMES).map(([v, t]) => {
-    const on = v === NMODE;
-    const color = v === "sell" ? "bg-down text-white" : v === "buy" ? "bg-up text-desk" : "bg-gold text-desk";
-    return `<button type="button" data-nmode="${v}" class="min-h-10 px-3 ${on ? color + " font-semibold" : "text-mute"}">${t}</button>`;
-  }).join("");
-  $("n-mode-hint").textContent = MODE_HINTS[NMODE];
-  document.querySelectorAll("[data-nmode]").forEach(b => b.onclick = async () => {
-    const was = NMODE;
-    NMODE = b.dataset.nmode;
-    try { localStorage.setItem("nMode", NMODE); } catch (e) {}
-    renderMode();
-    // діапазон, уже вписаний у форму, зсуваємо так, щоб лінії були з потрібного боку ціни
-    const lo = Number($("n-lower").value), hi = Number($("n-upper").value), sym = $("n-symbol").value.trim();
-    if (was !== NMODE && lo > 0 && hi > lo && sym) {
-      try { const r = await api("/api/price", { symbol: sym.toUpperCase() }); placeRange(Number(r.last), hi - lo); } catch (e) {}
-    }
-    if ($("n-lower").value && $("n-upper").value) previewGrid();
-  });
+  $("n-lower").value = (last - width * 0.1).toFixed(d);
+  $("n-upper").value = (last + width * 0.9).toFixed(d);
 }
 function renderToggles() {
   $("n-trail").innerHTML = tog(NTRAIL, "Сітка йде за ціною (трейлінг)");
@@ -277,7 +247,7 @@ function render() {
     return `<div class="rounded-2xl border border-line bg-panel p-4">
       <div class="flex flex-wrap items-center justify-between gap-2">
         <div class="font-mono text-base font-semibold">${esc(g.symbol)}
-          ${g.mode === "sell" ? '<span class="rounded bg-down px-1.5 py-0.5 text-xs text-white">Тільки Sell</span>' : g.mode === "buy" ? '<span class="rounded bg-up px-1.5 py-0.5 text-xs text-desk">Тільки Buy</span>' : ""}
+          ${g.mode === "sell" ? '<span class="rounded bg-down px-1.5 py-0.5 text-xs text-white">Sell</span>' : `<span class="rounded border border-line px-1.5 py-0.5 text-xs text-mute">${MODE_NAMES[g.mode] || g.mode} · стара</span>`}
           <span class="text-xs text-mute">x${g.lev} · маржа ${g.margin}${g.geo ? " · геометрична" : ""}</span></div>
         <div class="flex gap-2">
           <button data-chart="${esc(g.symbol)}" class="min-h-11 rounded-lg border px-3 text-xs ${g.symbol === C.symbol ? "border-gold text-gold" : "border-line"}">📈 Графік</button>
@@ -289,7 +259,7 @@ function render() {
         <div><span class="block text-mute">Діапазон</span>${px(g.lower)} – ${px(g.upper)}</div>
         <div><span class="block text-mute">Ціна</span>${px(g.last)}${g.out ? ' <span class="text-gold">поза</span>' : ""}</div>
         <div><span class="block text-mute">Сіток · крок</span>${g.count} · ${g.geo ? g.stepPct + "%" : px(g.step)}</div>
-        <div><span class="block text-mute">Лімітки</span>Buy ${g.buys} / Sell ${g.sells}</div>
+        <div><span class="block text-mute">Лімітки</span>${g.mode === "sell" ? `Sell ${g.sells} · тейків ${g.buys}` : `Buy ${g.buys} / Sell ${g.sells}`}</div>
         <div><span class="block text-mute">Виконань</span>${g.fills}</div>
         <div><span class="block text-mute">Мікротейків</span>${g.takes}</div>
         <div><span class="block text-mute">Прибуток сітки</span><span class="${g.profit >= 0 ? "text-up" : "text-down"}">${g.profit >= 0 ? "+" : ""}${Number(g.profit).toFixed(4)}</span></div>
@@ -341,8 +311,8 @@ async function previewGrid() {
     plan.classList.remove("hidden");
     plan.innerHTML = `<b class="font-mono">${esc(p.symbol)}</b> · ціна ${px(p.last)} · плече x${p.lev}<br>
       ${p.geo
-        ? `${p.mode !== "both" ? MODE_NAMES[p.mode] + " · " : ""}Геометрична: Buy ${p.buys} / Sell ${p.sells} лімітів, лоти <b class="font-mono">${esc(p.qty)}</b> (×${p.geoMult} на лінію) · крок ${p.stepPct}%`
-        : `${p.mode !== "both" ? MODE_NAMES[p.mode] + " · " : ""}Buy ${p.buys} / Sell ${p.sells} лімітів по <b class="font-mono">${esc(p.qty)}</b> · крок ${px(p.step)}`} · усього ≈ ${p.notional} USDT<br>
+        ? `Геометрична: ${p.sells} Sell-лімітів вище ціни, лоти <b class="font-mono">${esc(p.qty)}</b> (×${p.geoMult} на лінію) · крок ${p.stepPct}%`
+        : `${p.sells} Sell-лімітів вище ціни по <b class="font-mono">${esc(p.qty)}</b> · крок ${px(p.step)}`} · усього ≈ ${p.notional} USDT<br>
       Прибуток на одну сітку (мікротейк): <b class="text-up">${p.profitLow === p.profitHigh ? p.profitLow + "%" : p.profitLow + "% – " + p.profitHigh + "%"}</b> після комісій мейкера
       ${p.inside ? "" : '<br><span class="text-gold">Ціна зараз поза діапазоном — з одного боку лімітів не буде.</span>'}
       ${p.geo && p.lots ? `<div class="mt-2 max-h-48 overflow-y-auto font-mono text-xs">${p.lots.map(o => `<div class="flex justify-between gap-3"><span class="${o.side === "Buy" ? "text-up" : "text-down"}">${o.side}</span><span>${o.price}</span><span>${o.qty}</span></div>`).join("")}</div>` : ""}`;
@@ -352,7 +322,7 @@ async function previewGrid() {
 async function startGrid() {
   const p = await previewGrid();
   if (!p) return;
-  if (S && S.env === "mainnet" && !confirm(`Запустити сітку ${p.symbol} на MAINNET? Лімітки реальні.`)) return;
+  if (S && S.env === "mainnet" && !confirm(`Запустити Sell-сітку ${p.symbol} на MAINNET? Лімітки реальні.`)) return;
   $("n-start").disabled = true;
   try { toast((await api("/api/start", form())).text); await pull(); showChart(p.symbol); }
   catch (e) { toast(e.message, true); }
@@ -378,7 +348,7 @@ async function autoGrid(profile) {
     const a = await api("/api/auto", { symbol: $("n-symbol").value.trim().toUpperCase(), margin: $("n-margin").value, leverage: "", profile });
     $("n-symbol").value = a.symbol; $("n-lower").value = a.lower; $("n-upper").value = a.upper;
     $("n-count").value = a.count; $("n-lev").value = a.leverage; $("n-shift").value = a.shiftMin;
-    if (NMODE !== "both") placeRange(Number(a.last), Number(a.upper) - Number(a.lower));
+    placeRange(Number(a.last), Number(a.upper) - Number(a.lower));
     NTRAIL = true; renderToggles();
     const p = await previewGrid();
     if (p) $("n-plan").innerHTML += `<div class="mt-2 border-t border-line pt-2 text-xs text-mute">
@@ -958,12 +928,12 @@ function renderScan() {
   $("s-body").innerHTML = rows.map((c, i) => `<tr class="border-t border-line ${i === 0 && !SCAN.relaxed ? "bg-up/5" : ""}">
     <td class="px-3 py-2 font-semibold">${i === 0 && !SCAN.relaxed ? "★ " : ""}${esc(c.symbol)}<span class="block text-[11px] font-normal text-mute">${px(c.last)}</span></td>
     <td class="px-3 py-2 text-right text-ink">${c.range5}%</td>
-    <td class="px-3 py-2 text-right ${c.breakout ? "text-down" : tone(c.trend5, 50, 80)}">${c.breakout ? "пробій " : ""}${c.trend5}%</td>
-    <td class="px-3 py-2 text-right">${c.range60}% <span class="${tone(c.trend60, 30, 55)}">· ${c.trend60}%</span></td>
+    <td class="px-3 py-2 text-right ${c.breakout ? "text-down" : tone(c.trend5, 50, 80)}">${c.breakout ? (c.upBreak ? "пробій ↑ " : "пробій ↓ ") : ""}${c.trend5}%</td>
+    <td class="px-3 py-2 text-right">${c.range60}% <span class="${tone(c.trend60, 30, 55)}">· ${c.up60 ? "↑" : "↓"}${c.trend60}%</span></td>
     <td class="px-3 py-2 text-right">${c.crosses}</td>
-    <td class="px-3 py-2 text-right ${c.pos >= 30 && c.pos <= 70 ? "text-up" : "text-gold"}">${c.pos}%</td>
+    <td class="px-3 py-2 text-right ${c.pos >= 50 && c.pos <= 85 ? "text-up" : "text-gold"}">${c.pos}%</td>
     <td class="px-3 py-2 text-right text-mute">${money(c.turnover)}</td>
-    <td class="px-3 py-2">±${(c.widthPct / 2).toFixed(2)}% · ${c.count} · крок ${c.stepPct}% · x${c.leverage}</td>
+    <td class="px-3 py-2">−${(c.widthPct * 0.1).toFixed(2)}% / +${(c.widthPct * 0.9).toFixed(2)}% · ${c.count} · крок ${c.stepPct}% · x${c.leverage}</td>
     <td class="px-3 py-2 text-right">${c.takesHour}</td>
     <td class="px-3 py-2 text-right">${c.busy
       ? '<span class="text-mute">вже є сітка</span>'
@@ -982,13 +952,13 @@ async function takeCoin(c) {
   $("n-symbol").value = c.symbol; $("n-lower").value = c.lower; $("n-upper").value = c.upper;
   $("n-count").value = c.count; $("n-lev").value = c.leverage; $("n-shift").value = 0;
   NTRAIL = true; renderToggles();
-  NMODE = "both"; try { localStorage.setItem("nMode", NMODE); } catch (e) {} renderMode();
+
   $("form-box").scrollIntoView({ behavior: "smooth", block: "start" });
   showChart(c.symbol);
   const p = await previewGrid();
   if (p) $("n-plan").innerHTML += `<div class="mt-2 border-t border-line pt-2 text-xs text-mute">
     <b class="text-up">З пошуку:</b> за 5 хв рух ${c.range5}% при тренді ${c.trend5}%, за годину ${c.range60}% (тренд ${c.trend60}%, перетинів середини ${c.crosses}).
-    Сітка на годину ±${(c.widthPct / 2).toFixed(2)}%, ${c.count} ліній, крок ${c.stepPct}%, x${c.leverage}, ≈ ${c.takesHour} мікротейків за годину (оцінка за минулою годиною).
+    Sell-сітка на годину: від −${(c.widthPct * 0.1).toFixed(2)}% до +${(c.widthPct * 0.9).toFixed(2)}% від ціни, ${c.count} ліній, крок ${c.stepPct}%, x${c.leverage}, ≈ ${c.takesHour} мікротейків за годину (оцінка за минулою годиною).
     Через годину перевірте монету пошуком ще раз.</div>`;
 }
 $("s-run").onclick = runScan;
@@ -1004,9 +974,9 @@ async function autoSell() {
     // параметри — у форму, щоб їх було видно і можна було змінити
     $("n-symbol").value = pl.symbol; $("n-lower").value = pl.lower; $("n-upper").value = pl.upper;
     $("n-count").value = pl.count; $("n-lev").value = pl.leverage; $("n-margin").value = pl.margin; $("n-shift").value = 0;
-    NTRAIL = true; NGEO = false; NMODE = "sell";
-    try { localStorage.setItem("nGeo", "0"); localStorage.setItem("nMode", "sell"); } catch (e) {}
-    renderToggles(); renderMode();
+    NTRAIL = true; NGEO = false;
+    try { localStorage.setItem("nGeo", "0"); } catch (e) {}
+    renderToggles();
     showChart(pl.symbol);
     await previewGrid();
     $("form-box").scrollIntoView({ behavior: "smooth", block: "start" });
@@ -1029,7 +999,6 @@ async function autoSell() {
 $("s-sell").onclick = autoSell;
 
 renderToggles();
-renderMode();
 renderChartBar();
 pull().then(() => { renderChartBar(); loadChart(); });
 setInterval(pull, 4000);
