@@ -1562,7 +1562,7 @@ def grid_rows() -> list[dict]:
 # переходить на іншу (закриту монету 2 год не бере). Захист кожні 30 с: збиток сітки > stopPct% депозиту → закрити;
 # капітал просів на ddPct% від увімкнення → закрити сітку і вимкнути автопілот. За замовчуванням ВИМКНЕНИЙ.
 
-AUTO_DEFAULT = {"on": False, "pct": 90.0, "everyMin": 60, "stopPct": 10.0, "ddPct": 20.0,
+AUTO_DEFAULT = {"on": False, "pct": 90.0, "everyMin": 60, "stopPct": 10.0, "ddPct": 20.0, "geoMult": 1.3,
                 "startEq": 0.0, "nextAt": 0.0, "guardAt": 0.0, "last": "", "cooldown": {}}
 AUTO_IDLE_SEC = 300
 AUTO_COOLDOWN_SEC = 7200
@@ -1600,15 +1600,16 @@ def autopilot_set(data: dict) -> dict:
     every = int(parse_num(data.get("everyMin", cfg["everyMin"]), "Перевірка, хв", 10, 1440, integer=True))
     stop = parse_num(data.get("stopPct", cfg["stopPct"]), "Стоп сітки, % депозиту", 1, 100)
     dd = parse_num(data.get("ddPct", cfg["ddPct"]), "Просадка автопілота, %", 2, 90)
+    mult = parse_num(data.get("geoMult", cfg["geoMult"]), "Множник лота", 1, 3)
     on = bool(data.get("on", cfg["on"]))
     if on and not (CFG.api_key and CFG.api_secret):
         raise BybitError("Немає ключів Bybit — автопілот не може торгувати")
     with AUTO_LOCK:
         was = cfg["on"]
-        cfg.update({"pct": pct, "everyMin": every, "stopPct": stop, "ddPct": dd})
+        cfg.update({"pct": pct, "everyMin": every, "stopPct": stop, "ddPct": dd, "geoMult": mult})
         if on and not was:
             cfg.update({"on": True, "startEq": wallet_equity(), "nextAt": 0.0, "cooldown": {}})
-            auto_say(f"увімкнено. Капітал {cfg['startEq']:.2f} USDT, сітка на {pct:g}% депозиту, перевірка що {every} хв, "
+            auto_say(f"увімкнено. Капітал {cfg['startEq']:.2f} USDT, геометрична сітка (лот ×{mult:g}) на {pct:g}% депозиту, перевірка що {every} хв, "
                      f"стоп сітки −{stop:g}% депозиту, вимкнення при просадці −{dd:g}%.")
         elif not on and was:
             cfg["on"] = False
@@ -1624,6 +1625,7 @@ def auto_status() -> dict:
     g = auto_grid()
     return {
         "on": cfg["on"], "pct": cfg["pct"], "everyMin": cfg["everyMin"], "stopPct": cfg["stopPct"], "ddPct": cfg["ddPct"],
+        "geoMult": cfg["geoMult"],
         "startEq": cfg["startEq"], "last": cfg["last"], "grid": g["symbol"] if g else "",
         "nextIn": max(0, int(cfg["nextAt"] - time.time())) if cfg["on"] else 0,
         "cooldown": sorted(k for k, v in (cfg.get("cooldown") or {}).items() if v > time.time()),
@@ -1706,8 +1708,21 @@ def autopilot_step() -> None:
     if plan["relaxed"]:
         auto_say(f"ринок трендовий — жодна монета не проходить умови. Чекаю {AUTO_IDLE_SEC // 60} хв.", loud=False)
         return
-    pl = dict(plan["plan"], auto=True, autoEq=plan["equity"])
-    text = start_grid(pl)
+    # автопілот завжди ставить геометричну сітку; якщо найменша лімітка менша за мінімум біржі — менше ліній
+    pl = dict(plan["plan"], auto=True, autoEq=plan["equity"], geo=True, geoMult=cfg["geoMult"])
+    text, err = None, None
+    for count in range(int(pl["count"]), 3, -1):
+        try:
+            text = start_grid(dict(pl, count=count))
+            pl["count"] = count
+            break
+        except BybitError as exc:
+            if "Замало маржі" not in str(exc):
+                raise
+            err = exc
+    if text is None:
+        auto_say(f"не запускаю {pl['symbol']}: {err} Повтор через {AUTO_IDLE_SEC // 60} хв.", loud=False)
+        return
     cfg["nextAt"] = time.time() + cfg["everyMin"] * 60
     c = plan["coin"]
     auto_say(f"запустив {text}. Маржа {pl['margin']} з {plan['equity']} USDT. "

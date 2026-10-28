@@ -56,12 +56,13 @@ tailwind.config = { theme: { extend: { colors: {
       </div>
       <button type="button" id="a-toggle" class="min-h-11 rounded-lg px-4 text-sm font-semibold"></button>
     </div>
-    <p class="mt-1 text-xs text-mute">Одна Sell-сітка автопілота за раз. Немає сітки — кожні 5 хв шукає монету й запускає <b>без підтвердження</b> (ринок трендовий — чекає). Є сітка — раз на період перевіряє монету: почався ріст → екстрено закриває і переходить на іншу (закриту монету 2 год не бере). Захист кожні 30 с: стоп сітки у % депозиту і вимкнення при просадці капіталу. Працює на сервері, сторінку можна закрити.</p>
+    <p class="mt-1 text-xs text-mute">Одна <b>геометрична</b> Sell-сітка автопілота за раз (лінії через однаковий %, найменший лот біля ціни, кожна лінія вгору — у множник разів більший). Немає сітки — кожні 5 хв шукає монету й запускає <b>без підтвердження</b> (ринок трендовий — чекає). Є сітка — раз на період перевіряє монету: почався ріст → екстрено закриває і переходить на іншу (закриту монету 2 год не бере). Захист кожні 30 с: стоп сітки у % депозиту і вимкнення при просадці капіталу. Працює на сервері, сторінку можна закрити.</p>
     <div class="mt-3 grid grid-cols-2 gap-3 md:grid-cols-4">
       <label class="flex flex-col gap-1 text-xs text-mute">Сітка на, % депозиту<input id="a-pct" inputmode="decimal" autocomplete="off" class="min-h-10 w-full rounded-lg border border-line bg-desk px-3 font-mono text-sm text-ink"></label>
       <label class="flex flex-col gap-1 text-xs text-mute">Перевіряти монету кожні, хв<input id="a-every" inputmode="decimal" autocomplete="off" class="min-h-10 w-full rounded-lg border border-line bg-desk px-3 font-mono text-sm text-ink"></label>
       <label class="flex flex-col gap-1 text-xs text-mute">Стоп сітки: збиток, % депозиту<input id="a-stop" inputmode="decimal" autocomplete="off" class="min-h-10 w-full rounded-lg border border-line bg-desk px-3 font-mono text-sm text-ink"></label>
       <label class="flex flex-col gap-1 text-xs text-mute">Вимкнути при просадці капіталу, %<input id="a-dd" inputmode="decimal" autocomplete="off" class="min-h-10 w-full rounded-lg border border-line bg-desk px-3 font-mono text-sm text-ink"></label>
+      <label class="flex flex-col gap-1 text-xs text-mute">Геометрична сітка: множник лота<input id="a-mult" inputmode="decimal" autocomplete="off" class="min-h-10 w-full rounded-lg border border-line bg-desk px-3 font-mono text-sm text-ink"></label>
     </div>
     <div class="mt-3 flex flex-wrap items-center gap-2">
       <button type="button" id="a-save" class="hidden min-h-10 rounded-lg border border-gold/40 px-3 text-sm text-gold">Зберегти налаштування</button>
@@ -972,6 +973,7 @@ function renderAuto() {
   if (!a) return;
   if (!AUTO_FILLED) {
     $("a-pct").value = a.pct; $("a-every").value = a.everyMin; $("a-stop").value = a.stopPct; $("a-dd").value = a.ddPct;
+    $("a-mult").value = a.geoMult;
     AUTO_FILLED = true;
   }
   $("a-badge").textContent = a.on ? "УВІМКНЕНО" : "вимкнено";
@@ -991,14 +993,14 @@ function renderAuto() {
   $("a-status").innerHTML = esc(parts.join(" · ")) + (a.last ? `<br><span class="text-ink">Останнє: ${esc(a.last)}</span>` : "");
 }
 function autoForm(on) {
-  return { on, pct: $("a-pct").value, everyMin: $("a-every").value, stopPct: $("a-stop").value, ddPct: $("a-dd").value };
+  return { on, pct: $("a-pct").value, everyMin: $("a-every").value, stopPct: $("a-stop").value, ddPct: $("a-dd").value, geoMult: $("a-mult").value };
 }
 $("a-toggle").onclick = async () => {
   const on = !(S && S.auto && S.auto.on);
   if (on) {
     const f = autoForm(true);
     const msg = `🤖 Увімкнути автопілот Sell${S.env === "mainnet" ? " на MAINNET (реальні гроші)" : " (testnet)"}?\n\n`
-      + `• Сам шукає монету і запускає Sell-сітку на ${f.pct}% депозиту БЕЗ підтвердження.\n`
+      + `• Сам шукає монету і запускає геометричну Sell-сітку (лот ×${f.geoMult}) на ${f.pct}% депозиту БЕЗ підтвердження.\n`
       + `• Кожні ${f.everyMin} хв перевіряє монету; почався ріст — закриває ринком і переходить на іншу.\n`
       + `• Збиток сітки більше ${f.stopPct}% депозиту — закриває сітку.\n`
       + `• Капітал впав на ${f.ddPct}% — закриває все і вимикається.\n\n`
