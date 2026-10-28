@@ -80,6 +80,9 @@ tailwind.config = { theme: { extend: { colors: {
       <div class="flex flex-wrap items-center gap-2">
         <div id="c-symbols" class="flex flex-wrap gap-1"></div>
         <div id="c-tf" class="flex overflow-hidden rounded-lg border border-line text-xs"></div>
+        <div id="c-type" class="flex overflow-hidden rounded-lg border border-line text-xs"></div>
+        <label id="c-brick-box" class="hidden items-center gap-1 text-xs text-mute">цеглина
+          <input id="c-brick" inputmode="decimal" placeholder="авто" autocomplete="off" class="min-h-9 w-20 rounded-lg border border-line bg-desk px-2 font-mono text-xs text-ink"></label>
       </div>
     </div>
     <div class="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-xs text-mute">
@@ -325,11 +328,13 @@ $("n-scalp").onclick = () => autoGrid("scalp");
 // ---------------- графік і заявки ----------------
 const C = { symbol: "", tf: "5", chart: null, series: null, lines: [], key: "", busy: false, extra: [],
   oiS: null, cvdS: null, bars: [], oiHist: [], drawnSec: 0, showOi: true, showCvd: true, showVp: true, vpCanvas: null, shown: [],
-  scale: "grid" };
+  scale: "grid", ctype: "ha", brick: 0 };
 try {
   C.showOi = localStorage.getItem("cOi") !== "0"; C.showCvd = localStorage.getItem("cCvd") !== "0";
   C.showVp = localStorage.getItem("cVp") !== "0";
   C.scale = localStorage.getItem("cScale") === "near" ? "near" : "grid";
+  const ct = localStorage.getItem("cType"); if (["ha", "renko", "candle"].includes(ct)) C.ctype = ct;
+  const br = localStorage.getItem("cBrick"); if (br) $("c-brick").value = br;
 } catch (e) {}
 const TFS = [["1s", "1с"], ["1", "1х"], ["5", "5х"], ["15", "15х"], ["60", "1г"], ["240", "4г"], ["D", "1д"]];
 function chartSymbols() {
@@ -344,6 +349,15 @@ function renderChartBar() {
   $("c-symbols").innerHTML = list.map(s => `<button data-csym="${esc(s)}" class="min-h-9 rounded-lg border px-2 font-mono text-xs ${s === C.symbol ? "border-gold bg-gold text-desk" : "border-line text-mute"}">${esc(s)}</button>`).join("");
   document.querySelectorAll("[data-csym]").forEach(b => b.onclick = () => { C.symbol = b.dataset.csym; C.key = ""; renderChartBar(); loadChart(); });
   $("c-tf").innerHTML = TFS.map(([v, t]) => `<button data-tf="${v}" class="min-h-9 px-2.5 ${v === C.tf ? "bg-gold font-semibold text-desk" : "text-mute"}">${t}</button>`).join("");
+  const TYPES = [["ha", "Heikin Ashi"], ["renko", "Renko"], ["candle", "Свічки"]];
+  $("c-type").innerHTML = TYPES.map(([v, t]) => `<button data-ctype="${v}" class="min-h-9 px-2.5 ${v === C.ctype ? "bg-gold font-semibold text-desk" : "text-mute"}">${t}</button>`).join("");
+  $("c-brick-box").classList.toggle("hidden", C.ctype !== "renko");
+  $("c-brick-box").classList.toggle("flex", C.ctype === "renko");
+  document.querySelectorAll("[data-ctype]").forEach(b => b.onclick = () => {
+    C.ctype = b.dataset.ctype;
+    try { localStorage.setItem("cType", C.ctype); } catch (e) {}
+    C.key = ""; renderChartBar(); applyLayout(); drawLive(true); redrawBars(true);
+  });
   document.querySelectorAll("[data-tf]").forEach(b => b.onclick = () => {
     C.tf = b.dataset.tf; C.key = ""; C.drawnSec = 0; renderChartBar();
     if (C.lastData && C.lastData.symbol === C.symbol && C.series) drawLines(C.lastData);
@@ -400,11 +414,16 @@ function applyLayout() {
   $("c-cvd").innerHTML = tog(C.showCvd, '<span style="color:#38bdf8">CVD</span> дельта обсягу');
   $("c-scale").textContent = C.scale === "grid" ? "⇕ масштаб: вся сітка" : "⇕ масштаб: біля ціни";
   $("c-vp").innerHTML = tog(C.showVp, '<span style="color:#f7a600">▤</span> горизонтальні обсяги');
+  // Renko не має шкали часу — OI і CVD (вони по часу) там вимикаються
+  const renkoMode = C.ctype === "renko";
+  $("c-oi").style.opacity = $("c-cvd").style.opacity = renkoMode ? ".4" : "1";
+  $("c-oi").title = $("c-cvd").title = renkoMode ? "У Renko немає шкали часу — OI і CVD показуються на інших типах графіка" : "";
   if (!C.chart) return;
-  const both = C.showOi && C.showCvd, one = C.showOi || C.showCvd;
+  const showOi = C.showOi && !renkoMode, showCvd = C.showCvd && !renkoMode;
+  const both = showOi && showCvd, one = showOi || showCvd;
   C.series.priceScale().applyOptions({ scaleMargins: { top: 0.05, bottom: both ? 0.4 : one ? 0.24 : 0.06 } });
-  C.oiS.applyOptions({ visible: C.showOi });
-  C.cvdS.applyOptions({ visible: C.showCvd });
+  C.oiS.applyOptions({ visible: showOi });
+  C.cvdS.applyOptions({ visible: showCvd });
   C.chart.priceScale("oi").applyOptions({ scaleMargins: both ? { top: 0.62, bottom: 0.21 } : { top: 0.79, bottom: 0.01 } });
   C.chart.priceScale("cvd").applyOptions({ scaleMargins: { top: both ? 0.82 : 0.79, bottom: 0.01 } });
 }
@@ -418,6 +437,68 @@ $("c-scale").onclick = () => {
 $("c-vp").onclick = () => { C.showVp = !C.showVp; try { localStorage.setItem("cVp", C.showVp ? "1" : "0"); } catch (e) {} applyLayout(); drawVp(); };
 $("c-cvd").onclick = () => { C.showCvd = !C.showCvd; try { localStorage.setItem("cCvd", C.showCvd ? "1" : "0"); } catch (e) {} applyLayout(); };
 applyLayout();
+
+// ---------------- тип графіка: Heikin Ashi, Renko, звичайні свічки ----------------
+function heikinAshi(bars) {
+  const out = [];
+  let po = 0, pc = 0;
+  bars.forEach((b, i) => {
+    const c = (b.open + b.high + b.low + b.close) / 4;
+    const o = i ? (po + pc) / 2 : (b.open + b.close) / 2;
+    out.push({ time: b.time, open: o, high: Math.max(b.high, o, c), low: Math.min(b.low, o, c), close: c });
+    po = o; pc = c;
+  });
+  return out;
+}
+function autoBrick(bars) {
+  // ATR(14) по свічках, що є на графіку; округлено до тіка
+  const n = Math.min(14, bars.length - 1);
+  if (n < 1) return 0;
+  let sum = 0;
+  for (let i = bars.length - n; i < bars.length; i++) {
+    const b = bars[i], pc = bars[i - 1].close;
+    sum += Math.max(b.high - b.low, Math.abs(b.high - pc), Math.abs(b.low - pc));
+  }
+  const tick = Number((C.lastData && C.lastData.tick) || 0) || 0;
+  let size = sum / n;
+  if (tick > 0) size = Math.max(tick, Math.round(size / tick) * tick);
+  return size;
+}
+function renko(bars) {
+  if (bars.length < 2) return [];
+  const manual = Number(String($("c-brick").value || "").replace(",", "."));
+  const size = manual > 0 ? manual : autoBrick(bars);
+  C.brick = size;
+  if (!(size > 0)) return [];
+  const out = [];
+  let top = bars[0].close, bottom = bars[0].close, t = bars[0].time - 1;
+  const push = (o, c, time) => { t = Math.max(time, t + 1); out.push({ time: t, open: o, close: c, high: Math.max(o, c), low: Math.min(o, c) }); };
+  for (const b of bars) {
+    // класичний Renko по закриттю: нова цеглина — рух на розмір цеглини, розворот — на дві
+    let guard = 0;
+    while (b.close >= top + size && guard++ < 500) { push(top, top + size, b.time); bottom = top; top += size; }
+    while (b.close <= bottom - size && guard++ < 500) { push(bottom, bottom - size, b.time); top = bottom; bottom -= size; }
+  }
+  return out.slice(-600);
+}
+function display(bars) {
+  if (C.ctype === "ha") return heikinAshi(bars);
+  if (C.ctype === "renko") return renko(bars);
+  return bars.map(b => ({ time: b.time, open: b.open, high: b.high, low: b.low, close: b.close }));
+}
+function redrawBars(full) {
+  if (!C.series) return;
+  if (C.tf === "1s") { C.drawnSec = 0; drawLive(true); }
+  else C.series.setData(display(C.bars || []));
+  if (full && C.chart) { C.chart.timeScale().fitContent(); C.key = C.symbol + ":" + C.tf; }
+  const info = C.ctype === "renko" && C.brick > 0 ? `цеглина ${px(C.brick)}${$("c-brick").value ? "" : " (авто, ATR14)"}` : "";
+  $("c-brick").title = info;
+  $("c-brick").placeholder = C.ctype === "renko" && C.brick > 0 && !$("c-brick").value ? px(C.brick) : "авто";
+}
+$("c-brick").onchange = () => {
+  try { localStorage.setItem("cBrick", $("c-brick").value.trim()); } catch (e) {}
+  redrawBars(true);
+};
 
 // ---------------- живі угоди Bybit: секундні свічки, CVD, OI ----------------
 // Браузер підключається до публічного потоку Bybit напряму (без ключів).
@@ -496,8 +577,9 @@ function drawLive(full) {
     const bars = secBars();
     first = bars.length ? bars[0].time : 0;
     C.shown = bars;
-    if (full || !C.drawnSec) C.series.setData(bars);
-    else bars.filter(b => b.time >= C.drawnSec).forEach(b => C.series.update(b));
+    const disp = display(bars);
+    if (full || !C.drawnSec || C.ctype === "renko") C.series.setData(disp);
+    else disp.filter(b => b.time >= C.drawnSec).forEach(b => C.series.update(b));
     C.drawnSec = bars.length ? bars[bars.length - 1].time : 0;
     if (!bars.length) $("c-info").textContent = `${C.symbol} · чекаю угоди…`;
   } else if (C.bars.length) {
@@ -508,12 +590,13 @@ function drawLive(full) {
       if (k > bar.time) { bar = { time: k, open: L.lastPrice, high: L.hi, low: L.lo, close: L.lastPrice }; C.bars.push(bar); }
       if (k === bar.time) {
         bar.close = L.lastPrice; bar.high = Math.max(bar.high, L.hi); bar.low = Math.min(bar.low, L.lo);
-        C.series.update(bar);
+        if (C.ctype === "renko") C.series.setData(display(C.bars));
+        else { const disp = display(C.bars); C.series.update(disp[disp.length - 1]); }
       }
     }
   }
-  C.cvdS.setData(cvdPoints(first));
-  C.oiS.setData(oiPoints(first));
+  C.cvdS.setData(C.ctype === "renko" ? [] : cvdPoints(first));
+  C.oiS.setData(C.ctype === "renko" ? [] : oiPoints(first));
   const since = L.since ? new Date(L.since).toLocaleTimeString("uk-UA") : "—";
   $("c-live").innerHTML = L.live
     ? `<span class="text-up">● наживо</span> <span class="text-mute">CVD з ${since}</span>`
@@ -534,9 +617,9 @@ function drawVp() {
   ctx.clearRect(0, 0, w, h);
   const bars = C.shown || [];
   if (!C.showVp || !bars.length) return;
-  const range = C.chart.timeScale().getVisibleLogicalRange();
-  const from = Math.max(0, Math.floor(range ? range.from : 0)), to = Math.min(bars.length - 1, Math.ceil(range ? range.to : bars.length - 1));
-  const vis = bars.slice(from, to + 1).filter(b => (b.v || 0) > 0 && b.high >= b.low);
+  const range = C.chart.timeScale().getVisibleRange();
+  const t0 = range ? Number(range.from) : -Infinity, t1 = range ? Number(range.to) : Infinity;
+  const vis = bars.filter(b => b.time >= t0 && b.time <= t1 && (b.v || 0) > 0 && b.high >= b.low);
   if (!vis.length) return;
   let lo = Infinity, hi = -Infinity;
   vis.forEach(b => { lo = Math.min(lo, b.low); hi = Math.max(hi, b.high); });
@@ -720,7 +803,8 @@ async function loadChart() {
     const dec = Math.min(10, decimalsOf(d.tick));
     C.series.applyOptions({ priceFormat: { type: "price", precision: dec, minMove: Number(d.tick) || Math.pow(10, -dec) } });
     C.oiHist = d.oi || [];
-    if (C.tf !== "1s") { C.bars = d.candles; C.shown = d.candles; C.series.setData(d.candles); }
+    C.lastData = C.lastData && C.lastData.symbol === d.symbol ? Object.assign(C.lastData, { tick: d.tick }) : { symbol: d.symbol, tick: d.tick };
+    if (C.tf !== "1s") { C.bars = d.candles; C.shown = d.candles; C.series.setData(display(d.candles)); }
     liveConnect();
     drawLive(true);
     drawLines(d);
