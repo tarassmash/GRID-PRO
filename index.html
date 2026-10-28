@@ -204,6 +204,7 @@ function render() {
       <div class="flex flex-wrap items-center justify-between gap-2">
         <div class="font-mono text-base font-semibold">${esc(g.symbol)} <span class="text-xs text-mute">x${g.lev} · маржа ${g.margin}${g.geo ? " · геометрична" : ""}</span></div>
         <div class="flex gap-2">
+          <button data-chart="${esc(g.symbol)}" class="min-h-11 rounded-lg border px-3 text-xs ${g.symbol === C.symbol ? "border-gold text-gold" : "border-line"}">📈 Графік</button>
           <button data-stop="${esc(g.id)}" class="min-h-11 rounded-lg border border-line px-3 text-xs">Зняти ліміти</button>
           <button data-close="${esc(g.id)}" class="min-h-11 rounded-lg border-2 border-down bg-down/15 px-3 text-xs font-bold text-down hover:bg-down hover:text-white">⛔ Екстрено закрити</button>
         </div>
@@ -223,6 +224,7 @@ function render() {
     </div>`;
   }).join("") : `<p class="rounded-2xl border border-line bg-panel p-4 text-sm text-mute">Живих сіток немає.</p>`;
   document.querySelectorAll("[data-stop]").forEach(b => b.onclick = () => stopGrid(b.dataset.stop, false));
+  document.querySelectorAll("[data-chart]").forEach(b => b.onclick = () => showChart(b.dataset.chart));
   document.querySelectorAll("[data-close]").forEach(b => b.onclick = () => panic(b.dataset.close, b));
   $("btn-panic").classList.toggle("hidden", !rows.length);
   $("btn-panic").classList.toggle("inline-flex", !!rows.length);
@@ -276,7 +278,7 @@ async function startGrid() {
   if (!p) return;
   if (S && S.env === "mainnet" && !confirm(`Запустити сітку ${p.symbol} на MAINNET? Лімітки реальні.`)) return;
   $("n-start").disabled = true;
-  try { toast((await api("/api/start", form())).text); pull(); }
+  try { toast((await api("/api/start", form())).text); await pull(); showChart(p.symbol); }
   catch (e) { toast(e.message, true); }
   finally { $("n-start").disabled = false; }
 }
@@ -346,15 +348,25 @@ function chartSymbols() {
 function renderChartBar() {
   const list = chartSymbols();
   if (!C.symbol || !list.includes(C.symbol)) C.symbol = list[0] || "";
-  $("c-symbols").innerHTML = list.map(s => `<button data-csym="${esc(s)}" class="min-h-9 rounded-lg border px-2 font-mono text-xs ${s === C.symbol ? "border-gold bg-gold text-desk" : "border-line text-mute"}">${esc(s)}</button>`).join("");
-  document.querySelectorAll("[data-csym]").forEach(b => b.onclick = () => { C.symbol = b.dataset.csym; C.key = ""; renderChartBar(); loadChart(); });
-  $("c-tf").innerHTML = TFS.map(([v, t]) => `<button data-tf="${v}" class="min-h-9 px-2.5 ${v === C.tf ? "bg-gold font-semibold text-desk" : "text-mute"}">${t}</button>`).join("");
+  // перемальовуємо лише коли щось змінилось — інакше клік, що припав на оновлення, губиться
+  const symHtml = list.length
+    ? list.map(s => `<button data-csym="${esc(s)}" class="min-h-9 rounded-lg border px-3 font-mono text-xs font-semibold ${s === C.symbol ? "border-gold bg-gold text-desk" : "border-line text-ink hover:border-gold"}">${esc(s)}</button>`).join("")
+    : "";
+  if (symHtml !== C.symHtml) {
+    C.symHtml = symHtml;
+    $("c-symbols").innerHTML = symHtml;
+    document.querySelectorAll("[data-csym]").forEach(b => b.onclick = () => showChart(b.dataset.csym));
+  }
+  const tfHtml = TFS.map(([v, t]) => `<button data-tf="${v}" class="min-h-9 px-2.5 ${v === C.tf ? "bg-gold font-semibold text-desk" : "text-mute"}">${t}</button>`).join("");
+  if (tfHtml === C.tfHtml && C.typeHtmlFor === C.ctype) return;
+  C.tfHtml = tfHtml; C.typeHtmlFor = C.ctype;
+  $("c-tf").innerHTML = tfHtml;
   const TYPES = [["ha", "Heikin Ashi"], ["renko", "Renko"], ["candle", "Свічки"]];
   $("c-type").innerHTML = TYPES.map(([v, t]) => `<button data-ctype="${v}" class="min-h-9 px-2.5 ${v === C.ctype ? "bg-gold font-semibold text-desk" : "text-mute"}">${t}</button>`).join("");
   $("c-brick-box").classList.toggle("hidden", C.ctype !== "renko");
   $("c-brick-box").classList.toggle("flex", C.ctype === "renko");
   document.querySelectorAll("[data-ctype]").forEach(b => b.onclick = () => {
-    C.ctype = b.dataset.ctype;
+    C.ctype = b.dataset.ctype; C.typeHtmlFor = "";
     try { localStorage.setItem("cType", C.ctype); } catch (e) {}
     C.key = ""; renderChartBar(); applyLayout(); drawLive(true); redrawBars(true);
   });
@@ -787,6 +799,17 @@ function renderOrders(d) {
   $("c-info").innerHTML = `${esc(d.symbol)} ${px(d.last)}` + (p ? ` · <span class="text-gold">${esc(p.side)} ${esc(p.size)} @ ${px(p.avg)}</span> · <span class="${p.pnl >= 0 ? "text-up" : "text-down"}">${p.pnl >= 0 ? "+" : ""}${p.pnl.toFixed(4)}</span>`
     + (p.sl ? ` · <span class="text-down">стоп ${px(p.sl)}</span>` : "") + (p.liq ? ` · <span style="color:#a855f7">ліквідація ${px(p.liq)}</span>` : "") : "");
 }
+function showChart(sym) {
+  // одразу перемикаємось: старі лінії й свічки прибираємо, нове завантажуємо
+  if (!sym) return;
+  C.symbol = sym; C.key = ""; C.bars = []; C.shown = []; C.drawnSec = 0; C.lastData = null;
+  if (C.series) { C.series.setData([]); drawLines({ orders: [], last: 0 }); C.extra = []; C.oiS.setData([]); C.cvdS.setData([]); }
+  $("c-info").textContent = `${sym} · завантажую…`;
+  $("o-body").innerHTML = ""; $("o-count").textContent = ""; $("o-sum").textContent = "";
+  C.symHtml = ""; renderChartBar();
+  loadChart();
+  $("c-chart").scrollIntoView({ behavior: "smooth", block: "center" });
+}
 async function loadChart() {
   if (!C.symbol) {
     $("c-info").textContent = "";
@@ -795,12 +818,13 @@ async function loadChart() {
     if (C.series) { C.series.setData([]); drawLines({ orders: [] }); }
     return;
   }
-  if (C.busy || !ensureChart()) return;
-  C.busy = true;
+  if (!ensureChart()) return;
+  // кожен запит має номер; відповідь на застарілий запит (інша монета / таймфрейм) відкидається
+  const seq = C.seq = (C.seq || 0) + 1;
   const want = C.symbol + ":" + C.tf;
   try {
     const d = await api("/api/chart", { symbol: C.symbol, interval: C.tf });
-    if (want !== C.symbol + ":" + C.tf) return;
+    if (seq !== C.seq || want !== C.symbol + ":" + C.tf) return;
     const dec = Math.min(10, decimalsOf(d.tick));
     C.series.applyOptions({ priceFormat: { type: "price", precision: dec, minMove: Number(d.tick) || Math.pow(10, -dec) } });
     C.oiHist = d.oi || [];
@@ -813,8 +837,8 @@ async function loadChart() {
     if (C.tf === "1s" && !L.sec.size) $("c-info").textContent = `${d.symbol} ${px(d.last)} · чекаю угоди…`;
     if (C.key !== want) { C.chart.timeScale().fitContent(); C.key = want; }
   } catch (e) {
-    $("c-info").innerHTML = `<span class="text-down">${esc(e.message)}</span>`;
-  } finally { C.busy = false; }
+    if (seq === C.seq) $("c-info").innerHTML = `<span class="text-down">${esc(e.message)}</span>`;
+  }
 }
 $("n-symbol").addEventListener("change", () => {
   const s = $("n-symbol").value.trim().toUpperCase();
@@ -822,13 +846,23 @@ $("n-symbol").addEventListener("change", () => {
   renderChartBar(); loadChart();
 });
 const _render = render;
-render = function () { _render(); renderChartBar(); };
+// поки кнопка миші/палець натиснуті — не перемальовуємо сторінку, щоб клік не загубився
+let PRESSING = false, PENDING = false;
+document.addEventListener("pointerdown", () => { PRESSING = true; }, true);
+const release = () => { PRESSING = false; if (PENDING) setTimeout(() => { if (!PRESSING && PENDING) { PENDING = false; render(); } }, 250); };
+document.addEventListener("pointerup", release, true);
+document.addEventListener("pointercancel", release, true);
+render = function () {
+  if (PRESSING) { PENDING = true; return; }
+  PENDING = false;
+  _render(); renderChartBar();
+};
 
 renderToggles();
 renderChartBar();
 pull().then(() => { renderChartBar(); loadChart(); });
 setInterval(pull, 4000);
-setInterval(loadChart, 5000);
+setInterval(() => { if (!C.loading) { C.loading = true; loadChart().finally(() => { C.loading = false; }); } }, 5000);
 </script>
 </body>
 </html>
