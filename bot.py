@@ -697,7 +697,88 @@ def finish_grid(grid: dict, status: str) -> None:
     grid["closedAt"] = int(time.time())
 
 
+def batch_cancel(symbol: str, links: list[str]) -> None:
+    """Знімає заявки пачками по 20 (швидко); якщо пачка не пройшла — по одній."""
+    links = [l for l in links if l.startswith(LINK_PREFIX)]
+    for i in range(0, len(links), 20):
+        chunk = links[i:i + 20]
+        try:
+            bybit("/v5/order/cancel-batch", "POST", body={
+                "category": "linear", "request": [{"symbol": symbol, "orderLinkId": l} for l in chunk],
+            }, auth=True)
+        except BybitError as exc:
+            log(f"пачка {symbol}: {exc} — знімаю по одній")
+            for link in chunk:
+                try:
+                    cancel_link(symbol, link)
+                except BybitError as e:
+                    log(f"зняти {symbol} {link}: {e}")
+
+
+def cancel_mine_on_exchange(symbol: str) -> int:
+    """Усі заявки бота на монеті, які зараз висять на біржі (навіть якщо їх немає в стані)."""
+    links = [o["link"] for o in open_orders(symbol) if o["link"].startswith(LINK_PREFIX)]
+    if links:
+        batch_cancel(symbol, links)
+    return len(links)
+
+
+def emergency_close(grid: dict) -> str:
+    """Екстрено: сітка одразу перестає ставити лімітки, усі лімітки бота знімаються, позиція закривається ринком
+    (до 3 спроб), потім перевірка, що позиції й заявок бота не лишилось."""
+    symbol = grid["symbol"]
+    grid["status"] = "closing"  # цикл більше не чіпає цю сітку і не ставить протилежних ліміток
+    closed: list[str] = []
+    errors: list[str] = []
+    left: list[dict] = []
+    with GRID_LOCK:
+        batch_cancel(symbol, [l["orderLinkId"] for l in grid["levels"] if l["status"] == "open"])
+        for level in grid["levels"]:
+            if level["status"] == "open":
+                level["status"] = "done"
+                level["note"] = "emergency"
+        try:
+            cancel_mine_on_exchange(symbol)
+        except BybitError as exc:
+            errors.append(f"заявки: {exc}")
+        for _ in range(3):
+            try:
+                if not positions(symbol):
+                    break
+                closed.append(close_position(symbol))
+            except BybitError as exc:
+                errors.append(str(exc))
+            time.sleep(0.4)
+        try:
+            left = positions(symbol)
+            cancel_mine_on_exchange(symbol)  # раптом щось встигло з'явитись
+        except BybitError as exc:
+            errors.append(f"перевірка: {exc}")
+        finish_grid(grid, "stopped" if left else "closed")
+    with LOCK:
+        save_state()
+    if left:
+        size = ", ".join(f"{p.get('side')} {p.get('size')}" for p in left)
+        text = (f"⛔ ЕКСТРЕНО {symbol}: лімітки знято, але позицію НЕ закрито ({size}). "
+                f"Закрийте її вручну на Bybit! {'; '.join(errors[-2:])}")
+    else:
+        text = f"⛔ Екстрено закрито {symbol}: лімітки знято, позицію закрито ({'; '.join(closed) or 'позиції не було'})."
+    notify(text)
+    return text
+
+
+def emergency(grid_id: str) -> str:
+    """Один id — одна сітка; порожній id — усі живі сітки."""
+    with LOCK:
+        grids = [g for g in STATE["grids"] if g["status"] == "active" and (not grid_id or g["id"] == grid_id)]
+    if not grids:
+        raise BybitError("Живих сіток немає" if not grid_id else "Сітку не знайдено")
+    return "\n".join(emergency_close(g) for g in grids)
+
+
 def stop_grid(grid_id: str, close: bool) -> str:
+    if close:
+        return emergency(grid_id)
     with LOCK:
         grid = next((g for g in STATE["grids"] if g["id"] == grid_id and g["status"] == "active"), None)
     if not grid:
@@ -1112,6 +1193,7 @@ def serve() -> None:
                 "/api/preview": lambda: preview(data),
                 "/api/start": lambda: {"ok": True, "text": start_grid(data)},
                 "/api/stop": lambda: {"ok": True, "text": stop_grid(str(data.get("id") or ""), bool(data.get("close")))},
+                "/api/emergency": lambda: {"ok": True, "text": emergency(str(data.get("id") or ""))},
             }
             if path not in routes:
                 self.send_json(404, {"error": "немає такого запиту"})

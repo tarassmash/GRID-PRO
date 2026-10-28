@@ -32,6 +32,7 @@ tailwind.config = { theme: { extend: { colors: {
         <p class="text-xs text-mute">Bybit USDT-perp · ручний нейтральний грід</p>
       </div>
     </div>
+    <button id="btn-panic" type="button" class="hidden min-h-11 items-center gap-2 rounded-xl border-2 border-down bg-down px-4 text-sm font-bold text-white shadow-lg shadow-down/30 hover:bg-down/90">⛔ Закрити все</button>
     <div class="flex flex-wrap items-center gap-3 rounded-xl border border-line bg-desk px-4 py-2 text-xs">
       <div><span class="block text-mute">Середовище</span><b id="h-env" class="font-mono">—</b></div>
       <span class="h-6 w-px bg-line"></span>
@@ -199,7 +200,7 @@ function render() {
         <div class="font-mono text-base font-semibold">${esc(g.symbol)} <span class="text-xs text-mute">x${g.lev} · маржа ${g.margin}${g.geo ? " · геометрична" : ""}</span></div>
         <div class="flex gap-2">
           <button data-stop="${esc(g.id)}" class="min-h-11 rounded-lg border border-line px-3 text-xs">Зняти ліміти</button>
-          <button data-close="${esc(g.id)}" class="min-h-11 rounded-lg border border-down/40 px-3 text-xs text-down">Закрити все ринком</button>
+          <button data-close="${esc(g.id)}" class="min-h-11 rounded-lg border-2 border-down bg-down/15 px-3 text-xs font-bold text-down hover:bg-down hover:text-white">⛔ Екстрено закрити</button>
         </div>
       </div>
       <div class="mt-2 grid grid-cols-2 gap-2 font-mono text-xs md:grid-cols-4">
@@ -217,7 +218,9 @@ function render() {
     </div>`;
   }).join("") : `<p class="rounded-2xl border border-line bg-panel p-4 text-sm text-mute">Живих сіток немає.</p>`;
   document.querySelectorAll("[data-stop]").forEach(b => b.onclick = () => stopGrid(b.dataset.stop, false));
-  document.querySelectorAll("[data-close]").forEach(b => b.onclick = () => stopGrid(b.dataset.close, true));
+  document.querySelectorAll("[data-close]").forEach(b => b.onclick = () => panic(b.dataset.close, b));
+  $("btn-panic").classList.toggle("hidden", !rows.length);
+  $("btn-panic").classList.toggle("inline-flex", !!rows.length);
   const evs = S.events || [];
   $("events").innerHTML = evs.length ? evs.map(e => {
     const t = new Date(e.t * 1000).toLocaleString("uk-UA", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" });
@@ -231,6 +234,19 @@ async function pull() {
   try { S = await api("/api/status"); render(); }
   catch (e) { $("updated").textContent = "Немає зв'язку з сервером: " + e.message; }
 }
+async function panic(id, btn) {
+  const g = id ? (S.grids || []).find(x => x.id === id) : null;
+  const what = g ? `сітку ${g.symbol}` : `УСІ сітки (${(S.grids || []).length})`;
+  if (!confirm(`⛔ Екстрено закрити ${what}?\n\nБот зніме всі свої лімітки і закриє позицію ринком.`)) return;
+  const b = btn || $("btn-panic"), label = b.textContent;
+  b.disabled = true; b.textContent = "Закриваю…";
+  try {
+    const r = await api("/api/emergency", { id: id || "" });
+    r.text.split("\n").forEach(t => toast(t, /НЕ закрито/.test(t)));
+  } catch (e) { toast(e.message, true); }
+  finally { b.disabled = false; b.textContent = label; pull(); }
+}
+$("btn-panic").onclick = () => panic("", $("btn-panic"));
 async function stopGrid(id, close) {
   if (close && !confirm("Зняти лімітки і закрити позицію ринком?")) return;
   try { toast((await api("/api/stop", { id, close })).text); pull(); } catch (e) { toast(e.message, true); }
