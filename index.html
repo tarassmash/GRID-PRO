@@ -1,0 +1,274 @@
+<!doctype html>
+<html lang="uk">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Grid Pro</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+tailwind.config = { theme: { extend: { colors: {
+  desk: "#0b0e11", panel: "#161a1e", line: "#2b3139", ink: "#eaecef",
+  mute: "#848e9c", gold: "#f7a600", up: "#0ecb81", down: "#f6465d"
+}}}}
+</script>
+<style>
+  html, body { background: #0b0e11; color: #eaecef; font-family: "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif; }
+  .font-mono { font-family: "IBM Plex Mono", ui-monospace, monospace; }
+  button { cursor: pointer; }
+  button:disabled { cursor: default; opacity: .6; }
+  input { min-width: 0; }
+</style>
+</head>
+<body class="min-h-screen bg-desk text-ink">
+<header class="sticky top-0 z-30 border-b border-line bg-panel/95 backdrop-blur">
+  <div class="mx-auto flex max-w-5xl flex-wrap items-center justify-between gap-3 px-4 py-3">
+    <div class="flex items-center gap-3">
+      <div class="flex size-10 items-center justify-center rounded-xl border border-gold/40 bg-gold/10 text-gold">⌁</div>
+      <div>
+        <h1 class="text-lg font-semibold tracking-tight">Grid Pro</h1>
+        <p class="text-xs text-mute">Bybit USDT-perp · ручний нейтральний грід</p>
+      </div>
+    </div>
+    <div class="flex flex-wrap items-center gap-3 rounded-xl border border-line bg-desk px-4 py-2 text-xs">
+      <div><span class="block text-mute">Середовище</span><b id="h-env" class="font-mono">—</b></div>
+      <span class="h-6 w-px bg-line"></span>
+      <div><span class="block text-mute">Капітал</span><b id="h-eq" class="font-mono">—</b></div>
+      <span class="h-6 w-px bg-line"></span>
+      <div><span class="block text-mute">Вільно</span><b id="h-av" class="font-mono">—</b></div>
+    </div>
+  </div>
+</header>
+
+<main class="mx-auto flex w-full max-w-5xl flex-col gap-4 px-4 py-5">
+  <div id="warn" class="hidden rounded-xl border border-down/40 bg-down/10 px-4 py-2 text-sm text-down"></div>
+
+  <section class="rounded-2xl border border-line bg-panel p-4">
+    <h2 class="text-base font-semibold">Нова сітка</h2>
+    <p class="mt-1 text-xs text-mute">Buy ставляться на лініях нижче ціни, Sell — вище. Щойно лімітка виконалась (перевірка кожні 2 с), на сусідній лінії ставиться протилежна — це мікротейк, прибуток одного кроку. Коли ціна виходить з діапазону, сітка (якщо увімкнено) переїжджає за ціною.</p>
+    <div class="mt-3 grid grid-cols-2 gap-3 md:grid-cols-4">
+      <label class="flex flex-col gap-1 text-xs text-mute">Монета<input id="n-symbol" placeholder="BTCUSDT" autocomplete="off" class="min-h-11 rounded-lg border border-line bg-desk px-3 font-mono text-sm uppercase text-ink"></label>
+      <label class="flex flex-col gap-1 text-xs text-mute">Нижня ціна<input id="n-lower" inputmode="decimal" autocomplete="off" class="min-h-11 rounded-lg border border-line bg-desk px-3 font-mono text-sm text-ink"></label>
+      <label class="flex flex-col gap-1 text-xs text-mute">Верхня ціна<input id="n-upper" inputmode="decimal" autocomplete="off" class="min-h-11 rounded-lg border border-line bg-desk px-3 font-mono text-sm text-ink"></label>
+      <label class="flex flex-col gap-1 text-xs text-mute">Кількість сіток<input id="n-count" inputmode="decimal" value="20" autocomplete="off" class="min-h-11 rounded-lg border border-line bg-desk px-3 font-mono text-sm text-ink"></label>
+      <label class="flex flex-col gap-1 text-xs text-mute">Маржа, USDT<input id="n-margin" inputmode="decimal" value="20" autocomplete="off" class="min-h-11 rounded-lg border border-line bg-desk px-3 font-mono text-sm text-ink"></label>
+      <label class="flex flex-col gap-1 text-xs text-mute">Плече<input id="n-lev" inputmode="decimal" value="10" autocomplete="off" class="min-h-11 rounded-lg border border-line bg-desk px-3 font-mono text-sm text-ink"></label>
+      <label class="flex flex-col gap-1 text-xs text-mute">Іти за ціною через, хв (0 = одразу)<input id="n-shift" inputmode="decimal" value="0" autocomplete="off" class="min-h-11 rounded-lg border border-line bg-desk px-3 font-mono text-sm text-ink"></label>
+      <div class="flex items-end"><button type="button" id="n-trail" class="inline-flex min-h-11 w-full items-center gap-2 rounded-lg border border-line px-3 text-xs"></button></div>
+      <div class="flex items-end"><button type="button" id="n-geo" class="inline-flex min-h-11 w-full items-center gap-2 rounded-lg border border-line px-3 text-xs"></button></div>
+      <label id="n-geo-box" class="flex flex-col gap-1 text-xs text-mute">Множник лота (кожна наступна лінія від ціни)<input id="n-geo-mult" inputmode="decimal" value="1.3" autocomplete="off" class="min-h-11 rounded-lg border border-line bg-desk px-3 font-mono text-sm text-ink"></label>
+    </div>
+    <p id="n-geo-hint" class="mt-2 hidden text-xs text-mute">Геометрична сітка: лінії стоять через однаковий відсоток, а лот росте від ціни до краю — найближчі лімітки найменші, далекі найбільші (×множник на кожну лінію). Усі лімітки разом = маржа × плече. Тейк по кожній лімітці — тим самим лотом.</p>
+    <div class="mt-3 flex flex-wrap items-center gap-2">
+      <button type="button" id="n-scalp" class="min-h-11 rounded-lg border border-gold bg-gold/15 px-3 text-sm font-semibold text-gold">⚡ Скальпінг: часто по трохи</button>
+      <button type="button" id="n-auto" class="min-h-11 rounded-lg border border-up/50 bg-up/10 px-3 text-sm font-semibold text-up">Авто: канал і параметри</button>
+      <button type="button" id="n-range" class="min-h-11 rounded-lg border border-line px-3 text-sm">Діапазон ±3% від ціни</button>
+      <button type="button" id="n-preview" class="min-h-11 rounded-lg border border-gold/40 px-3 text-sm text-gold">Перевірити</button>
+      <button type="button" id="n-start" class="min-h-11 rounded-lg bg-gold px-4 text-sm font-semibold text-desk">Запустити сітку</button>
+    </div>
+    <div id="n-plan" class="mt-3 hidden rounded-xl border border-line bg-desk p-3 text-sm"></div>
+  </section>
+
+  <section>
+    <h2 class="mb-2 text-base font-semibold">Живі сітки</h2>
+    <div id="n-list" class="space-y-3"></div>
+  </section>
+
+  <section class="rounded-2xl border border-line bg-panel p-4">
+    <div class="flex flex-wrap items-center justify-between gap-2">
+      <h2 class="text-base font-semibold">Що робив бот</h2>
+      <span id="updated" class="text-xs text-mute"></span>
+    </div>
+    <ul id="events" class="mt-3 max-h-64 space-y-1 overflow-auto font-mono text-xs"></ul>
+  </section>
+
+  <p class="pb-4 text-center text-xs text-mute">Це не фінансова порада. Лімітки можуть виконатись усі разом, якщо ціна пройде діапазон.</p>
+</main>
+<div id="toasts" class="fixed bottom-4 right-4 z-50 space-y-2"></div>
+
+<script>
+let S = null;
+let NTRAIL = true;
+let NGEO = false;
+const $ = (id) => document.getElementById(id);
+try {
+  NGEO = localStorage.getItem("nGeo") === "1";
+  const m = localStorage.getItem("nGeoMult"); if (m) $("n-geo-mult").value = m;
+} catch (e) {}
+
+function toast(msg, bad) {
+  const el = document.createElement("div");
+  el.className = "max-w-sm rounded-xl border bg-panel px-4 py-3 text-xs " + (bad ? "border-down text-down" : "border-gold text-gold");
+  el.textContent = msg;
+  $("toasts").appendChild(el);
+  setTimeout(() => el.remove(), 5000);
+}
+function px(n) {
+  const v = Number(n);
+  if (!Number.isFinite(v)) return "—";
+  if (v >= 1000) return v.toLocaleString("en-US", { maximumFractionDigits: 2 });
+  if (v >= 1) return v.toLocaleString("en-US", { maximumFractionDigits: 4 });
+  return v.toPrecision(4);
+}
+function esc(s) {
+  const map = { "&": "amp", "<": "lt", ">": "gt", '"': "quot", "'": "#39" };
+  return String(s).replace(/[&<>"']/g, (c) => "&" + map[c] + ";");
+}
+function tog(on, text) {
+  return `<span class="size-2 rounded-full ${on ? "bg-gold" : "bg-line"}"></span>${text}`;
+}
+async function api(path, body) {
+  const res = await fetch(path, {
+    method: body ? "POST" : "GET",
+    headers: { "Content-Type": "application/json" },
+    body: body ? JSON.stringify(body) : undefined
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || "помилка");
+  return data;
+}
+function form() {
+  return {
+    symbol: $("n-symbol").value.trim().toUpperCase(), lower: $("n-lower").value, upper: $("n-upper").value,
+    count: $("n-count").value, margin: $("n-margin").value, leverage: $("n-lev").value, shiftMin: $("n-shift").value,
+    trail: NTRAIL, geo: NGEO, geoMult: $("n-geo-mult").value
+  };
+}
+function renderToggles() {
+  $("n-trail").innerHTML = tog(NTRAIL, "Сітка йде за ціною (трейлінг)");
+  $("n-geo").innerHTML = tog(NGEO, "Геометрична сітка (різні лоти)");
+  $("n-geo-box").classList.toggle("hidden", !NGEO);
+  $("n-geo-hint").classList.toggle("hidden", !NGEO);
+}
+function render() {
+  if (!S) return;
+  $("h-env").textContent = S.env === "mainnet" ? "MAINNET" : "testnet";
+  $("h-env").className = "font-mono " + (S.env === "mainnet" ? "text-down" : "text-up");
+  $("h-eq").textContent = px(S.account.equity);
+  $("h-av").textContent = px(S.account.available);
+  const warn = !S.keys ? "Ключі Bybit не задані: впишіть BYBIT_API_KEY і BYBIT_API_SECRET у змінні сервера (Railway → Variables) або у файл .env."
+    : S.account.error ? "Bybit: " + S.account.error
+    : S.env === "mainnet" ? "MAINNET: лімітки реальні, кошти справжні." : "";
+  $("warn").textContent = warn;
+  $("warn").classList.toggle("hidden", !warn);
+  const rows = S.grids || [];
+  $("n-list").innerHTML = rows.length ? rows.map(g => {
+    const pos = (S.account.positions || []).find(p => p.symbol === g.symbol);
+    const upnl = pos ? Number(pos.pnl || 0) : 0;
+    return `<div class="rounded-2xl border border-line bg-panel p-4">
+      <div class="flex flex-wrap items-center justify-between gap-2">
+        <div class="font-mono text-base font-semibold">${esc(g.symbol)} <span class="text-xs text-mute">x${g.lev} · маржа ${g.margin}${g.geo ? " · геометрична" : ""}</span></div>
+        <div class="flex gap-2">
+          <button data-stop="${esc(g.id)}" class="min-h-11 rounded-lg border border-line px-3 text-xs">Зняти ліміти</button>
+          <button data-close="${esc(g.id)}" class="min-h-11 rounded-lg border border-down/40 px-3 text-xs text-down">Закрити все ринком</button>
+        </div>
+      </div>
+      <div class="mt-2 grid grid-cols-2 gap-2 font-mono text-xs md:grid-cols-4">
+        <div><span class="block text-mute">Діапазон</span>${px(g.lower)} – ${px(g.upper)}</div>
+        <div><span class="block text-mute">Ціна</span>${px(g.last)}${g.out ? ' <span class="text-gold">поза</span>' : ""}</div>
+        <div><span class="block text-mute">Сіток · крок</span>${g.count} · ${g.geo ? g.stepPct + "%" : px(g.step)}</div>
+        <div><span class="block text-mute">Лімітки</span>Buy ${g.buys} / Sell ${g.sells}</div>
+        <div><span class="block text-mute">Виконань</span>${g.fills}</div>
+        <div><span class="block text-mute">Мікротейків</span>${g.takes}</div>
+        <div><span class="block text-mute">Прибуток сітки</span><span class="${g.profit >= 0 ? "text-up" : "text-down"}">${g.profit >= 0 ? "+" : ""}${Number(g.profit).toFixed(4)}</span></div>
+        <div><span class="block text-mute">Позиція PnL</span><span class="${upnl >= 0 ? "text-up" : "text-down"}">${pos ? (upnl >= 0 ? "+" : "") + upnl.toFixed(4) : "—"}</span></div>
+      </div>
+      <p class="mt-2 text-xs text-mute">${g.trail ? `Іде за ціною через ${g.shiftMin} хв поза діапазоном · зсувів ${g.shifts}` : "Діапазон фіксований"} ·
+        ${g.geo ? `лот ×${g.geoMult} · лоти ${esc(g.qty)}` : `лот ${esc(g.qty)}`}${pos ? ` · позиція ${esc(pos.side)} ${esc(pos.size)} @ ${px(pos.avg)}${Number(pos.sl) ? " · стоп " + px(pos.sl) : ""}` : ""}</p>
+    </div>`;
+  }).join("") : `<p class="rounded-2xl border border-line bg-panel p-4 text-sm text-mute">Живих сіток немає.</p>`;
+  document.querySelectorAll("[data-stop]").forEach(b => b.onclick = () => stopGrid(b.dataset.stop, false));
+  document.querySelectorAll("[data-close]").forEach(b => b.onclick = () => stopGrid(b.dataset.close, true));
+  const evs = S.events || [];
+  $("events").innerHTML = evs.length ? evs.map(e => {
+    const t = new Date(e.t * 1000).toLocaleString("uk-UA", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" });
+    return `<li><span class="text-mute">${t}</span> ${esc(e.text)}</li>`;
+  }).join("") : `<li class="text-mute">Поки нічого.</li>`;
+  $("updated").textContent = S.loopAgo >= 0 && S.loopAgo < 30
+    ? `Бот працює · перевірка ${S.loopAgo} с тому · ${S.upMin} хв без перезапуску${S.slRoi > 0 ? " · стоп-лос −" + S.slRoi + "% маржі" : ""}`
+    : "Бот не відповідає — перевірте сервер";
+}
+async function pull() {
+  try { S = await api("/api/status"); render(); }
+  catch (e) { $("updated").textContent = "Немає зв'язку з сервером: " + e.message; }
+}
+async function stopGrid(id, close) {
+  if (close && !confirm("Зняти лімітки і закрити позицію ринком?")) return;
+  try { toast((await api("/api/stop", { id, close })).text); pull(); } catch (e) { toast(e.message, true); }
+}
+async function previewGrid() {
+  const plan = $("n-plan");
+  try {
+    const p = await api("/api/preview", form());
+    plan.classList.remove("hidden");
+    plan.innerHTML = `<b class="font-mono">${esc(p.symbol)}</b> · ціна ${px(p.last)} · плече x${p.lev}<br>
+      ${p.geo
+        ? `Геометрична: Buy ${p.buys} / Sell ${p.sells} лімітів, лоти <b class="font-mono">${esc(p.qty)}</b> (×${p.geoMult} на лінію) · крок ${p.stepPct}%`
+        : `Buy ${p.buys} / Sell ${p.sells} лімітів по <b class="font-mono">${esc(p.qty)}</b> · крок ${px(p.step)}`} · усього ≈ ${p.notional} USDT<br>
+      Прибуток на одну сітку (мікротейк): <b class="text-up">${p.profitLow === p.profitHigh ? p.profitLow + "%" : p.profitLow + "% – " + p.profitHigh + "%"}</b> після комісій мейкера
+      ${p.inside ? "" : '<br><span class="text-gold">Ціна зараз поза діапазоном — з одного боку лімітів не буде.</span>'}
+      ${p.geo && p.lots ? `<div class="mt-2 max-h-48 overflow-y-auto font-mono text-xs">${p.lots.map(o => `<div class="flex justify-between gap-3"><span class="${o.side === "Buy" ? "text-up" : "text-down"}">${o.side}</span><span>${o.price}</span><span>${o.qty}</span></div>`).join("")}</div>` : ""}`;
+    return p;
+  } catch (e) { plan.classList.remove("hidden"); plan.innerHTML = `<span class="text-down">${esc(e.message)}</span>`; return null; }
+}
+async function startGrid() {
+  const p = await previewGrid();
+  if (!p) return;
+  if (S && S.env === "mainnet" && !confirm(`Запустити сітку ${p.symbol} на MAINNET? Лімітки реальні.`)) return;
+  $("n-start").disabled = true;
+  try { toast((await api("/api/start", form())).text); pull(); }
+  catch (e) { toast(e.message, true); }
+  finally { $("n-start").disabled = false; }
+}
+async function rangeGrid() {
+  const sym = $("n-symbol").value.trim().toUpperCase();
+  if (!sym) { toast("Впишіть монету", true); return; }
+  try {
+    const r = await api("/api/price", { symbol: sym });
+    const last = Number(r.last);
+    const d = last >= 100 ? 2 : last >= 1 ? 4 : 6;
+    $("n-lower").value = (last * 0.97).toFixed(d); $("n-upper").value = (last * 1.03).toFixed(d);
+    previewGrid();
+  } catch (e) { toast("Ціну не отримав: " + e.message, true); }
+}
+async function autoGrid(profile) {
+  if (!$("n-symbol").value.trim()) { toast("Впишіть монету, наприклад BTCUSDT", true); return; }
+  const btn = profile === "scalp" ? $("n-scalp") : $("n-auto");
+  const label = btn.textContent;
+  btn.disabled = true; btn.textContent = "Аналізую…";
+  try {
+    const a = await api("/api/auto", { symbol: $("n-symbol").value.trim().toUpperCase(), margin: $("n-margin").value, leverage: "", profile });
+    $("n-symbol").value = a.symbol; $("n-lower").value = a.lower; $("n-upper").value = a.upper;
+    $("n-count").value = a.count; $("n-lev").value = a.leverage; $("n-shift").value = a.shiftMin;
+    NTRAIL = true; renderToggles();
+    const p = await previewGrid();
+    if (p) $("n-plan").innerHTML += `<div class="mt-2 border-t border-line pt-2 text-xs text-mute">
+      <b class="text-up">${a.profile === "scalp" ? "Скальпінг" : "Авто-підбір"}:</b> ${esc(a.why)}<br>
+      Канал ${px(a.lower)} – ${px(a.upper)} (${a.widthPct}%) · ${a.count} сіток · крок ${a.stepPct}% · x${a.leverage} ·
+      мікротейк ≈ ${a.profitPct}% після комісій · за останні ${a.takesWindow || "12 год"} було б ≈ ${a.takes12h} мікротейків (оцінка).</div>`;
+  } catch (e) { toast(e.message, true); }
+  finally { btn.disabled = false; btn.textContent = label; }
+}
+$("n-trail").onclick = () => { NTRAIL = !NTRAIL; renderToggles(); };
+$("n-geo").onclick = () => {
+  NGEO = !NGEO;
+  try { localStorage.setItem("nGeo", NGEO ? "1" : "0"); } catch (e) {}
+  renderToggles();
+  if ($("n-lower").value && $("n-upper").value) previewGrid();
+};
+$("n-geo-mult").onchange = () => {
+  try { localStorage.setItem("nGeoMult", $("n-geo-mult").value); } catch (e) {}
+  if (NGEO && $("n-lower").value) previewGrid();
+};
+$("n-preview").onclick = previewGrid;
+$("n-start").onclick = startGrid;
+$("n-range").onclick = rangeGrid;
+$("n-auto").onclick = () => autoGrid("");
+$("n-scalp").onclick = () => autoGrid("scalp");
+renderToggles();
+pull();
+setInterval(pull, 4000);
+</script>
+</body>
+</html>
