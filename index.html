@@ -48,6 +48,27 @@ tailwind.config = { theme: { extend: { colors: {
 <main class="mx-auto flex w-full max-w-5xl flex-col gap-4 px-4 py-5">
   <div id="warn" class="hidden rounded-xl border border-down/40 bg-down/10 px-4 py-2 text-sm text-down"></div>
 
+  <section id="auto-box" class="rounded-2xl border border-line bg-panel p-4">
+    <div class="flex flex-wrap items-center justify-between gap-2">
+      <div class="flex items-center gap-2">
+        <h2 class="text-base font-semibold">🤖 Автопілот Sell</h2>
+        <span id="a-badge" class="rounded-md px-2 py-0.5 text-xs font-semibold"></span>
+      </div>
+      <button type="button" id="a-toggle" class="min-h-11 rounded-lg px-4 text-sm font-semibold"></button>
+    </div>
+    <p class="mt-1 text-xs text-mute">Одна Sell-сітка автопілота за раз. Немає сітки — кожні 5 хв шукає монету й запускає <b>без підтвердження</b> (ринок трендовий — чекає). Є сітка — раз на період перевіряє монету: почався ріст → екстрено закриває і переходить на іншу (закриту монету 2 год не бере). Захист кожні 30 с: стоп сітки у % депозиту і вимкнення при просадці капіталу. Працює на сервері, сторінку можна закрити.</p>
+    <div class="mt-3 grid grid-cols-2 gap-3 md:grid-cols-4">
+      <label class="flex flex-col gap-1 text-xs text-mute">Сітка на, % депозиту<input id="a-pct" inputmode="decimal" autocomplete="off" class="min-h-10 w-full rounded-lg border border-line bg-desk px-3 font-mono text-sm text-ink"></label>
+      <label class="flex flex-col gap-1 text-xs text-mute">Перевіряти монету кожні, хв<input id="a-every" inputmode="decimal" autocomplete="off" class="min-h-10 w-full rounded-lg border border-line bg-desk px-3 font-mono text-sm text-ink"></label>
+      <label class="flex flex-col gap-1 text-xs text-mute">Стоп сітки: збиток, % депозиту<input id="a-stop" inputmode="decimal" autocomplete="off" class="min-h-10 w-full rounded-lg border border-line bg-desk px-3 font-mono text-sm text-ink"></label>
+      <label class="flex flex-col gap-1 text-xs text-mute">Вимкнути при просадці капіталу, %<input id="a-dd" inputmode="decimal" autocomplete="off" class="min-h-10 w-full rounded-lg border border-line bg-desk px-3 font-mono text-sm text-ink"></label>
+    </div>
+    <div class="mt-3 flex flex-wrap items-center gap-2">
+      <button type="button" id="a-save" class="hidden min-h-10 rounded-lg border border-gold/40 px-3 text-sm text-gold">Зберегти налаштування</button>
+      <span id="a-status" class="font-mono text-xs text-mute"></span>
+    </div>
+  </section>
+
   <section class="rounded-2xl border border-line bg-panel p-4">
     <div class="flex flex-wrap items-center justify-between gap-2">
       <div>
@@ -247,6 +268,7 @@ function render() {
     return `<div class="rounded-2xl border border-line bg-panel p-4">
       <div class="flex flex-wrap items-center justify-between gap-2">
         <div class="font-mono text-base font-semibold">${esc(g.symbol)}
+          ${g.auto ? '<span class="rounded bg-gold px-1.5 py-0.5 text-xs text-desk">🤖 автопілот</span>' : ""}
           ${g.mode === "sell" ? '<span class="rounded bg-down px-1.5 py-0.5 text-xs text-white">Sell</span>' : `<span class="rounded border border-line px-1.5 py-0.5 text-xs text-mute">${MODE_NAMES[g.mode] || g.mode} · стара</span>`}
           <span class="text-xs text-mute">x${g.lev} · маржа ${g.margin}${g.geo ? " · геометрична" : ""}</span></div>
         <div class="flex gap-2">
@@ -902,7 +924,57 @@ document.addEventListener("pointercancel", release, true);
 render = function () {
   if (PRESSING) { PENDING = true; return; }
   PENDING = false;
-  _render(); renderChartBar();
+  _render(); renderChartBar(); renderAuto();
+};
+
+// ---------------- автопілот ----------------
+let AUTO_FILLED = false;
+function renderAuto() {
+  const a = S && S.auto;
+  if (!a) return;
+  if (!AUTO_FILLED) {
+    $("a-pct").value = a.pct; $("a-every").value = a.everyMin; $("a-stop").value = a.stopPct; $("a-dd").value = a.ddPct;
+    AUTO_FILLED = true;
+  }
+  $("a-badge").textContent = a.on ? "УВІМКНЕНО" : "вимкнено";
+  $("a-badge").className = "rounded-md px-2 py-0.5 text-xs font-semibold " + (a.on ? "bg-up text-desk" : "border border-line text-mute");
+  $("a-toggle").textContent = a.on ? "■ Вимкнути автопілот" : "▶ Увімкнути автопілот";
+  $("a-toggle").className = "min-h-11 rounded-lg px-4 text-sm font-semibold " + (a.on ? "border border-down text-down" : "bg-gold text-desk");
+  $("a-save").classList.toggle("hidden", !a.on);
+  $("auto-box").classList.toggle("border-gold", a.on);
+  const mins = Math.round(a.nextIn / 60);
+  const parts = [];
+  if (a.on) {
+    parts.push(a.grid ? `Сітка: ${a.grid}` : "Сітки немає — шукаю");
+    parts.push(a.nextIn > 0 ? `наступна перевірка через ${mins >= 1 ? mins + " хв" : a.nextIn + " с"}` : "перевіряю…");
+    if (a.startEq) parts.push(`капітал на старті ${px(a.startEq)}`);
+    if (a.cooldown && a.cooldown.length) parts.push(`пауза: ${a.cooldown.join(", ")}`);
+  }
+  $("a-status").innerHTML = esc(parts.join(" · ")) + (a.last ? `<br><span class="text-ink">Останнє: ${esc(a.last)}</span>` : "");
+}
+function autoForm(on) {
+  return { on, pct: $("a-pct").value, everyMin: $("a-every").value, stopPct: $("a-stop").value, ddPct: $("a-dd").value };
+}
+$("a-toggle").onclick = async () => {
+  const on = !(S && S.auto && S.auto.on);
+  if (on) {
+    const f = autoForm(true);
+    const msg = `🤖 Увімкнути автопілот Sell${S.env === "mainnet" ? " на MAINNET (реальні гроші)" : " (testnet)"}?\n\n`
+      + `• Сам шукає монету і запускає Sell-сітку на ${f.pct}% депозиту БЕЗ підтвердження.\n`
+      + `• Кожні ${f.everyMin} хв перевіряє монету; почався ріст — закриває ринком і переходить на іншу.\n`
+      + `• Збиток сітки більше ${f.stopPct}% депозиту — закриває сітку.\n`
+      + `• Капітал впав на ${f.ddPct}% — закриває все і вимикається.\n\n`
+      + `Торгівля з плечем може призвести до втрати депозиту. Увімкнути?`;
+    if (!confirm(msg)) return;
+  }
+  $("a-toggle").disabled = true;
+  try { S.auto = await api("/api/autopilot", autoForm(on)); renderAuto(); toast(on ? "Автопілот увімкнено" : "Автопілот вимкнено"); pull(); }
+  catch (e) { toast(e.message, true); }
+  finally { $("a-toggle").disabled = false; }
+};
+$("a-save").onclick = async () => {
+  try { S.auto = await api("/api/autopilot", autoForm(true)); renderAuto(); toast("Налаштування автопілота збережено"); }
+  catch (e) { toast(e.message, true); }
 };
 
 // ---------------- пошук монет ----------------

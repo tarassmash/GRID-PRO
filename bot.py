@@ -595,6 +595,7 @@ def start_grid(data: dict) -> str:
         "step": (prm["upper"] - prm["lower"]) / prm["count"], "tick": spec["tick"], "qty": qty, "lev": lev,
         "margin": prm["margin"], "trail": prm["trail"], "shiftMin": prm["shiftMin"],
         "geo": prm["geo"], "geoMult": prm["geoMult"], "mode": prm["mode"],
+        "auto": bool(data.get("auto")), "autoEq": float(data.get("autoEq") or 0),
         "levels": opened, "status": "active", "created": int(time.time()), "last": last,
         "fills": 0, "takes": 0, "profit": 0.0, "shifts": 0, "outSince": None,
     }
@@ -784,7 +785,7 @@ def cancel_mine_on_exchange(symbol: str) -> int:
     return len(links)
 
 
-def emergency_close(grid: dict) -> str:
+def emergency_close(grid: dict, quiet: bool = False) -> str:
     """Екстрено: сітка одразу перестає ставити лімітки, усі лімітки бота знімаються, позиція закривається ринком
     (до 3 спроб), потім перевірка, що позиції й заявок бота не лишилось."""
     symbol = grid["symbol"]
@@ -824,7 +825,8 @@ def emergency_close(grid: dict) -> str:
                 f"Закрийте її вручну на Bybit! {'; '.join(errors[-2:])}")
     else:
         text = f"⛔ Екстрено закрито {symbol}: лімітки знято, позицію закрито ({'; '.join(closed) or 'позиції не було'})."
-    notify(text)
+    if not quiet:
+        notify(text)
     return text
 
 
@@ -1202,7 +1204,8 @@ def sell_plan(data: dict) -> dict:
             f"Під нову сітку лишається {max(margin, 0):.2f} USDT."
         )
     scan = scan_coins({"margin": margin})
-    pool = [c for c in scan["coins"] if not c.get("busy") and c["count"] > 0]
+    exclude = set(data.get("exclude") or [])
+    pool = [c for c in scan["coins"] if not c.get("busy") and c["count"] > 0 and c["symbol"] not in exclude]
     if not pool:
         raise BybitError("Не знайшов вільної монети під сітку (усі зайняті або замало маржі)")
     # для Sell краще, коли ціна у верхній половині годинного каналу
@@ -1387,10 +1390,178 @@ def grid_rows() -> list[dict]:
             "buys": sum(1 for l in opened if l["side"] == "Buy"), "sells": sum(1 for l in opened if l["side"] == "Sell"),
             "fills": g.get("fills") or 0, "takes": g.get("takes") or 0, "profit": round(float(g.get("profit") or 0), 6),
             "shifts": g.get("shifts") or 0, "out": bool(g.get("outSince")), "created": g.get("created"),
-            "geo": bool(g.get("geo")), "geoMult": g.get("geoMult"), "mode": g.get("mode") or "both",
+            "geo": bool(g.get("geo")), "geoMult": g.get("geoMult"), "mode": g.get("mode") or "both", "auto": bool(g.get("auto")),
             "stepPct": round(((g["upper"] / g["lower"]) ** (1 / g["count"]) - 1) * 100, 3) if g.get("geo") else None,
         })
     return rows
+
+
+# ---------------- автопілот ----------------
+# Одна Sell-сітка автопілота за раз на pct% депозиту. Немає сітки — кожні 5 хв шукає монету і запускає без підтвердження
+# (якщо ринок трендовий — чекає). Є сітка — раз на everyMin хв перевіряє монету: почався ріст → екстрено закриває і
+# переходить на іншу (закриту монету 2 год не бере). Захист кожні 30 с: збиток сітки > stopPct% депозиту → закрити;
+# капітал просів на ddPct% від увімкнення → закрити сітку і вимкнути автопілот. За замовчуванням ВИМКНЕНИЙ.
+
+AUTO_DEFAULT = {"on": False, "pct": 90.0, "everyMin": 60, "stopPct": 10.0, "ddPct": 20.0,
+                "startEq": 0.0, "nextAt": 0.0, "guardAt": 0.0, "last": "", "cooldown": {}}
+AUTO_IDLE_SEC = 300
+AUTO_COOLDOWN_SEC = 7200
+AUTO_LOCK = threading.Lock()
+
+
+def auto_cfg() -> dict:
+    cfg = STATE.setdefault("auto", {})
+    for k, v in AUTO_DEFAULT.items():
+        cfg.setdefault(k, v if not isinstance(v, dict) else dict(v))
+    return cfg
+
+
+def auto_grid() -> dict | None:
+    with LOCK:
+        return next((g for g in STATE["grids"] if g.get("auto") and g["status"] == "active"), None)
+
+
+def auto_say(text: str, loud: bool = True) -> None:
+    auto_cfg()["last"] = text
+    if loud:
+        notify("🤖 Автопілот: " + text)
+    else:
+        add_event("🤖 " + text)
+
+
+def wallet_equity() -> float:
+    wallet = bybit("/v5/account/wallet-balance", query={"accountType": "UNIFIED"}, auth=True)
+    return float(((wallet.get("list") or [{}])[0]).get("totalEquity") or 0)
+
+
+def autopilot_set(data: dict) -> dict:
+    cfg = auto_cfg()
+    pct = parse_num(data.get("pct", cfg["pct"]), "Відсоток депозиту", 10, 95)
+    every = int(parse_num(data.get("everyMin", cfg["everyMin"]), "Перевірка, хв", 10, 1440, integer=True))
+    stop = parse_num(data.get("stopPct", cfg["stopPct"]), "Стоп сітки, % депозиту", 1, 100)
+    dd = parse_num(data.get("ddPct", cfg["ddPct"]), "Просадка автопілота, %", 2, 90)
+    on = bool(data.get("on", cfg["on"]))
+    if on and not (CFG.api_key and CFG.api_secret):
+        raise BybitError("Немає ключів Bybit — автопілот не може торгувати")
+    with AUTO_LOCK:
+        was = cfg["on"]
+        cfg.update({"pct": pct, "everyMin": every, "stopPct": stop, "ddPct": dd})
+        if on and not was:
+            cfg.update({"on": True, "startEq": wallet_equity(), "nextAt": 0.0, "cooldown": {}})
+            auto_say(f"увімкнено. Капітал {cfg['startEq']:.2f} USDT, сітка на {pct:g}% депозиту, перевірка що {every} хв, "
+                     f"стоп сітки −{stop:g}% депозиту, вимкнення при просадці −{dd:g}%.")
+        elif not on and was:
+            cfg["on"] = False
+            g = auto_grid()
+            auto_say("вимкнено." + (f" Сітка {g['symbol']} лишається працювати — закрийте її, якщо треба." if g else ""))
+    with LOCK:
+        save_state()
+    return auto_status()
+
+
+def auto_status() -> dict:
+    cfg = auto_cfg()
+    g = auto_grid()
+    return {
+        "on": cfg["on"], "pct": cfg["pct"], "everyMin": cfg["everyMin"], "stopPct": cfg["stopPct"], "ddPct": cfg["ddPct"],
+        "startEq": cfg["startEq"], "last": cfg["last"], "grid": g["symbol"] if g else "",
+        "nextIn": max(0, int(cfg["nextAt"] - time.time())) if cfg["on"] else 0,
+        "cooldown": sorted(k for k, v in (cfg.get("cooldown") or {}).items() if v > time.time()),
+    }
+
+
+def auto_close(grid: dict, why: str) -> None:
+    cfg = auto_cfg()
+    text = emergency_close(grid, quiet=True)
+    cfg.setdefault("cooldown", {})[grid["symbol"]] = time.time() + AUTO_COOLDOWN_SEC
+    auto_say(f"{why} {text}")
+
+
+def autopilot_guard(cfg: dict, grid: dict | None) -> None:
+    """Кожні 30 с: просадка капіталу і стоп сітки у % депозиту."""
+    if time.time() - cfg.get("guardAt", 0) < 30:
+        return
+    cfg["guardAt"] = time.time()
+    equity = wallet_equity()
+    if cfg["startEq"] > 0 and equity < cfg["startEq"] * (1 - cfg["ddPct"] / 100):
+        if grid:
+            auto_close(grid, f"просадка капіталу {equity:.2f} < −{cfg['ddPct']:g}% від {cfg['startEq']:.2f}.")
+        cfg["on"] = False
+        auto_say(f"ВИМКНЕНО через просадку: капітал {equity:.2f} USDT (було {cfg['startEq']:.2f}).")
+        return
+    if grid:
+        upnl = sum(float(p.get("unrealisedPnl") or 0) for p in positions(grid["symbol"]))
+        base = float(grid.get("autoEq") or cfg["startEq"] or equity)
+        if upnl <= -base * cfg["stopPct"] / 100:
+            auto_close(grid, f"стоп сітки {grid['symbol']}: збиток {upnl:.2f} USDT > {cfg['stopPct']:g}% депозиту.")
+            cfg["nextAt"] = time.time() + AUTO_IDLE_SEC  # пауза перед наступною монетою
+
+
+def coin_turned_up(symbol: str, margin: float) -> str:
+    """Порожній рядок — монета ще годиться під Sell; інакше — причина закрити."""
+    load_all_specs()
+    t = ticker(symbol)
+    c = judge_coin({"symbol": symbol, "lastPrice": t.get("lastPrice"), "turnover24h": t.get("turnover24h")}, margin)
+    if not c:
+        return ""
+    if c["upBreak"]:
+        return f"{symbol} пробив годинний канал угору."
+    if c["up60"] and c["trend60"] >= 55:
+        return f"{symbol} росте: тренд години {c['trend60']}% угору."
+    return ""
+
+
+def autopilot_step() -> None:
+    cfg = auto_cfg()
+    if not cfg["on"]:
+        return
+    grid = auto_grid()
+    autopilot_guard(cfg, grid)
+    if not cfg["on"]:
+        return
+    grid = auto_grid()
+    now = time.time()
+    if now < cfg["nextAt"]:
+        return
+    if grid:
+        cfg["nextAt"] = now + cfg["everyMin"] * 60
+        why = coin_turned_up(grid["symbol"], float(grid.get("margin") or 20))
+        if not why:
+            auto_say(f"{grid['symbol']} без росту — сітка працює далі.", loud=False)
+            return
+        auto_close(grid, why + " Закриваю і шукаю іншу монету.")
+        grid = None
+    cfg["nextAt"] = now + AUTO_IDLE_SEC
+    cool = cfg.setdefault("cooldown", {})
+    for k in [k for k, v in cool.items() if v <= now]:
+        cool.pop(k, None)
+    try:
+        plan = sell_plan({"pct": cfg["pct"], "exclude": list(cool)})
+    except BybitError as exc:
+        auto_say(f"не запускаю: {exc} Повтор через {AUTO_IDLE_SEC // 60} хв.", loud=False)
+        return
+    if plan["relaxed"]:
+        auto_say(f"ринок трендовий — жодна монета не проходить умови. Чекаю {AUTO_IDLE_SEC // 60} хв.", loud=False)
+        return
+    pl = dict(plan["plan"], auto=True, autoEq=plan["equity"])
+    text = start_grid(pl)
+    cfg["nextAt"] = time.time() + cfg["everyMin"] * 60
+    c = plan["coin"]
+    auto_say(f"запустив {text}. Маржа {pl['margin']} з {plan['equity']} USDT. "
+             f"За 5 хв рух {c['range5']}%, тренд години {c['trend60']}% {'↑' if c.get('up60') else '↓'}, ціна на {c['pos']}% каналу.")
+
+
+def autopilot_loop() -> None:
+    while not STOP.is_set():
+        try:
+            with AUTO_LOCK:
+                autopilot_step()
+                with LOCK:
+                    save_state()
+        except Exception as exc:  # noqa: BLE001 — автопілот не повинен падати
+            log(f"автопілот: {exc}")
+            auto_cfg()["last"] = f"помилка: {exc}"
+        STOP.wait(5)
 
 
 def snapshot() -> dict:
@@ -1401,7 +1572,7 @@ def snapshot() -> dict:
         "env": CFG.env, "keys": bool(CFG.api_key and CFG.api_secret), "slRoi": CFG.sl_roi,
         "loopAgo": int(time.time() - HEART["tick"]) if HEART["tick"] else -1,
         "upMin": int((time.time() - HEART["started"]) // 60),
-        "grids": grid_rows(), "events": events,
+        "grids": grid_rows(), "events": events, "auto": auto_status(),
         "account": {k: ACCOUNT[k] for k in ("equity", "available", "positions", "error")},
     }
 
@@ -1450,6 +1621,7 @@ def serve() -> None:
                 "/api/price": lambda: price_of(data.get("symbol")),
                 "/api/scan": lambda: scan_coins(data),
                 "/api/sellplan": lambda: sell_plan(data),
+                "/api/autopilot": lambda: autopilot_set(data),
                 "/api/chart": lambda: chart_data(data.get("symbol"), data.get("interval")),
                 "/api/trades": lambda: recent_trades(data.get("symbol")),
                 "/api/preview": lambda: preview(data),
@@ -1515,6 +1687,9 @@ def main() -> None:
             log(f"УВАГА: ключ не підходить до {CFG.env} ({exc}). Перевірте BYBIT_ENV = mainnet/testnet")
         if CFG.env == "mainnet":
             log("MAINNET: лімітки реальні")
+        threading.Thread(target=autopilot_loop, name="autopilot", daemon=True).start()
+        if auto_cfg()["on"]:
+            log("автопілот увімкнений (після перезапуску продовжує)")
     try:
         loop()
     except KeyboardInterrupt:
