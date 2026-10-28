@@ -396,9 +396,9 @@ function ensureChart() {
     if (a >= 1e4) return sg + (a / 1e3).toFixed(1) + "K";
     return sg + a.toFixed(a < 10 ? 3 : a < 1000 ? 1 : 0);
   };
-  C.oiS = C.chart.addLineSeries({ priceScaleId: "oi", color: "#a855f7", lineWidth: 2, title: "OI",
+  C.oiS = C.chart.addLineSeries({ priceScaleId: "oi", color: "#a855f7", lineWidth: 2, lastValueVisible: false,
     priceFormat: { type: "custom", formatter: compact, minMove: 0.001 }, priceLineVisible: false });
-  C.cvdS = C.chart.addLineSeries({ priceScaleId: "cvd", color: "#38bdf8", lineWidth: 2, title: "CVD",
+  C.cvdS = C.chart.addLineSeries({ priceScaleId: "cvd", color: "#38bdf8", lineWidth: 2, lastValueVisible: false,
     priceFormat: { type: "custom", formatter: compact, minMove: 0.001 }, priceLineVisible: false });
   // полотно для горизонтальних обсягів поверх графіка (кліки проходять крізь нього)
   const cv = document.createElement("canvas");
@@ -739,7 +739,8 @@ function drawLines(d) {
   const add = (price, color, title, style, width) => {
     if (!(price > 0)) return;
     if (price < lo * 0.9999 || price > hi * 1.0001) { hidden++; return; }
-    C.lines.push(C.series.createPriceLine({ price, color, lineWidth: width || 1, lineStyle: style, axisLabelVisible: true, title }));
+    // без підсвічених плашок: лише лінія (лот і ціна — у таблиці заявок)
+    C.lines.push(C.series.createPriceLine({ price, color, lineWidth: width || 1, lineStyle: style, axisLabelVisible: false, title: "" }));
   };
   if (d.grid) {
     add(d.grid.lower, "#848e9c", "низ", 2, 1);
