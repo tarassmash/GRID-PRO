@@ -32,13 +32,15 @@ tailwind.config = { theme: { extend: { colors: {
         <p class="text-xs text-mute">Bybit USDT-perp · ручний нейтральний грід</p>
       </div>
     </div>
-    <button id="btn-panic" type="button" class="hidden min-h-11 items-center gap-2 rounded-xl border-2 border-down bg-down px-4 text-sm font-bold text-white shadow-lg shadow-down/30 hover:bg-down/90">⛔ Закрити все</button>
+    <div class="flex flex-wrap items-center gap-2">
     <div class="flex flex-wrap items-center gap-3 rounded-xl border border-line bg-desk px-4 py-2 text-xs">
       <div><span class="block text-mute">Середовище</span><b id="h-env" class="font-mono">—</b></div>
       <span class="h-6 w-px bg-line"></span>
       <div><span class="block text-mute">Капітал</span><b id="h-eq" class="font-mono">—</b></div>
       <span class="h-6 w-px bg-line"></span>
       <div><span class="block text-mute">Вільно</span><b id="h-av" class="font-mono">—</b></div>
+    </div>
+    <button id="btn-panic" type="button" class="hidden min-h-11 items-center gap-2 rounded-xl border-2 border-down bg-down px-4 text-sm font-bold text-white shadow-lg shadow-down/30 hover:bg-down/90">⛔ Закрити все</button>
     </div>
   </div>
 </header>
