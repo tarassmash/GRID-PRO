@@ -22,6 +22,7 @@ RANGES = [0.03, 0.05, 0.08, 0.12, 0.20]
 LEVELS = [5, 8, 12, 20, 30, 45]
 TRAILS = ["off", "up", "both"]
 LEVS = [1, 2, 3, 5, 10, 20]
+MULTS = [1.0, 1.3, 1.6]               # 1.0 = одинаковые лоты, иначе геометрические
 
 SPOT_FEE, FUT_FEE = 0.001, 0.0002     # мейкер Bybit для обычного аккаунта
 SLIP = 0.0002                         # «быстрая лимитка» при сдвигах трейлинга
@@ -74,7 +75,7 @@ def estimate_tick(prices):
     return d
 
 
-def sim(O, H, L, C, rng, n, trail, fut, tick=0.0):
+def sim(O, H, L, C, rng, n, trail, fut, tick=0.0, mult=1.0):
     """Один прогон сетки. Возвращает {плечо: результат}. Фьючерсы считаются один раз при 1x:
     все ордера масштабируются линейно, поэтому PnL при плече L = L × PnL(1x),
     а момент аварийного закрытия ищется отдельно для каждого плеча."""
@@ -91,12 +92,16 @@ def sim(O, H, L, C, rng, n, trail, fut, tick=0.0):
     half = tick * 0.5
     below = lambda x: min(x - half, x * (1 - EPS))   # покупка исполнится, если цена ушла ниже хотя бы на тик
     above = lambda x: max(x + half, x * (1 + EPS))
-    per = CAP / (n - 1)
+    m = max([i for i in range(n - 1) if lv(i) <= p0], default=-1)
+    w = {i: mult ** ((m - i) if i <= m else (i - m - 1)) for i in range(n - 1)}
+    sw = sum(w.values())
+    perk = {i: CAP * w[i] / sw for i in w}       # лот каждой ячейки, USDT
+    per = min(perk.values())                     # самый маленький лот — для новых ячеек трейлинга
     kmin = 0
     cash, coin, hold = CAP, 0.0, {}
     for i in range(n - 1):                       # верхние ячейки сразу держат монету
         if lv(i) > p0:
-            q = per / lv(i)
+            q = perk[i] / lv(i)
             cash -= q * p0 * (1 + fee + SLIP)
             coin += q
             hold[i] = q
@@ -116,7 +121,7 @@ def sim(O, H, L, C, rng, n, trail, fut, tick=0.0):
         while b < below(lv(z)):                  # вниз через уровень покупки ячейки z
             if kmin <= z <= kmin + n - 2 and z not in hold:
                 x = lv(z)
-                q = per / x
+                q = perk.get(z, per) / x
                 cash -= q * x * (1 + fee)
                 coin += q
                 hold[z] = q
@@ -161,6 +166,7 @@ def sim(O, H, L, C, rng, n, trail, fut, tick=0.0):
                     break
                 kmin += 1
                 k = kmin + n - 2
+                perk[k] = per
                 q = per / c
                 cash -= per * (1 + fee + SLIP)
                 coin += q
@@ -181,6 +187,7 @@ def sim(O, H, L, C, rng, n, trail, fut, tick=0.0):
                 cash += q * c * (1 - fee - SLIP)
                 coin -= q
                 kmin -= 1
+                perk[kmin] = per
                 if c < lv(kmin) * (1 - EPS):     # цена ниже новой покупки: сразу покупается
                     q2 = per / lv(kmin)
                     cash -= q2 * c * (1 + fee + SLIP)
@@ -226,7 +233,8 @@ def configs(quick=False):
                 if step < 2 * fee + 0.0005:          # шаг меньше двух комиссий — заведомо в минус
                     continue
                 for tr in TRAILS:
-                    yield fut, rng, n, tr, step
+                    for mu in ([1.0, 1.3] if quick else MULTS):
+                        yield fut, rng, n, tr, step, mu
 
 
 def run_window(task):
@@ -239,12 +247,12 @@ def run_window(task):
     hourly = prev[::60]
     path = sum(abs(b / a - 1) for a, b in zip(hourly, hourly[1:]))
     pre_chop = path / max(abs(pre_chg), 0.002)
-    for fut, rng, n, tr, step in configs(quick):
+    for fut, rng, n, tr, step, mu in configs(quick):
         if tick and ((1 + rng) / (1 - rng)) ** (1 / (n - 1)) * O[0] - O[0] < 3 * tick:
             continue                              # шаг сетки меньше трёх тиков — так бот не поставит
-        for L_, r in sim(O, H, L, C, rng, n, tr, fut, tick).items():
+        for L_, r in sim(O, H, L, C, rng, n, tr, fut, tick, mu).items():
             res.append(dict(coin=coin, start=start_ts, market="futures" if fut else "spot", range=rng, levels=n,
-                            step=round(step * 100, 3), trail=tr, lev=L_, ret=r["final"] / CAP - 1,
+                            step=round(step * 100, 3), trail=tr, mult=mu, lev=L_, ret=r["final"] / CAP - 1,
                             mdd=r["mdd"], stopped=r["stopped"], trades=r["trades"], shifts=r["shifts"],
                             hold=hold, pre_chg=pre_chg, pre_rng=pre_rng, pre_chop=pre_chop))
     return res
@@ -263,7 +271,7 @@ def pct(xs, p):
 def summarize(rows, test_from_ts):
     groups = {}
     for r in rows:
-        key = (r["market"], r["range"], r["levels"], r["trail"], r["lev"])
+        key = (r["market"], r["range"], r["levels"], r["trail"], r["mult"], r["lev"])
         part = "test" if r["start"] >= test_from_ts else "train"
         groups.setdefault(key, {"train": [], "test": []})[part].append(r)
 
@@ -280,13 +288,13 @@ def summarize(rows, test_from_ts):
 
     table = []
     for key, g in groups.items():
-        m, rng, n, tr, L_ = key
+        m, rng, n, tr, mu, L_ = key
         tr_s, te_s = stats(g["train"]), stats(g["test"])
         al = stats(g["train"] + g["test"])
         # «стабильность» = доходность плохой недели (20-й перцентиль) с поправкой на долю прибыльных
         score = tr_s.get("p20", -9) + 0.02 * tr_s.get("win", 0)
         table.append(dict(market=m, range=rng, levels=n, step=g["train"][0]["step"] if g["train"] else None,
-                          trail=tr, lev=L_, score=score, train=tr_s, test=te_s, all=al))
+                          trail=tr, mult=mu, lev=L_, score=score, train=tr_s, test=te_s, all=al))
     table.sort(key=lambda x: x["score"], reverse=True)
     return table
 
@@ -336,7 +344,7 @@ def main():
         w.writerows(out)
     print(f"готово за {time.time() - t0:.0f} с, строк {len(out)}", flush=True)
     for r in table[:15]:
-        print(r["market"], r["range"], r["levels"], r["trail"], f"{r['lev']}x",
+        print(r["market"], r["range"], r["levels"], r["trail"], f"лот×{r['mult']}", f"{r['lev']}x",
               "p20 %.2f%% med %.2f%% win %.0f%% | test med %.2f%% win %.0f%%" % (
                   r["train"]["p20"] * 100, r["train"]["median"] * 100, r["train"]["win"] * 100,
                   r["test"].get("median", 0) * 100, r["test"].get("win", 0) * 100))
