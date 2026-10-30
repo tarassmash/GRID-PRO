@@ -28,7 +28,8 @@ DEFAULT_CFG = {"api_key": "", "api_secret": "", "network": "testnet", "market": 
                "leverage": 1, "symbol": "BTCUSDT", "capital": 200, "range_pct": 8, "levels": 12,
                "trail_up": True, "trail_down": False, "trail_up_limit": 0, "trail_down_limit": 0,
                "trail_pct": 2, "trail_down_cap": 5,
-               "radar": "pause", "radar_sens": "mid", "lot_mode": "equal", "lot_mult": 1.3}
+               "radar": "pause", "radar_sens": "mid", "lot_mode": "equal", "lot_mult": 1.3,
+               "direction": "both"}
 SPOT_FEE = Decimal("0.001")      # комиссия спота Bybit 0.1%
 SPOT_FEE_BUF = Decimal("0.0015") # запас: комиссия покупки на споте списывается монетой
 FUT_FEE = Decimal("0.0002")      # мейкерская комиссия фьючерсов (бот торгует лимитками Post-Only)
@@ -407,6 +408,7 @@ class Bot:
         self.shift_up = self.shift_dn = 0
         self.trail_pnl = 0.0
         self.per_min, self.geo = Decimal(0), False
+        self.short = False
         self.trail_up = self.trail_down = False
         self.up_limit = self.dn_limit = Decimal(0)
         self.radar, self.radar_mode, self.radar_sens = None, "off", "mid"
@@ -439,7 +441,7 @@ class Bot:
                     "levels": [float(x) for x in self.levels], "hist": self.hist[-400:],
                     "fills": self.fills[-100:], "log": self.log[:60], "profit": self.profit,
                     "trades": self.trades, "open": len(self.orders), "bal": b,
-                    "market": self.cat, "leverage": self.lev, "pos": pos,
+                    "market": self.cat, "leverage": self.lev, "pos": pos, "direction": "sell" if self.short else "both",
                     "trail": {"up": self.trail_up, "down": self.trail_down,
                               "nup": self.shift_up, "ndn": self.shift_dn, "pnl": self.trail_pnl,
                               "wait": self.trail_wait, "pct": float(self.trail_pct * 100),
@@ -558,7 +560,14 @@ class Bot:
         if not 3 <= n <= 50:
             raise BybitError("Уровней должно быть от 3 до 50")
         rng = float(cfg["range_pct"]) / 100
-        lo, hi = float(p) * (1 - rng), float(p) * (1 + rng)
+        self.short = cfg.get("direction") == "sell"
+        if self.short and self.cat != "linear":
+            raise BybitError("«Только Sell» работает на фьючерсах: на споте нельзя продать то, чего нет. "
+                             "Выберите рынок «Фьючерсы USDT».")
+        if self.short:   # шорт-сетка: цена у низа диапазона, почти все линии выше цены
+            lo, hi = float(p) * (1 - 0.2 * rng), float(p) * (1 + 1.8 * rng)
+        else:
+            lo, hi = float(p) * (1 - rng), float(p) * (1 + rng)
         self.lo0, self.r, self.n, self.kmin, self._lv = lo, (hi / lo) ** (1 / (n - 1)), n, 0, {}
         L = [self.lv(i) for i in range(n)]
         self.levels = L
@@ -616,6 +625,7 @@ class Bot:
         if self.cat == "linear":
             self._setup_futures(api, cfg, p, cap, sell_cells, buy_cells, need_base)
             return
+
         free_base = self.bal.get(self.base_coin, {}).get("free", Decimal(0))
         free_quote = self.bal.get(self.quote_coin, {}).get("free", Decimal(0))
         short = need_base - free_base
@@ -647,6 +657,7 @@ class Bot:
         self.say("info", f"выставлено ордеров: {len(self.orders)}")
 
     def _setup_futures(self, api, cfg, p, cap, sell_cells, buy_cells, need_base):
+        self._api = api
         sym, L = self.symbol, self.levels
         margin = self.bal.get("_margin", Decimal(0))
         if margin < cap:
@@ -661,6 +672,13 @@ class Bot:
         if liq_move < rng * 1.2:
             self.say("err", f"плечо {self.lev}x: ликвидация примерно при движении на {liq_move:.1f}%, "
                             f"а диапазон ±{rng}%. Бот закроет позицию раньше ликвидации.")
+        if self.short:
+            self.say("info", f"режим «Только Sell»: шорт-лимитки на линиях выше цены, тейки reduce-only, "
+                             f"сетка {self.levels[0]} – {self.levels[-1]}")
+            _, self.bid, self.ask = api.bbo(sym)
+            self._arm_short()
+            self.say("info", f"выставлено Sell-лимиток: {len(self.orders)}")
+            return
         if need_base > 0:
             got, spent = self._chase(api, "Buy", q(need_base, self.bstep))
             self.say("buy", f"лонг быстрой лимиткой {got} {self.base_coin} для верхних ордеров")
@@ -708,6 +726,13 @@ class Bot:
     def _can_trail_up(self):
         return self.trail_up and (not self.up_limit or self.lv(self.kmin + self.n) <= self.up_limit)
 
+    # шорт-сетка: «трейлинг вверх» в настройках = за ценой вниз (в прибыль), «трейлинг вниз» = вверх против шорта
+    def _short_can_follow(self):
+        return self.trail_up and (not self.dn_limit or self.lv(self.kmin - 1) >= self.dn_limit)
+
+    def _short_can_against(self):
+        return self.trail_down and (not self.up_limit or self.lv(self.kmin + self.n) <= self.up_limit)
+
     def _down_day_limit(self, now):
         """Лимит убытка: сдвиги вниз за последние сутки уже зафиксировали down_cap капитала. 0 — без лимита."""
         if not self.down_cap or not self.cap:
@@ -719,7 +744,93 @@ class Bot:
             return True
         return False
 
+    def _trail_short(self, api, p):
+        top, bot = self.lv(self.kmin + self.n - 1), self.lv(self.kmin)
+        self.dn_at = bot * (1 - self.trail_pct) if self.trail_up else None
+        self.up_at = top * (1 + self.trail_pct) if self.trail_down else None
+        self.trail_wait = ""
+        steps = 0
+        if self._short_can_follow() and p < bot * (1 - self.trail_pct):
+            while steps < TRAIL_MAX_STEPS and self._short_can_follow() and p < self.lv(self.kmin):
+                if not self._shift_short_down(api):
+                    break
+                steps += 1
+        elif self._short_can_against() and p > top * (1 + self.trail_pct):
+            while steps < TRAIL_MAX_STEPS and self._short_can_against() and p > self.lv(self.kmin + self.n - 1):
+                if self._down_day_limit(time.time()) or not self._shift_short_up(api, p):
+                    break
+                steps += 1
+        if steps:
+            self._refresh_levels()
+            top, bot = self.lv(self.kmin + self.n - 1), self.lv(self.kmin)
+            self.dn_at = bot * (1 - self.trail_pct) if self.trail_up else None
+            self.up_at = top * (1 + self.trail_pct) if self.trail_down else None
+
+    def _shift_short_down(self, api):
+        """Цена ушла под шорт-сетку: все шорты уже закрыты тейками. Переносим верхнюю пустую ячейку вниз —
+        без сделок и без убытка."""
+        ktop = self.kmin + self.n - 2
+        c = self.cells.get(ktop)
+        if c is None or c.get("pos"):
+            return False
+        oid, o = self._order_of(ktop)
+        if o:
+            try:
+                api.cancel(self.symbol, oid)
+            except BybitError:
+                return False  # успела исполниться — разберёмся на следующей проверке
+        with self.lock:
+            if oid:
+                self.orders.pop(oid, None)
+            self.cells.pop(ktop, None)
+            self.paused.pop(ktop, None)
+            self.kmin -= 1
+        k = self.kmin
+        qty = q(self.per_min / self.lv(k), self.bstep) if self.geo else c["qty"]
+        self.cells[k] = {"i": k, "qty": qty, "cost": Decimal(0)}
+        self._arm_short()
+        self.shift_dn += 1
+        self.say("info", f"трейлинг ↓ шорт-сетка сдвинута за ценой: {self.lv(self.kmin)} – {self.lv(self.kmin + self.n - 1)}")
+        return True
+
+    def _shift_short_up(self, api, p):
+        """Цена ушла над шорт-сеткой: откупаем самый невыгодный (нижний) шорт и переносим ячейку наверх.
+        Фиксирует убыток, поэтому по умолчанию выключено."""
+        kb = self.kmin
+        c = self.cells.get(kb)
+        if c is None:
+            return False
+        oid, o = self._order_of(kb)
+        if o:
+            try:
+                api.cancel(self.symbol, oid)
+            except BybitError:
+                return False
+        with self.lock:
+            if oid:
+                self.orders.pop(oid, None)
+            self.cells.pop(kb, None)
+            self.paused.pop(kb, None)
+            self.kmin += 1
+        loss = 0.0
+        if c.get("pos"):
+            got, money = self._chase(api, "Buy", c["pos"], reduce_only=True)
+            loss = float(c.get("entry", money) - money * (1 + self.fee)) if got else 0.0
+            self.trail_pnl += loss
+            self.profit += loss
+            self.dn_losses.append((time.time(), loss))
+        k = self.kmin + self.n - 2
+        qty = q(self.per_min / self.lv(k), self.bstep) if self.geo else c["qty"]
+        self.cells[k] = {"i": k, "qty": qty, "cost": Decimal(0)}
+        self._arm_short()
+        self.shift_up += 1
+        self.say("info", f"трейлинг ↑ шорт-сетка сдвинута против шорта: {self.lv(self.kmin)} – "
+                         f"{self.lv(self.kmin + self.n - 1)}", round(loss, 4))
+        return True
+
     def _trail(self, api, p):
+        if self.short:
+            return self._trail_short(api, p)
         """Сдвиг сетки, когда цена ушла за границу на trail_pct %. Сдвигаем столько шагов, сколько нужно,
         чтобы цена снова оказалась внутри сетки."""
         top, bot = self.lv(self.kmin + self.n - 1), self.lv(self.kmin)
@@ -874,17 +985,34 @@ class Bot:
             price = self.bid
         elif side == "Sell" and self.bid and price <= self.bid:
             price = self.ask
-        oid = api.place(self.symbol, side, qty, price)
+        oid = api.place(self.symbol, side, qty, price, reduce_only=(self.short and side == "Buy"))
         with self.lock:
             self.orders[oid] = {"cell": cell, "side": side, "qty": qty, "price": price}
 
+    def _arm_short(self):
+        """Шорт-сетка: каждая свободная ячейка, у которой линия Sell выше цены, получает Sell-лимитку."""
+        busy = {o["cell"]["i"] for o in self.orders.values()} | set(self.paused)
+        for k in sorted(self.cells):
+            c = self.cells[k]
+            if k in busy or c.get("pos"):
+                continue
+            if self.ask is None or self.lv(k + 1) > self.ask:
+                self._put(self._api, c, "Sell", c["qty"])
+
     def _tick(self, api):
+        self._api = api
         p, self.bid, self.ask = api.bbo(self.symbol)
         with self.lock:
             self.price = p
             self.hist.append({"t": int(time.time() * 1000), "p": float(p)})
             del self.hist[:-1500]
-        if not self._can_trail_down() and p < self.lv(self.kmin) * (1 - STOP_BELOW):
+        if self.short:
+            if not self._short_can_against() and p > self.lv(self.kmin + self.n - 1) * (1 + STOP_BELOW):
+                self.error = (f"Цена {p} ушла выше шорт-сетки более чем на {int(STOP_BELOW*100)}%. "
+                              f"Позиция закрыта, бот остановлен для защиты.")
+                self.running = False
+                return
+        elif not self._can_trail_down() and p < self.lv(self.kmin) * (1 - STOP_BELOW):
             why = "достигнут предел трейлинга вниз, " if self.trail_down else ""
             self.error = (f"Цена {p}: {why}ушла ниже сетки более чем на {int(STOP_BELOW*100)}%. "
                           f"Бот остановлен для защиты.")
@@ -924,6 +1052,8 @@ class Bot:
                     self.say("info", f"ордер {o['side']} {o['price']} отменён вне бота, выставляю заново")
                 if c["i"] in self.cells:
                     self._put(api, c, o["side"], o["qty"])
+        if self.short and self.guard != "pump":
+            self._arm_short()
         if self.radar and self._guard(api, p) == "exit":
             return
         if not self.guard:
@@ -945,11 +1075,15 @@ class Bot:
         why = lambda: (f"принты ×{m['speed_x']}, объём ×{m['burst']}, дельта {m['delta']:+.2f}, "
                        f"цена 60с {m['move60']:+.2f}%, стакан {m['imb']:+.2f}")
         if self.guard is None:
-            if m["dump"] >= alert:
+            if m["dump"] >= alert and not self.short:
                 self._pause(api, "dump", "Buy", f"ранний сигнал ДАМПА ({m['dump']}): " + why())
             elif m["pump"] >= alert:
                 self._pause(api, "pump", "Sell", f"ранний сигнал ПАМПА ({m['pump']}): " + why())
             return
+        if self.guard == "pump" and self.short and self.radar_mode == "exit" and m["pump"] >= RADAR_EXIT:
+            self.error = f"Аварийный выход: сильный памп против шорта ({m['pump']}). " + why()
+            self.running = False
+            return "exit"
         if self.guard == "dump" and self.radar_mode == "exit" and m["dump"] >= RADAR_EXIT:
             self.error = f"Аварийный выход: сильный дамп ({m['dump']}). " + why()
             self.exit_spot = True
@@ -980,6 +1114,14 @@ class Bot:
         self.say("err", f"{text}. Сняты {what}: {n}")
 
     def _resume(self, api, why):
+        if self.short:   # шорт: Sell вернутся только на линии выше цены, без продажи «по рынку» после пампа
+            with self.lock:
+                self.paused = {}
+            before = len(self.orders)
+            self._arm_short()
+            self.say("info", f"{why}, защита снята, вернул Sell-лимиток: {len(self.orders) - before}")
+            self.guard, self.calm = None, 0
+            return
         n = 0
         for k, c in sorted(self.paused.items()):
             if k not in self.cells:
@@ -995,6 +1137,22 @@ class Bot:
         self.trades += 1
         self.maker_n += 1
         t = int(time.time() * 1000)
+        if self.short:
+            if o["side"] == "Sell":      # открылся шорт — ставим тейк линией ниже
+                c["pos"] = filled
+                c["entry"] = filled * avg * (1 - self.fee)
+                self.fills.append({"t": t, "p": float(avg), "k": "sell"})
+                self.say("sell", f"шорт {filled} {self.base_coin} по {avg}")
+                self._put(api, c, "Buy", filled)
+            else:                        # тейк исполнился — фиксируем прибыль и снова Sell на той же линии
+                pr = float(c.get("entry", filled * avg) - filled * avg * (1 + self.fee))
+                c["pos"] = Decimal(0)
+                self.profit += pr
+                self.fills.append({"t": t, "p": float(avg), "k": "buy"})
+                self.say("buy", f"тейк {filled} {self.base_coin} по {avg}", round(pr, 4))
+                if c["i"] in self.cells and (self.ask is None or self.lv(c["i"] + 1) > self.ask):
+                    self._put(api, c, "Sell", c["qty"])
+            return
         if o["side"] == "Buy":
             c["cost"] = filled * avg * (1 + self.fee)
             self.fills.append({"t": t, "p": float(avg), "k": "buy"})
@@ -1096,6 +1254,7 @@ def grids_summary():
         live = b is not None and (b.running or b.busy or b.symbol)
         out.append({"id": gid, "symbol": (b.symbol if live and b.symbol else g.get("symbol", "")).upper(),
                     "market": g.get("market", "spot"), "leverage": g.get("leverage", 1),
+                    "direction": g.get("direction", "both"),
                     "running": bool(b and b.running), "busy": bool(b and b.busy),
                     "status": b.status if b else "Остановлен", "error": b.error if b else "",
                     "profit": b.profit if b else 0.0, "trades": b.trades if b else 0})
@@ -1305,6 +1464,13 @@ input[type=range]{padding:0;border:0;background:none;accent-color:var(--fg)}
 .chips b{font-family:var(--mono);font-weight:500;font-size:14px;font-variant-numeric:tabular-nums}
 @media (prefers-reduced-motion:reduce){.track i{transition:none}}
 .posrow{display:none}.fut .posrow{display:grid}
+.seg{display:grid;grid-template-columns:1fr 1fr;gap:0;border-radius:6px;box-shadow:inset 0 0 0 1px var(--line);background:var(--panel);padding:3px}
+.seg button{font:inherit;font-weight:600;font-size:14px;padding:10px;border:0;border-radius:4px;background:transparent;color:var(--muted);cursor:pointer}
+.seg button[aria-checked="true"]{background:var(--ink);color:var(--ink-fg)}
+.seg button[data-dir="sell"][aria-checked="true"]{background:var(--sell);color:#fff}
+.seg button:disabled{cursor:not-allowed;opacity:.6}
+.seg button:focus-visible{outline:3px solid var(--buy);outline-offset:2px}
+#dirnote{margin-top:-14px}
 .tabs{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
 .tab{font:inherit;font-size:13px;display:inline-flex;align-items:center;gap:8px;padding:8px 12px;border-radius:6px;border:0;background:var(--panel);color:var(--fg);box-shadow:inset 0 0 0 1px var(--line);cursor:pointer}
 .tab b{font-family:var(--mono);font-weight:500}
@@ -1364,6 +1530,12 @@ input[type=range]{padding:0;border:0;background:none;accent-color:var(--fg)}
 </div>
 </section>
 <div class="err" id="err" hidden></div>
+<div class="seg" role="radiogroup" aria-label="Какие лимитки ставить">
+<button type="button" role="radio" data-dir="both">Обе стороны</button>
+<button type="button" role="radio" data-dir="sell">Только Sell</button>
+<select id="direction" hidden><option value="both">both</option><option value="sell">sell</option></select>
+</div>
+<div class="note" id="dirnote"></div>
 <button id="go" type="button">Запустить бота</button>
 <section class="stats">
 <div class="stat"><span>Сделок</span><b id="tc">0</b></div>
@@ -1389,8 +1561,8 @@ input[type=range]{padding:0;border:0;background:none;accent-color:var(--fg)}
 <div class="full warn" id="levwarn" hidden></div>
 <label>Ранняя защита от дампа/пампа<select id="radar"><option value="off">Выключена</option><option value="pause">Снимать ордера на время всплеска</option><option value="exit">Снимать ордера + аварийный выход при сильном дампе</option></select></label>
 <label>Чувствительность<select id="radar_sens"><option value="low">Низкая (реже, только сильные всплески)</option><option value="mid">Средняя</option><option value="high">Высокая (раньше, больше ложных)</option></select></label>
-<label class="chk"><input type="checkbox" id="trail_up"> Трейлинг вверх</label>
-<label class="chk"><input type="checkbox" id="trail_down"> Трейлинг вниз</label>
+<label class="chk"><input type="checkbox" id="trail_up"> <span id="tul">Трейлинг вверх</span></label>
+<label class="chk"><input type="checkbox" id="trail_down"> <span id="tdl">Трейлинг вниз</span></label>
 <label>Перестановка: цена ушла за границу на, %<input id="trail_pct" type="number" min="0" max="50" step="0.5"></label>
 <label>Лимит убытка сдвигов вниз, % капитала в сутки (0 = без лимита)<input id="trail_down_cap" type="number" min="0" max="100" step="1"></label>
 <label>Предел вверх, цена (0 = без предела)<input id="trail_up_limit" type="number" min="0" step="any"></label>
@@ -1415,7 +1587,7 @@ input[type=range]{padding:0;border:0;background:none;accent-color:var(--fg)}
 </div>
 <script>
 const $=id=>document.getElementById(id);
-const F=["api_key","api_secret","network","market","leverage","symbol","capital","range_pct","levels","trail_up","trail_down","trail_up_limit","trail_down_limit","radar","radar_sens","lot_mode","lot_mult","trail_pct","trail_down_cap"];
+const F=["api_key","api_secret","network","market","leverage","symbol","capital","range_pct","levels","trail_up","trail_down","trail_up_limit","trail_down_limit","radar","radar_sens","lot_mode","lot_mult","trail_pct","trail_down_cap","direction"];
 const CHK=["trail_up","trail_down"];
 function levUI(){const fut=$("market").value==="futures",lv=Number($("leverage").value)||1,rng=Number($("range_pct").value)||8;
  $("levbox").hidden=!fut;$("levval").textContent=lv+"x";const w=$("levwarn");
@@ -1439,13 +1611,24 @@ let S=null,LOCK="";
 const GLOBAL=["api_key","api_secret","network"];
 let CFG=null,CUR=null;
 try{CUR=localStorage.getItem("grid")}catch(e){}
+function dirUI(){
+ const d=$("direction").value||"both",sell=d==="sell";
+ document.querySelectorAll(".seg button").forEach(b=>b.setAttribute("aria-checked",String(b.dataset.dir===d)));
+ $("tul").textContent=sell?"Трейлинг за ценой вниз (без убытка)":"Трейлинг вверх";
+ $("tdl").textContent=sell?"Трейлинг вверх против шорта (фиксирует убыток)":"Трейлинг вниз";
+ $("dirnote").textContent=sell?"Только Sell: шорт-лимитки на линиях выше цены, тейки на линию ниже только закрывают шорт и никогда не откроют лонг. Работает на фьючерсах. Стоп: цена ушла выше сетки на 5%.":"";
+}
+document.querySelector(".seg").addEventListener("click",e=>{const b=e.target.closest("button[data-dir]");if(!b||b.disabled)return;
+ $("direction").value=b.dataset.dir;
+ if(b.dataset.dir==="sell"&&$("market").value!=="futures"){$("market").value="futures";levUI();lotUI();netTag($("network").value)}
+ dirUI();saveSoon()});
 function fillForm(){
  const g=CFG.grids[CUR]||{};
  F.forEach(k=>{
   if(GLOBAL.includes(k)){if(k==="api_secret")$(k).value=CFG.has_secret?"********":"";else $(k).value=CFG[k]??"";return}
   if(CHK.includes(k))$(k).checked=!!g[k];else $(k).value=g[k]??"";
  });
- $("pair").textContent=(g.symbol||"—").replace("USDT"," / USDT");netTag(CFG.network);levUI();lotUI();
+ $("pair").textContent=(g.symbol||"—").replace("USDT"," / USDT");netTag(CFG.network);levUI();lotUI();dirUI();
 }
 async function loadCfg(){
  CFG=await (await fetch("/api/config")).json();
@@ -1473,7 +1656,7 @@ async function newGrid(prefill){await saveNow();
 let GRIDS=[];
 function renderTabs(){
  const t=$("tabs"),tot=GRIDS.reduce((a,g)=>a+(g.profit||0),0),run=GRIDS.filter(g=>g.running).length;
- t.innerHTML=GRIDS.map(g=>{const sym=(g.symbol||"—").replace("USDT",""),mk=g.market==="futures"?` ${g.leverage}x`:" спот";
+ t.innerHTML=GRIDS.map(g=>{const sym=(g.symbol||"—").replace("USDT",""),mk=(g.market==="futures"?` ${g.leverage}x`:" спот")+(g.direction==="sell"?" sell":"");
   const p=g.trades||g.profit?` <b class="${g.profit>=0?"b":"s"}">${g.profit>=0?"+":""}${fmt(g.profit)}</b>`:"";
   return `<button type="button" class="tab${g.running?" on":""}${g.error?" err":""}" data-id="${g.id}" aria-current="${g.id===CUR}"><span class="d"></span>${esc(sym)}<span class="i">${mk}</span>${p}</button>`}).join("")+
   `<button type="button" class="tab add" id="addtab">+ Новая сетка</button>`+
@@ -1491,7 +1674,7 @@ loadCfg().then(poll);
 function netTag(n,m,lv){const t=$("net");m=m||$("market").value;lv=lv||$("leverage").value;
  const mk=m==="futures"||m==="linear"?`фьючерсы ${lv}x`:"спот";
  t.textContent={testnet:"Bybit testnet",demo:"Bybit demo",mainnet:"Bybit · реальные деньги"}[n]+" · "+mk;t.className="tag"+(n==="mainnet"?" live":"")}
-$("market").addEventListener("input",()=>netTag($("network").value));$("leverage").addEventListener("input",()=>netTag($("network").value));
+$("market").addEventListener("input",()=>{netTag($("network").value);if($("market").value!=="futures"&&$("direction").value==="sell"){$("direction").value="both";dirUI()}});$("leverage").addEventListener("input",()=>netTag($("network").value));
 $("network").onchange=e=>netTag(e.target.value);
 let STARTERR="";
 $("go").onclick=async()=>{
@@ -1525,6 +1708,7 @@ function render(){
  $("blab").textContent=fut?"Плечо":"Свободно "+(S.base||"монет");$("bb").textContent=fut?S.leverage+"x":fmt(S.bal[S.base],6);
  const e=$("err");e.hidden=!(S.error||LOCK||STARTERR);e.textContent=LOCK||STARTERR||S.error;
  $("delbtn").disabled=S.running||S.busy;
+ document.querySelectorAll(".seg button").forEach(b=>b.disabled=S.running||S.busy);
  if(S.levels.length){const L=S.levels,d=L[0]<10?4:0;$("grange").textContent=`Сетка: ${fmt(L[0],d)} – ${fmt(L[L.length-1],d)}`}
  radarUI(S.radar);
  if(S.fees)$("gfee").textContent=`Лимиток (мейкер): ${S.fees.maker} · маркетом: ${S.fees.taker}`;
