@@ -25,10 +25,10 @@ HOSTS = {
     "mainnet": "https://api.bybit.com",
 }
 DEFAULT_CFG = {"api_key": "", "api_secret": "", "network": "testnet", "market": "spot",
-               "leverage": 1, "symbol": "BTCUSDT", "capital": 200, "range_pct": 8, "levels": 12,
+               "leverage": 1, "symbol": "BTCUSDT", "capital": 200, "range_pct": 5, "levels": 4,
                "trail_up": True, "trail_down": False, "trail_up_limit": 0, "trail_down_limit": 0,
-               "trail_pct": 2, "trail_down_cap": 5,
-               "radar": "pause", "radar_sens": "mid", "lot_mode": "equal", "lot_mult": 1.3,
+               "trail_pct": 0.5, "trail_down_cap": 5, "stop_pct": 2,
+               "radar": "pause", "radar_sens": "mid", "lot_mode": "geo", "lot_mult": 1.4,
                "direction": "both"}
 SPOT_FEE = Decimal("0.001")      # комиссия спота Bybit 0.1%
 SPOT_FEE_BUF = Decimal("0.0015") # запас: комиссия покупки на споте списывается монетой
@@ -403,7 +403,8 @@ class Bot:
         self.cells, self.kmin, self.n, self._lv = {}, 0, 0, {}
         self.out_up = self.out_dn = 0
         self.dn_losses, self.trail_wait, self.cap = [], "", Decimal(0)
-        self.trail_pct, self.down_cap = Decimal("0.02"), Decimal("0.05")
+        self.trail_pct, self.down_cap = Decimal("0.005"), Decimal("0.05")
+        self.stop_pct = STOP_BELOW
         self.up_at = self.dn_at = None
         self.shift_up = self.shift_dn = 0
         self.trail_pnl = 0.0
@@ -607,6 +608,8 @@ class Bot:
         self.cap = cap
         self.trail_pct = min(max(Decimal(str(cfg.get("trail_pct") if cfg.get("trail_pct") is not None else 2)), Decimal(0)), Decimal(50)) / 100
         self.down_cap = max(Decimal(str(cfg.get("trail_down_cap") if cfg.get("trail_down_cap") is not None else 5)), Decimal(0)) / 100
+        sp = cfg.get("stop_pct")
+        self.stop_pct = min(max(Decimal(str(sp if sp is not None else 2)), Decimal("0.2")), Decimal(50)) / 100
         total = cap * self.lev           # объём всей сетки (с учётом плеча)
         # лоты: одинаковые или геометрические — у цены самый маленький, к краям каждый больше в mult раз
         mult = Decimal(1)
@@ -1026,14 +1029,14 @@ class Bot:
             self.hist.append({"t": int(time.time() * 1000), "p": float(p)})
             del self.hist[:-1500]
         if self.short:
-            if not self._short_can_against() and p > self.lv(self.kmin + self.n - 1) * (1 + STOP_BELOW):
-                self.error = (f"Цена {p} ушла выше шорт-сетки более чем на {int(STOP_BELOW*100)}%. "
+            if not self._short_can_against() and p > self.lv(self.kmin + self.n - 1) * (1 + self.stop_pct):
+                self.error = (f"Цена {p} ушла выше шорт-сетки более чем на {float(self.stop_pct*100):g}%. "
                               f"Позиция закрыта, бот остановлен для защиты.")
                 self.running = False
                 return
-        elif not self._can_trail_down() and p < self.lv(self.kmin) * (1 - STOP_BELOW):
+        elif not self._can_trail_down() and p < self.lv(self.kmin) * (1 - self.stop_pct):
             why = "достигнут предел трейлинга вниз, " if self.trail_down else ""
-            self.error = (f"Цена {p}: {why}ушла ниже сетки более чем на {int(STOP_BELOW*100)}%. "
+            self.error = (f"Цена {p}: {why}ушла ниже сетки более чем на {float(self.stop_pct*100):g}%. "
                           f"Бот остановлен для защиты.")
             self.running = False
             return
@@ -1237,13 +1240,14 @@ def scan_volatile(market="spot", minutes=30):
         trend = abs(chg) >= rng * 0.7
         kind = ("памп" if chg > 0 else "дамп") if trend and rng >= 2 else ("тренд" if trend else "пила")
         # подсказка для сетки: диапазон чуть шире размаха, шаг не меньше 0.4% (иначе съест комиссия)
-        rp = round(min(max(rng * 1.3, 2.0), 20.0), 1)
-        step = max(candle * 0.8, 0.4) / 100
-        lv = int(math.log((1 + rp / 100) / (1 - rp / 100)) / math.log(1 + step)) + 1
+        # по тесту на истории (полгода, 8 монет, окна 24 ч): узкие сетки ±0.5–1% с частыми уровнями в среднем
+        # убыточны, лучше всего держится ±5% и 4 уровня (шаг ~3.4%), для спокойной монеты ±3%
+        rp = 5.0 if rng >= 1.5 else 3.0
+        lv = 4
         return {"symbol": sym, "range": round(rng, 2), "candle": round(candle, 3), "change": round(chg, 2),
                 "chop": round(min(chop, 99), 1), "turn30": round(turn30), "turn24": round(turnover.get(sym, 0)),
                 "price": close, "kind": kind, "grid_ok": kind == "пила" and rng >= 1,
-                "sugg_range": rp, "sugg_levels": max(5, min(lv, 40))}
+                "sugg_range": rp, "sugg_levels": lv}
 
     with ThreadPoolExecutor(max_workers=10) as ex:
         rows = [r for r in ex.map(one, pool) if r]
@@ -1485,6 +1489,8 @@ input[type=range]{padding:0;border:0;background:none;accent-color:var(--fg)}
 .chips b{font-family:var(--mono);font-weight:500;font-size:14px;font-variant-numeric:tabular-nums}
 @media (prefers-reduced-motion:reduce){.track i{transition:none}}
 .posrow{display:none}.fut .posrow{display:grid}
+.presetrow{display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+#presetbtn{font:inherit;font-size:13px;font-weight:600;padding:8px 12px;border-radius:4px;border:0;background:var(--ink);color:var(--ink-fg);cursor:pointer}
 .pnlsub{font-family:var(--mono);font-size:13px;color:var(--muted);margin-top:6px;font-variant-numeric:tabular-nums}
 .seg{display:grid;grid-template-columns:1fr 1fr;gap:0;border-radius:6px;box-shadow:inset 0 0 0 1px var(--line);background:var(--panel);padding:3px}
 .seg button{font:inherit;font-weight:600;font-size:14px;padding:10px;border:0;border-radius:4px;background:transparent;color:var(--muted);cursor:pointer}
@@ -1586,6 +1592,8 @@ input[type=range]{padding:0;border:0;background:none;accent-color:var(--fg)}
 <label>Чувствительность<select id="radar_sens"><option value="low">Низкая (реже, только сильные всплески)</option><option value="mid">Средняя</option><option value="high">Высокая (раньше, больше ложных)</option></select></label>
 <label class="chk"><input type="checkbox" id="trail_up"> <span id="tul">Трейлинг вверх</span></label>
 <label class="chk"><input type="checkbox" id="trail_down"> <span id="tdl">Трейлинг вниз</span></label>
+<label>Стоп: цена ушла за сетку на, %<input id="stop_pct" type="number" min="0.2" max="50" step="0.5"></label>
+<div class="full presetrow"><button type="button" id="presetbtn">Лучшие настройки по тесту на истории</button><span class="note">±5%, 4 уровня, лоты ×1.4, трейлинг вверх 0.5%, стоп 2%, без плеча</span></div>
 <label>Перестановка: цена ушла за границу на, %<input id="trail_pct" type="number" min="0" max="50" step="0.5"></label>
 <label>Лимит убытка сдвигов вниз, % капитала в сутки (0 = без лимита)<input id="trail_down_cap" type="number" min="0" max="100" step="1"></label>
 <label>Предел вверх, цена (0 = без предела)<input id="trail_up_limit" type="number" min="0" step="any"></label>
@@ -1610,14 +1618,15 @@ input[type=range]{padding:0;border:0;background:none;accent-color:var(--fg)}
 </div>
 <script>
 const $=id=>document.getElementById(id);
-const F=["api_key","api_secret","network","market","leverage","symbol","capital","range_pct","levels","trail_up","trail_down","trail_up_limit","trail_down_limit","radar","radar_sens","lot_mode","lot_mult","trail_pct","trail_down_cap","direction"];
+const F=["api_key","api_secret","network","market","leverage","symbol","capital","range_pct","levels","trail_up","trail_down","trail_up_limit","trail_down_limit","radar","radar_sens","lot_mode","lot_mult","trail_pct","trail_down_cap","direction","stop_pct"];
 const CHK=["trail_up","trail_down"];
 function levUI(){const fut=$("market").value==="futures",lv=Number($("leverage").value)||1,rng=Number($("range_pct").value)||8;
  $("levbox").hidden=!fut;$("levval").textContent=lv+"x";const w=$("levwarn");
  if(!fut){w.hidden=true;return}
  const liq=100/lv;w.hidden=lv<=3&&liq>rng*1.2;
  w.textContent=`Объём сетки ${(Number($("capital").value)*lv||0).toLocaleString("ru-RU")} USDT. Ликвидация примерно при движении цены на ${liq.toFixed(1)}%`+
-  (liq<rng*1.2?`, это внутри диапазона ±${rng}%. Бот закроет позицию раньше, но убыток будет почти весь капитал. Уменьшите плечо или диапазон.`:". Комиссии и просадки умножаются на плечо.");}
+  (liq<rng*1.2?`, это внутри диапазона ±${rng}%. Бот закроет позицию раньше, но убыток будет почти весь капитал. Уменьшите плечо или диапазон.`:". Комиссии и просадки умножаются на плечо.")+
+  (lv>3?` По тесту на истории худший день внутридневной сетки без плеча −4.5…−5.8%, при ${lv}x это −${(4.5*lv).toFixed(0)}…−${Math.min(5.8*lv,100).toFixed(0)}% капитала.`:"");}
 ["market","leverage","range_pct","capital"].forEach(k=>$(k).addEventListener("input",levUI));
 function lotUI(){
  const geo=$("lot_mode").value==="geo";$("multbox").hidden=!geo;
@@ -1634,6 +1643,8 @@ let S=null,LOCK="";
 const GLOBAL=["api_key","api_secret","network"];
 let CFG=null,CUR=null;
 try{CUR=localStorage.getItem("grid")}catch(e){}
+$("presetbtn").onclick=()=>{const v={range_pct:5,levels:4,lot_mode:"geo",lot_mult:1.4,trail_pct:0.5,stop_pct:2,leverage:1,trail_down_cap:5};
+ for(const k in v)$(k).value=v[k];$("trail_up").checked=true;$("trail_down").checked=false;levUI();lotUI();netTag($("network").value);saveSoon()};
 function dirUI(){
  const d=$("direction").value||"both",sell=d==="sell";
  document.querySelectorAll(".seg button").forEach(b=>b.setAttribute("aria-checked",String(b.dataset.dir===d)));
@@ -1663,7 +1674,7 @@ async function loadCfg(){
  if(CFG.locked){LOCK="На сервере не задан пароль. Добавьте переменную APP_PASSWORD в Railway → Variables, иначе бот был бы открыт всему интернету.";$("go").disabled=true}
 }
 function formBody(){const b={id:CUR};F.forEach(k=>b[k]=CHK.includes(k)?$(k).checked:$(k).value);
- ["capital","range_pct","levels","leverage","trail_up_limit","trail_down_limit","lot_mult","trail_pct","trail_down_cap"].forEach(k=>b[k]=Number(b[k])||0);return b}
+ ["capital","range_pct","levels","leverage","trail_up_limit","trail_down_limit","lot_mult","trail_pct","trail_down_cap","stop_pct"].forEach(k=>b[k]=Number(b[k])||0);return b}
 let saveT=null;
 function saveSoon(){clearTimeout(saveT);saveT=setTimeout(saveNow,500)}
 async function saveNow(){clearTimeout(saveT);if(!CFG)return;const b=formBody();
