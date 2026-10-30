@@ -27,7 +27,7 @@ HOSTS = {
 DEFAULT_CFG = {"api_key": "", "api_secret": "", "network": "testnet", "market": "spot",
                "leverage": 1, "symbol": "BTCUSDT", "capital": 200, "range_pct": 8, "levels": 12,
                "trail_up": True, "trail_down": True, "trail_up_limit": 0, "trail_down_limit": 0,
-               "radar": "pause", "radar_sens": "mid"}
+               "radar": "pause", "radar_sens": "mid", "lot_mode": "equal", "lot_mult": 1.3}
 SPOT_FEE = Decimal("0.001")      # комиссия спота Bybit 0.1%
 SPOT_FEE_BUF = Decimal("0.0015") # запас: комиссия покупки на споте списывается монетой
 FUT_FEE = Decimal("0.0002")      # мейкерская комиссия фьючерсов (бот торгует лимитками Post-Only)
@@ -371,6 +371,7 @@ class Bot:
         self.out_up = self.out_dn = 0
         self.shift_up = self.shift_dn = 0
         self.trail_pnl = 0.0
+        self.per_min, self.geo = Decimal(0), False
         self.trail_up = self.trail_down = False
         self.up_limit = self.dn_limit = Decimal(0)
         self.radar, self.radar_mode, self.radar_sens = None, "off", "mid"
@@ -536,16 +537,32 @@ class Bot:
                 self.radar = None
 
         cap = Decimal(str(cfg["capital"]))
-        per = cap * self.lev / (n - 1)   # объём на уровень (с учётом плеча)
-        if per < min_amt * Decimal("1.05"):
-            raise BybitError(f"На один уровень выходит {per:.2f} {self.quote_coin}, а минимум ордера на Bybit "
-                             f"{min_amt} {self.quote_coin}. Увеличьте капитал или уменьшите число уровней.")
+        total = cap * self.lev           # объём всей сетки (с учётом плеча)
+        # лоты: одинаковые или геометрические — у цены самый маленький, к краям каждый больше в mult раз
+        mult = Decimal(1)
+        if cfg.get("lot_mode") == "geo":
+            mult = min(max(Decimal(str(cfg.get("lot_mult") or "1.3")), Decimal("1.01")), Decimal(3))
+        m = max([i for i in range(n - 1) if L[i] <= p], default=-1)      # ячейка, в которой сейчас цена
+        dist = {i: (m - i) if i <= m else (i - m - 1) for i in range(n - 1)}
+        w = {i: mult ** dist[i] for i in dist}
+        sw = sum(w.values())
+        per = {i: total * w[i] / sw for i in w}
+        self.per_min, self.geo = min(per.values()), mult > 1
+        if self.per_min < min_amt * Decimal("1.05"):
+            hint = " или множитель лота" if self.geo else ""
+            raise BybitError(f"Самый маленький лот выходит {self.per_min:.2f} {self.quote_coin}, а минимум ордера на "
+                             f"Bybit {min_amt} {self.quote_coin}. Увеличьте капитал, уменьшите число уровней{hint}.")
+        if self.geo:
+            self.say("info", f"геометрические лоты ×{mult}: от {self.per_min:.2f} до {max(per.values()):.2f} {self.quote_coin}")
         self.min_amt, self.min_qty = min_amt, min_qty
         self.cells = {}
         for i in range(n - 1):
-            qty = q(per / L[i], self.bstep)
+            qty = q(per[i] / L[i], self.bstep)
             if qty < min_qty:
-                raise BybitError("Объём на уровень меньше минимального. Увеличьте капитал.")
+                need = min_qty * L[i]
+                hint = ", уменьшите число уровней или множитель лота" if self.geo else " или уменьшите число уровней"
+                raise BybitError(f"Лот {per[i]:.2f} {self.quote_coin} меньше минимального объёма Bybit "
+                                 f"({min_qty} {self.base_coin} ≈ {need:.2f} {self.quote_coin}). Увеличьте капитал{hint}.")
             self.cells[i] = {"i": i, "qty": qty, "cost": qty * L[i] * (1 + self.fee)}
 
         sell_cells = [c for c in self.cells.values() if L[c["i"]] > p]
@@ -686,7 +703,10 @@ class Bot:
             self.kmin += 1
         freed = o["qty"] * o["price"]
         k = self.kmin + self.n - 2
-        want = o["qty"] if self.cat == "linear" else q(freed / p * (1 - self.fee_buf), self.bstep)
+        if self.geo:   # новая ячейка встаёт рядом с ценой — ей положен самый маленький лот
+            want = q(self.per_min / p * (1 - self.fee_buf), self.bstep)
+        else:
+            want = o["qty"] if self.cat == "linear" else q(freed / p * (1 - self.fee_buf), self.bstep)
         got, spent = self._chase(api, "Buy", want)
         if got <= 0:
             self.say("err", "сдвиг вверх: не удалось купить, ячейка вернётся при следующем сдвиге")
@@ -727,7 +747,10 @@ class Bot:
         with self.lock:
             self.kmin -= 1
         k = self.kmin
-        qty = cell["qty"] if self.cat == "linear" else q(got / self.lv(k), self.bstep)
+        if self.geo:   # новая покупка рядом с ценой — самый маленький лот, остаток денег остаётся свободным
+            qty = q(self.per_min / self.lv(k), self.bstep)
+        else:
+            qty = cell["qty"] if self.cat == "linear" else q(got / self.lv(k), self.bstep)
         cell = {"i": k, "qty": qty, "cost": qty * self.lv(k) * (1 + self.fee)}
         self.cells[k] = cell
         self._put(api, cell, "Buy", qty)
@@ -1230,6 +1253,9 @@ input[type=range]{padding:0;border:0;background:none;accent-color:var(--fg)}
 <label>Капитал (маржа), USDT<input id="capital" type="number" min="10"></label>
 <label>Диапазон ± %<input id="range_pct" type="number" min="1" max="50" step="0.5"></label>
 <label>Уровней<input id="levels" type="number" min="3" max="50"></label>
+<label>Лоты<select id="lot_mode"><option value="equal">Одинаковые</option><option value="geo">Геометрические (растут к краям)</option></select></label>
+<label id="multbox">Множитель лота<input id="lot_mult" type="number" min="1.05" max="3" step="0.05"></label>
+<div class="full note" id="lotinfo" style="margin:0"></div>
 </div>
 <p class="note">Ключ создайте на Bybit только с правом «Спот торговля», без вывода средств, лучше с привязкой к вашему IP. Сохраняется в gridbot_config.json рядом с программой.</p>
 </details>
@@ -1242,7 +1268,7 @@ input[type=range]{padding:0;border:0;background:none;accent-color:var(--fg)}
 </div>
 <script>
 const $=id=>document.getElementById(id);
-const F=["api_key","api_secret","network","market","leverage","symbol","capital","range_pct","levels","trail_up","trail_down","trail_up_limit","trail_down_limit","radar","radar_sens"];
+const F=["api_key","api_secret","network","market","leverage","symbol","capital","range_pct","levels","trail_up","trail_down","trail_up_limit","trail_down_limit","radar","radar_sens","lot_mode","lot_mult"];
 const CHK=["trail_up","trail_down"];
 function levUI(){const fut=$("market").value==="futures",lv=Number($("leverage").value)||1,rng=Number($("range_pct").value)||8;
  $("levbox").hidden=!fut;$("levval").textContent=lv+"x";const w=$("levwarn");
@@ -1251,12 +1277,22 @@ function levUI(){const fut=$("market").value==="futures",lv=Number($("leverage")
  w.textContent=`Объём сетки ${(Number($("capital").value)*lv||0).toLocaleString("ru-RU")} USDT. Ликвидация примерно при движении цены на ${liq.toFixed(1)}%`+
   (liq<rng*1.2?`, это внутри диапазона ±${rng}%. Бот закроет позицию раньше, но убыток будет почти весь капитал. Уменьшите плечо или диапазон.`:". Комиссии и просадки умножаются на плечо.");}
 ["market","leverage","range_pct","capital"].forEach(k=>$(k).addEventListener("input",levUI));
+function lotUI(){
+ const geo=$("lot_mode").value==="geo";$("multbox").hidden=!geo;
+ const n=Number($("levels").value)||12,fut=$("market").value==="futures",lv=fut?Number($("leverage").value)||1:1;
+ const tot=(Number($("capital").value)||0)*lv,mu=geo?Math.max(Number($("lot_mult").value)||1.3,1.01):1;
+ const cells=n-1,b=Math.ceil(cells/2),s=cells-b;let w=[];for(let i=0;i<b;i++)w.push(mu**i);for(let i=0;i<s;i++)w.push(mu**i);
+ const sw=w.reduce((x,y)=>x+y,0),mn=tot/sw,mx=mn*Math.max(...w);
+ $("lotinfo").textContent=geo?`Лоты примерно от ${fmt(mn)} USDT у цены до ${fmt(mx)} USDT на краях диапазона. Шаг уровней и так геометрический: одинаковый в процентах.`
+  :`Лот на уровень примерно ${fmt(mn)} USDT. Шаг уровней геометрический: одинаковый в процентах.`;
+}
+["lot_mode","lot_mult","levels","capital","market","leverage"].forEach(k=>$(k).addEventListener("input",lotUI));
 const fmt=(n,d=2)=>n==null?"—":Number(n).toLocaleString("ru-RU",{minimumFractionDigits:d,maximumFractionDigits:d});
 let S=null,LOCK="";
 fetch("/api/config").then(r=>r.json()).then(c=>{F.forEach(k=>{if(k==="api_secret"){$(k).value=c.has_secret?"********":""}else if(CHK.includes(k)){$(k).checked=!!c[k]}else $(k).value=c[k]});
  if(c.env_keys){$("envkeys").hidden=false;$("envkeyval").textContent=c.api_key;$("kbox1").hidden=$("kbox2").hidden=true}
  else if(!c.api_key||!c.has_secret)$("set").open=true;
- if(c.locked){LOCK="На сервере не задан пароль. Добавьте переменную APP_PASSWORD в Railway → Variables, иначе бот был бы открыт всему интернету.";$("go").disabled=true} $("pair").textContent=c.symbol; netTag(c.network);levUI()});
+ if(c.locked){LOCK="На сервере не задан пароль. Добавьте переменную APP_PASSWORD в Railway → Variables, иначе бот был бы открыт всему интернету.";$("go").disabled=true} $("pair").textContent=c.symbol; netTag(c.network);levUI();lotUI()});
 function netTag(n,m,lv){const t=$("net");m=m||$("market").value;lv=lv||$("leverage").value;
  const mk=m==="futures"||m==="linear"?`фьючерсы ${lv}x`:"спот";
  t.textContent={testnet:"Bybit testnet",demo:"Bybit demo",mainnet:"Bybit · реальные деньги"}[n]+" · "+mk;t.className="tag"+(n==="mainnet"?" live":"")}
@@ -1265,7 +1301,7 @@ $("network").onchange=e=>netTag(e.target.value);
 $("go").onclick=async()=>{
  $("go").disabled=true;
  if(S&&S.running){await fetch("/api/stop",{method:"POST"})}
- else{const b={};F.forEach(k=>b[k]=CHK.includes(k)?$(k).checked:$(k).value);["capital","range_pct","levels","leverage","trail_up_limit","trail_down_limit"].forEach(k=>b[k]=Number(b[k])||0);
+ else{const b={};F.forEach(k=>b[k]=CHK.includes(k)?$(k).checked:$(k).value);["capital","range_pct","levels","leverage","trail_up_limit","trail_down_limit","lot_mult"].forEach(k=>b[k]=Number(b[k])||0);
   await fetch("/api/start",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(b)});$("set").open=false}
  poll();
 };
