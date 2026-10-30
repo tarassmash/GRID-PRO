@@ -7,7 +7,8 @@
 """
 import json, time, hmac, hashlib, threading, os, uuid, webbrowser, statistics, signal, base64, sys
 from collections import deque
-import urllib.request, urllib.parse, urllib.error
+import urllib.request, urllib.parse, urllib.error, math
+from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal, ROUND_DOWN
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -925,6 +926,74 @@ class Bot:
             self._put(api, c, "Buy", c["qty"])
 
 
+# ---------- поиск самых волатильных монет за последние 30 минут ----------
+STABLES = {"USDC", "FDUSD", "TUSD", "DAI", "USDE", "USDD", "PYUSD", "BUSD", "EUR", "USDR", "USD1", "RLUSD"}
+SCAN_TOP = 80              # сколько самых ликвидных пар проверять
+SCAN_MIN_TURNOVER = 3e6    # минимум оборота за 24 часа, USDT: в пустой монете сетка не работает
+_scan_cache = {}
+
+
+def scan_volatile(market="spot", minutes=30):
+    cat = "linear" if market in ("futures", "linear") else "spot"
+    key = (cat, minutes)
+    hit = _scan_cache.get(key)
+    if hit and time.time() - hit[0] < 20:
+        return hit[1]
+    pub = Bybit("", "", "mainnet", cat)  # рыночные данные всегда с основной биржи
+    tick = pub._req("GET", "/v5/market/tickers", {"category": cat}).get("list", [])
+    pool = []
+    for t in tick:
+        sym = t.get("symbol", "")
+        if not sym.endswith("USDT") or sym[:-4] in STABLES or "-" in sym:
+            continue
+        try:
+            turn = float(t.get("turnover24h") or 0)
+        except ValueError:
+            continue
+        if turn >= SCAN_MIN_TURNOVER:
+            pool.append((turn, sym))
+    pool = [s_ for _, s_ in sorted(pool, reverse=True)[:SCAN_TOP]]
+    turnover = {t["symbol"]: float(t.get("turnover24h") or 0) for t in tick}
+
+    def one(sym):
+        try:
+            k = pub._req("GET", "/v5/market/kline", {"category": cat, "symbol": sym,
+                                                    "interval": "1", "limit": minutes}).get("list", [])
+        except BybitError:
+            return None
+        if len(k) < minutes * 0.8:
+            return None
+        k = [(float(x[1]), float(x[2]), float(x[3]), float(x[4]), float(x[6])) for x in reversed(k)]
+        o0, close = k[0][0], k[-1][3]
+        hi, lo = max(x[1] for x in k), min(x[2] for x in k)
+        if lo <= 0 or o0 <= 0:
+            return None
+        rng = (hi / lo - 1) * 100                                  # размах за 30 минут
+        candle = sum((x[1] / x[2] - 1) * 100 for x in k) / len(k)  # средняя минутная свеча
+        chg = (close / o0 - 1) * 100                               # куда ушла цена
+        path = sum(abs(x[3] / x[0] - 1) * 100 for x in k)          # пройденный путь
+        chop = path / abs(chg) if abs(chg) > 0.05 else path / 0.05 # пила: путь / итоговое движение
+        turn30 = sum(x[4] for x in k)
+        trend = abs(chg) >= rng * 0.7
+        kind = ("памп" if chg > 0 else "дамп") if trend and rng >= 2 else ("тренд" if trend else "пила")
+        # подсказка для сетки: диапазон чуть шире размаха, шаг не меньше 0.4% (иначе съест комиссия)
+        rp = round(min(max(rng * 1.3, 2.0), 20.0), 1)
+        step = max(candle * 0.8, 0.4) / 100
+        lv = int(math.log((1 + rp / 100) / (1 - rp / 100)) / math.log(1 + step)) + 1
+        return {"symbol": sym, "range": round(rng, 2), "candle": round(candle, 3), "change": round(chg, 2),
+                "chop": round(min(chop, 99), 1), "turn30": round(turn30), "turn24": round(turnover.get(sym, 0)),
+                "price": close, "kind": kind, "grid_ok": kind == "пила" and rng >= 1,
+                "sugg_range": rp, "sugg_levels": max(5, min(lv, 40))}
+
+    with ThreadPoolExecutor(max_workers=10) as ex:
+        rows = [r for r in ex.map(one, pool) if r]
+    rows.sort(key=lambda r: r["range"], reverse=True)
+    res = {"market": "futures" if cat == "linear" else "spot", "minutes": minutes,
+           "checked": len(pool), "t": time.strftime("%H:%M:%S"), "rows": rows[:20]}
+    _scan_cache[key] = (time.time(), res)
+    return res
+
+
 BOT = Bot()
 
 
@@ -971,6 +1040,12 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, PAGE.encode(), "text/html; charset=utf-8")
         elif self.path == "/api/state":
             self._send(200, BOT.state())
+        elif self.path.startswith("/api/scan"):
+            qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            try:
+                self._send(200, scan_volatile(qs.get("market", ["spot"])[0]))
+            except BybitError as e:
+                self._send(502, {"error": str(e)})
         elif self.path == "/api/config":
             cfg = load_cfg()
             cfg["has_secret"] = bool(cfg.pop("api_secret"))
@@ -1078,6 +1153,25 @@ input[type=range]{padding:0;border:0;background:none;accent-color:var(--fg)}
 .chips b{font-family:var(--mono);font-weight:500;font-size:14px;font-variant-numeric:tabular-nums}
 @media (prefers-reduced-motion:reduce){.track i{transition:none}}
 .posrow{display:none}.fut .posrow{display:grid}
+.scan{display:grid;gap:12px}
+.scanhead{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}
+#scanbtn{font:inherit;font-weight:600;font-size:15px;padding:12px 16px;border-radius:6px;border:0;background:var(--panel);color:var(--fg);box-shadow:inset 0 0 0 1px var(--line);cursor:pointer}
+#scanbtn:hover{box-shadow:inset 0 0 0 1px var(--fg)}
+#scanbtn:disabled{opacity:.6;cursor:wait}
+#scanbtn:focus-visible{outline:3px solid var(--buy);outline-offset:2px}
+.tbl{overflow-x:auto;border:1px solid var(--line);border-radius:6px;background:var(--panel)}
+.tbl table{border-collapse:collapse;width:100%;font-size:13px;min-width:640px}
+.tbl th{text-align:right;font-weight:500;font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);padding:9px 10px;border-bottom:1px solid var(--line);white-space:nowrap}
+.tbl td{text-align:right;padding:8px 10px;border-bottom:1px solid var(--line);font-family:var(--mono);font-variant-numeric:tabular-nums;white-space:nowrap}
+.tbl th:first-child,.tbl td:first-child{text-align:left}
+.tbl tr:last-child td{border-bottom:0}
+.tbl td.sym{font-family:var(--body);font-weight:600}
+.kind{font-family:var(--body);font-size:12px;font-weight:600;padding:2px 8px;border-radius:99px}
+.kind.ok{background:color-mix(in srgb,var(--buy) 16%,transparent);color:var(--buy)}
+.kind.bad{background:color-mix(in srgb,var(--sell) 14%,transparent);color:var(--sell)}
+.kind.mid{background:color-mix(in srgb,var(--warn) 16%,transparent);color:var(--warn)}
+.take{font:inherit;font-family:var(--body);font-size:12px;font-weight:600;padding:5px 10px;border-radius:4px;border:0;background:var(--ink);color:var(--ink-fg);cursor:pointer}
+.take:disabled{opacity:.4;cursor:not-allowed}
 </style></head><body>
 <div class="wrap">
 <header><div><div class="pair" id="pair">—</div><div class="tag" id="net">—</div></div>
@@ -1139,6 +1233,10 @@ input[type=range]{padding:0;border:0;background:none;accent-color:var(--fg)}
 </div>
 <p class="note">Ключ создайте на Bybit только с правом «Спот торговля», без вывода средств, лучше с привязкой к вашему IP. Сохраняется в gridbot_config.json рядом с программой.</p>
 </details>
+<section class="scan">
+<div class="scanhead"><button id="scanbtn" type="button">Найти самые волатильные за 30 минут</button><span class="note" id="scaninfo">Ищет на рынке из настроек (спот или фьючерсы)</span></div>
+<div class="tbl" id="scantbl" hidden><table><thead><tr><th>Монета</th><th>Размах 30м</th><th>Свеча 1м</th><th>Изменение</th><th>Пила</th><th>Оборот 30м</th><th>Характер</th><th></th></tr></thead><tbody id="scanbody"></tbody></table></div>
+</section>
 <section><div class="lbl" style="margin-bottom:6px">Журнал</div><div class="log" id="log"></div></section>
 <p class="note">При остановке бот снимает все свои ордера. На споте купленные монеты остаются на счёте, на фьючерсах позиция закрывается по рынку. Бот останавливается сам, если цена падает на 5% ниже сетки, а на фьючерсах ещё и когда до ликвидации остаётся треть пути.</p>
 </div>
@@ -1224,6 +1322,37 @@ function radarUI(R){
  $("m_fund").textContent=has&&R.src==="linear"?sg(R.funding*100,4)+"%":"—";
  ["m_delta","m_move"].forEach(id=>{const v=id==="m_delta"?R&&R.delta:R&&R.move60;$(id).className=!has?"":v>0?"b":v<0?"s":""});
 }
+const money=v=>v>=1e9?fmt(v/1e9,1)+" млрд":v>=1e6?fmt(v/1e6,1)+" млн":fmt(v/1e3,0)+" тыс";
+let SCAN=[];
+$("scanbtn").onclick=async()=>{
+ const b=$("scanbtn"),info=$("scaninfo");b.disabled=true;b.textContent="Ищу…";
+ const mk=$("market").value;
+ try{const r=await fetch("/api/scan?market="+mk),d=await r.json();
+  if(!r.ok)throw new Error(d.error||r.status);
+  SCAN=d.rows;
+  info.textContent=`${d.market==="futures"?"Фьючерсы":"Спот"} · проверено ${d.checked} ликвидных пар · ${d.t}`;
+  $("scantbl").hidden=!SCAN.length;
+  if(!SCAN.length)info.textContent+=" · подходящих не нашлось";
+  $("scanbody").innerHTML=SCAN.map((x,i)=>{
+   const k=x.kind==="пила"?"ok":x.kind==="тренд"?"mid":"bad";
+   const tip=x.grid_ok?"цена ходит туда-сюда, хорошо для сетки":x.kind==="пила"?"мало движения":"цена ушла в одну сторону, сетка рискованна";
+   return `<tr><td class="sym">${esc(x.symbol.replace("USDT",""))}<span class="i"> /USDT</span></td>
+   <td>${fmt(x.range)}%</td><td>${fmt(x.candle,2)}%</td>
+   <td class="${x.change>0?"b":x.change<0?"s":""}">${x.change>0?"+":""}${fmt(x.change)}%</td>
+   <td>×${fmt(x.chop,1)}</td><td>${money(x.turn30)}</td>
+   <td><span class="kind ${k}" title="${tip}">${x.kind}</span></td>
+   <td><button class="take" data-i="${i}" ${S&&S.running?"disabled":""}>Взять</button></td></tr>`}).join("");
+ }catch(e){info.textContent="Не получилось найти: "+e.message}
+ b.disabled=false;b.textContent="Найти самые волатильные за 30 минут";
+};
+$("scanbody").addEventListener("click",e=>{
+ const btn=e.target.closest(".take");if(!btn)return;const x=SCAN[+btn.dataset.i];
+ $("symbol").value=x.symbol;$("range_pct").value=x.sugg_range;$("levels").value=x.sugg_levels;
+ $("pair").textContent=x.symbol.replace("USDT","")+" / USDT";levUI();
+ $("scaninfo").textContent=`Взято ${x.symbol}: диапазон ±${x.sugg_range}%, ${x.sugg_levels} уровней. Нажмите «Запустить бота».`+
+  (x.grid_ok?"":x.kind==="пила"?" Осторожно: монета сейчас почти не двигается.":" Осторожно: монета сейчас в "+x.kind+"е.");
+ $("go").scrollIntoView({behavior:"smooth",block:"center"});
+});
 function esc(s){return String(s).replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"})[c])}
 const cv=$("cv"),ctx=cv.getContext("2d");
 function draw(){
