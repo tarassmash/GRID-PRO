@@ -1,0 +1,35 @@
+BTCUSDT: 263520 свечей
+ETHUSDT: 263520 свечей
+SOLUSDT: 263520 свечей
+XRPUSDT: 263520 свечей
+DOGEUSDT: 263520 свечей
+SUIUSDT: 263520 свечей
+LINKUSDT: 263520 свечей
+PEPEUSDT: 263520 свечей
+окон: 208, процессов: 4
+  20/208 окон, 88 с
+  40/208 окон, 123 с
+  60/208 окон, 158 с
+  80/208 окон, 193 с
+  100/208 окон, 227 с
+  120/208 окон, 261 с
+  140/208 окон, 293 с
+  160/208 окон, 327 с
+  180/208 окон, 361 с
+  200/208 окон, 398 с
+готово за 410 с, строк 129168
+futures 0.08 8 both 1x p20 -2.41% med 0.73% win 59% | test med 1.16% win 66%
+spot 0.08 8 both 1x p20 -2.45% med 0.68% win 59% | test med 1.13% win 66%
+futures 0.12 45 both 1x p20 -2.37% med 0.40% win 53% | test med 0.88% win 61%
+futures 0.08 30 both 1x p20 -2.54% med 0.71% win 59% | test med 1.08% win 64%
+futures 0.08 45 both 1x p20 -2.57% med 0.80% win 60% | test med 1.07% win 66%
+spot 0.2 12 off 1x p20 -2.46% med 0.27% win 53% | test med 0.74% win 61%
+spot 0.2 12 up 1x p20 -2.46% med 0.27% win 53% | test med 0.74% win 61%
+spot 0.2 12 both 1x p20 -2.46% med 0.27% win 53% | test med 0.74% win 61%
+futures 0.2 45 off 1x p20 -2.46% med 0.14% win 52% | test med 0.69% win 61%
+futures 0.2 45 up 1x p20 -2.46% med 0.14% win 52% | test med 0.69% win 61%
+futures 0.2 45 both 1x p20 -2.46% med 0.14% win 52% | test med 0.69% win 61%
+futures 0.2 12 off 1x p20 -2.49% med 0.24% win 53% | test med 0.70% win 61%
+futures 0.2 12 up 1x p20 -2.49% med 0.24% win 53% | test med 0.70% win 61%
+futures 0.2 12 both 1x p20 -2.49% med 0.24% win 53% | test med 0.70% win 61%
+futures 0.12 12 both 1x p20 -2.56% med 0.42% win 55% | test med 0.92% win 61%
