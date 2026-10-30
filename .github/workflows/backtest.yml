@@ -16,14 +16,14 @@ jobs:
         with:
           python-version: "3.12"
       - name: Тест на истории
-        run: python backtest.py --out results 2>&1 | tee results-log.txt
+        run: python backtest.py --suite trail --out results_trail 2>&1 | tee results-log.txt
       - name: Сохранить результаты в ветку
         if: always()
         run: |
-          mkdir -p results && cp results-log.txt results/log.txt || true
+          mkdir -p results_trail && cp results-log.txt results_trail/log.txt || true
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add results
+          git add results_trail
           git commit -m "Результаты теста на истории" || exit 0
           git pull --rebase -X theirs origin backtest || true
           git push

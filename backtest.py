@@ -75,7 +75,8 @@ def estimate_tick(prices):
     return d
 
 
-def sim(O, H, L, C, rng, n, trail, fut, tick=0.0, mult=1.0):
+def sim(O, H, L, C, rng, n, trail, fut, tick=0.0, mult=1.0, trail_pct=0.0, stop_below=STOP_BELOW,
+        down_cap=None):
     """Один прогон сетки. Возвращает {плечо: результат}. Фьючерсы считаются один раз при 1x:
     все ордера масштабируются линейно, поэтому PnL при плече L = L × PnL(1x),
     а момент аварийного закрытия ищется отдельно для каждого плеча."""
@@ -115,6 +116,8 @@ def sim(O, H, L, C, rng, n, trail, fut, tick=0.0, mult=1.0):
     peak = {L_: CAP for L_ in levs}
     mdd = {L_: 0.0 for L_ in levs}
     stopped_all = None
+    tp = max(trail_pct, EPS)
+    dn_loss = []                                 # (свеча, убыток) сдвигов вниз — для суточного лимита
 
     def move(b):
         nonlocal z, cash, coin, trades
@@ -145,8 +148,8 @@ def sim(O, H, L, C, rng, n, trail, fut, tick=0.0, mult=1.0):
         move(c)
 
         # стоп ниже сетки (без трейлинга вниз)
-        if not down and l < lv(kmin) * (1 - STOP_BELOW):
-            px = lv(kmin) * (1 - STOP_BELOW)
+        if not down and stop_below and l < lv(kmin) * (1 - stop_below):
+            px = lv(kmin) * (1 - stop_below)
             eq = cash + coin * px * (1 - (fee + SLIP if fut else 0))
             stopped_all = (eq, t)
             break
@@ -160,7 +163,7 @@ def sim(O, H, L, C, rng, n, trail, fut, tick=0.0, mult=1.0):
                 break
 
         # трейлинг на закрытии свечи
-        if up and c > lv(kmin + n - 1) * (1 + EPS):
+        if up and c > lv(kmin + n - 1) * (1 + tp):
             for _ in range(60):
                 if c <= lv(kmin + n - 1) * (1 + EPS) or kmin in hold:
                     break
@@ -178,12 +181,17 @@ def sim(O, H, L, C, rng, n, trail, fut, tick=0.0, mult=1.0):
                     hold[k] = q
                 shifts += 1
             z = math.floor(math.log(c / lo) / lnr)
-        elif down and c < lv(kmin) * (1 - EPS):
+        elif down and c < lv(kmin) * (1 - tp):
             for _ in range(60):
                 ktop = kmin + n - 2
                 if c >= lv(kmin) * (1 - EPS) or ktop not in hold:
                     break
+                if down_cap:
+                    dn_loss = [(tt, x) for tt, x in dn_loss if t - tt < 1440]
+                    if sum(x for _, x in dn_loss) >= down_cap * CAP:
+                        break
                 q = hold.pop(ktop)
+                dn_loss.append((t, max(q * (lv(ktop) - c), 0.0)))
                 cash += q * c * (1 - fee - SLIP)
                 coin -= q
                 kmin -= 1
@@ -235,6 +243,36 @@ def configs(quick=False):
                 for tr in TRAILS:
                     for mu in ([1.0, 1.3] if quick else MULTS):
                         yield fut, rng, n, tr, step, mu
+
+
+def trail_configs():
+    """Набор для проверки трейлинга по проценту и стопов."""
+    for fut in (False, True):
+        for rng in (0.05, 0.08, 0.12):
+            for n in (5, 8, 12, 20):
+                step = ((1 + rng) / (1 - rng)) ** (1 / (n - 1)) - 1
+                for mu in (1.0, 1.3, 1.6):
+                    for sb in (0.03, 0.05, 0.08, 0.12):
+                        yield fut, rng, n, "off", step, mu, 0.0, sb
+                    for tp in (0.0, 0.01, 0.02, 0.03, 0.05):
+                        yield fut, rng, n, "up", step, mu, tp, 0.05
+                        yield fut, rng, n, "both", step, mu, tp, 0.05
+
+
+def run_window_trail(task):
+    coin, start_ts, O, H, L, C, quick, tick, prev = task
+    hold = C[-1] / O[0] - 1
+    pre_rng = max(prev) / min(prev) - 1 if prev else 0.0
+    res = []
+    for fut, rng, n, tr, step, mu, tp, sb in trail_configs():
+        for L_, r in sim(O, H, L, C, rng, n, tr, fut, tick, mu, tp, sb,
+                         0.05 if tr == "both" else None).items():
+            if L_ not in (1, 2, 3, 5):
+                continue
+            res.append(dict(coin=coin, start=start_ts, market="futures" if fut else "spot", range=rng, levels=n,
+                            trail=tr, mult=mu, tpct=tp, stop=sb, lev=L_, ret=r["final"] / CAP - 1, mdd=r["mdd"],
+                            stopped=r["stopped"], trades=r["trades"], shifts=r["shifts"], hold=hold, pre_rng=pre_rng))
+    return res
 
 
 def run_window(task):
@@ -303,6 +341,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--quick", action="store_true")
     ap.add_argument("--out", default="results")
+    ap.add_argument("--suite", default="main")
     a = ap.parse_args()
     coins = COINS[:3] if a.quick else COINS
     months = MONTHS[-2:] if a.quick else MONTHS
@@ -325,11 +364,20 @@ def main():
         print(f"{coin}: {len(rows)} свечей, шаг цены {tick:g} ({tick / rows[-1][4] * 100:.3f}% от цены)", flush=True)
     print(f"окон: {len(tasks)}, процессов: {os.cpu_count()}", flush=True)
     out = []
+    fn = run_window_trail if a.suite == "trail" else run_window
     with Pool() as pool:
-        for i, res in enumerate(pool.imap_unordered(run_window, tasks), 1):
+        for i, res in enumerate(pool.imap_unordered(fn, tasks), 1):
             out += res
             if i % 20 == 0:
                 print(f"  {i}/{len(tasks)} окон, {time.time() - t0:.0f} с", flush=True)
+    if a.suite == "trail":
+        os.makedirs(a.out, exist_ok=True)
+        with open(os.path.join(a.out, "runs.csv"), "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=list(out[0].keys()))
+            w.writeheader()
+            w.writerows(out)
+        print(f"готово за {time.time() - t0:.0f} с, строк {len(out)}", flush=True)
+        return
     import datetime
     tf = int(datetime.datetime.strptime(TEST_FROM + "-01", "%Y-%m-%d").replace(
         tzinfo=datetime.timezone.utc).timestamp() * 1000)
