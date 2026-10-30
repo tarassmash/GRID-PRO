@@ -424,7 +424,25 @@ class Bot:
         print(time.strftime("%H:%M:%S"), f"[сетка {self.gid} {self.symbol}]", kind, text,
               "" if val is None else val, flush=True)
 
+    def unrealized(self):
+        """Плавающий результат открытых позиций сетки, USDT."""
+        with self.lock:
+            if not (self.running or self.busy):
+                return 0.0
+            if self.cat == "linear":
+                return float(self.pos.get("unrealisedPnl") or 0) if self.pos else 0.0
+            if not self.price:
+                return 0.0
+            u = Decimal(0)
+            held = [o for o in self.orders.values() if o["side"] == "Sell"]
+            held += [{"cell": c["cell"], "qty": c["sell_qty"]} for c in self.paused.values() if c["side"] == "Sell"]
+            for o in held:
+                c = o["cell"]
+                u += o["qty"] * self.price * (1 - self.fee) - c.get("cost", Decimal(0))
+            return float(u)
+
     def state(self):
+        upnl = self.unrealized()
         with self.lock:
             b = {k: float(v["free"]) for k, v in self.bal.items() if k in (self.base_coin, self.quote_coin)}
             if "_margin" in self.bal:
@@ -440,6 +458,7 @@ class Bot:
                     "network": self.network, "price": float(self.price) if self.price else None,
                     "levels": [float(x) for x in self.levels], "hist": self.hist[-400:],
                     "fills": self.fills[-100:], "log": self.log[:60], "profit": self.profit,
+                    "upnl": upnl, "total": self.profit + upnl,
                     "trades": self.trades, "open": len(self.orders), "bal": b,
                     "market": self.cat, "leverage": self.lev, "pos": pos, "direction": "sell" if self.short else "both",
                     "trail": {"up": self.trail_up, "down": self.trail_down,
@@ -1251,13 +1270,15 @@ def grids_summary():
     out = []
     for gid in sorted(st["grids"], key=int):
         g, b = st["grids"][gid], BOTS.get(gid)
+        up = b.unrealized() if b else 0.0
         live = b is not None and (b.running or b.busy or b.symbol)
         out.append({"id": gid, "symbol": (b.symbol if live and b.symbol else g.get("symbol", "")).upper(),
                     "market": g.get("market", "spot"), "leverage": g.get("leverage", 1),
                     "direction": g.get("direction", "both"),
                     "running": bool(b and b.running), "busy": bool(b and b.busy),
                     "status": b.status if b else "Остановлен", "error": b.error if b else "",
-                    "profit": b.profit if b else 0.0, "trades": b.trades if b else 0})
+                    "profit": b.profit if b else 0.0, "trades": b.trades if b else 0,
+                    "upnl": up, "total": (b.profit if b else 0.0) + up})
     return out
 
 
@@ -1464,6 +1485,7 @@ input[type=range]{padding:0;border:0;background:none;accent-color:var(--fg)}
 .chips b{font-family:var(--mono);font-weight:500;font-size:14px;font-variant-numeric:tabular-nums}
 @media (prefers-reduced-motion:reduce){.track i{transition:none}}
 .posrow{display:none}.fut .posrow{display:grid}
+.pnlsub{font-family:var(--mono);font-size:13px;color:var(--muted);margin-top:6px;font-variant-numeric:tabular-nums}
 .seg{display:grid;grid-template-columns:1fr 1fr;gap:0;border-radius:6px;box-shadow:inset 0 0 0 1px var(--line);background:var(--panel);padding:3px}
 .seg button{font:inherit;font-weight:600;font-size:14px;padding:10px;border:0;border-radius:4px;background:transparent;color:var(--muted);cursor:pointer}
 .seg button[aria-checked="true"]{background:var(--ink);color:var(--ink-fg)}
@@ -1509,7 +1531,8 @@ input[type=range]{padding:0;border:0;background:none;accent-color:var(--fg)}
 <nav class="tabs" id="tabs" aria-label="Сетки"></nav>
 <header><div><div class="pair" id="pair">—</div><div class="tag" id="net">—</div></div>
 <div class="status" id="status"><span class="dot"></span><span id="statusText">Остановлен</span></div></header>
-<section class="hero"><div><div class="lbl">Прибыль сетки</div><div class="pnl" id="pnl">+0.00</div></div>
+<section class="hero"><div><div class="lbl">Итог сетки</div><div class="pnl" id="pnl">+0.00</div>
+<div class="pnlsub" id="pnlsub">зафиксировано +0,00 · в позиции +0,00</div></div>
 <div class="price"><div class="lbl">Цена</div><span id="price">—</span></div></section>
 <div class="chart"><canvas id="cv"></canvas></div>
 <div class="gridline"><span id="grange">Сетка: —</span><span id="gtrail">Трейлинг: —</span><span id="gfee">Лимиток: 0 · маркетом: 0</span></div>
@@ -1655,12 +1678,13 @@ async function newGrid(prefill){await saveNow();
  await selectGrid(r.id);$("set").open=true}
 let GRIDS=[];
 function renderTabs(){
- const t=$("tabs"),tot=GRIDS.reduce((a,g)=>a+(g.profit||0),0),run=GRIDS.filter(g=>g.running).length;
+ const t=$("tabs"),tot=GRIDS.reduce((a,g)=>a+(g.total||0),0),real=GRIDS.reduce((a,g)=>a+(g.profit||0),0),
+  un=GRIDS.reduce((a,g)=>a+(g.upnl||0),0),run=GRIDS.filter(g=>g.running).length,sg=v=>(v>=0?"+":"−")+fmt(Math.abs(v));
  t.innerHTML=GRIDS.map(g=>{const sym=(g.symbol||"—").replace("USDT",""),mk=(g.market==="futures"?` ${g.leverage}x`:" спот")+(g.direction==="sell"?" sell":"");
-  const p=g.trades||g.profit?` <b class="${g.profit>=0?"b":"s"}">${g.profit>=0?"+":""}${fmt(g.profit)}</b>`:"";
+  const v=g.total||0,p=g.running||g.trades||v?` <b class="${v>=0?"b":"s"}">${v>=0?"+":"−"}${fmt(Math.abs(v))}</b>`:"";
   return `<button type="button" class="tab${g.running?" on":""}${g.error?" err":""}" data-id="${g.id}" aria-current="${g.id===CUR}"><span class="d"></span>${esc(sym)}<span class="i">${mk}</span>${p}</button>`}).join("")+
   `<button type="button" class="tab add" id="addtab">+ Новая сетка</button>`+
-  `<span class="total">Работает ${run} из ${GRIDS.length} · всего <b class="${tot>=0?"b":"s"}">${tot>=0?"+":""}${fmt(tot)} USDT</b></span>`;
+  `<span class="total" title="зафиксировано ${sg(real)} · в позициях ${sg(un)}">Работает ${run} из ${GRIDS.length} · всего <b class="${tot>=0?"b":"s"}">${sg(tot)} USDT</b> <span class="i">(зафикс. ${sg(real)} · в позициях ${sg(un)})</span></span>`;
 }
 $("tabs").addEventListener("click",e=>{const b=e.target.closest(".tab");if(!b)return;
  if(b.id==="addtab")newGrid();else if(b.dataset.id!==CUR)selectGrid(b.dataset.id)});
@@ -1701,8 +1725,10 @@ function render(){
   $("pu").textContent=P?(P.upnl>=0?"+":"")+fmt(P.upnl):"—";$("pu").className=P&&P.upnl<0?"s":"b";
   $("qlab").textContent="Свободная маржа";$("qb").textContent=fmt(S.bal._margin)}
  $("price").textContent=fmt(S.price,S.price&&S.price<10?4:2);
- const p=$("pnl");p.textContent=(S.profit>=0?"+":"−")+fmt(Math.abs(S.profit))+" "+(S.quote||"USDT");
- p.className="pnl"+(S.profit>0.0001?" up":S.profit<-0.0001?" down":"");
+ const T0=S.total??S.profit,sg=v=>(v>=0?"+":"−")+fmt(Math.abs(v));
+ const p=$("pnl");p.textContent=sg(T0)+" "+(S.quote||"USDT");
+ p.className="pnl"+(T0>0.0001?" up":T0<-0.0001?" down":"");
+ $("pnlsub").textContent=`зафиксировано ${sg(S.profit)} · в позиции ${sg(S.upnl||0)}`;
  $("tc").textContent=S.trades;$("oc").textContent=S.open;
  if(!fut){$("qlab").textContent="Свободно "+(S.quote||"USDT");$("qb").textContent=fmt(S.bal[S.quote])}
  $("blab").textContent=fut?"Плечо":"Свободно "+(S.base||"монет");$("bb").textContent=fut?S.leverage+"x":fmt(S.bal[S.base],6);
