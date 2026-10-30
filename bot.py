@@ -1,1959 +1,1290 @@
 #!/usr/bin/env python3
-"""Ручний нейтральний грід-бот для Bybit USDT-perp (як грід-бот на Bybit, але свій).
-
-Ви задаєте монету, діапазон, кількість сіток, маржу й плече. Buy стоять нижче ціни, Sell — вище.
-Щойно лімітка виконалась, на сусідній лінії ставиться протилежна (мікротейк).
-Режими: однакові лоти або геометрична сітка (лінії через однаковий %, лот росте від ціни до краю).
-
-Лише стандартна бібліотека Python 3.9+. Налаштування — змінні середовища або файл .env поруч.
 """
-
-from __future__ import annotations
-
-import sys
-
-if sys.version_info < (3, 9):
-    sys.exit("Потрібен Python 3.9 або новіший")
-
-import hashlib
-import hmac
-import json
-import math
-import os
-import threading
-import time
-import urllib.error
-import urllib.parse
-import urllib.request
-import webbrowser
+Сеточный бот для Bybit (спот и фьючерсы USDT, API v5).
+Локально:  python bot.py  -> откроется страница в браузере.
+На Railway: ключи и пароль задаются в Variables (см. README.md и .env.example).
+Нужен только Python 3.8+, без сторонних библиотек.
+"""
+import json, time, hmac, hashlib, threading, os, uuid, webbrowser, statistics, signal, base64, sys
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor
+import urllib.request, urllib.parse, urllib.error
+from decimal import Decimal, ROUND_DOWN
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
 
-HERE = Path(__file__).resolve().parent
-LOCAL = not os.environ.get("RAILWAY_ENVIRONMENT")
-
-
-def load_dotenv(path: Path) -> None:
-    """KEY=VALUE з .env; справжні змінні середовища важливіші. # — коментар."""
-    if not path.exists():
-        return
-    for raw in path.read_text(encoding="utf-8-sig").splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        key = key.strip().removeprefix("export ").strip()
-        value = value.strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-            value = value[1:-1]
-        elif " #" in value:
-            value = value.split(" #", 1)[0].strip()
-        os.environ.setdefault(key, value)
-
-
-load_dotenv(HERE / ".env")
-for _stream in (sys.stdout, sys.stderr):
-    try:
-        _stream.reconfigure(encoding="utf-8", errors="replace")
-    except (AttributeError, ValueError):
-        pass
-
-
-def env_int(name: str, default: int, lo: int, hi: int) -> int:
-    try:
-        value = int(float(os.environ.get(name, default)))
-    except (TypeError, ValueError):
-        value = default
-    return max(lo, min(hi, value))
-
-
-def env_float(name: str, default: float, lo: float, hi: float) -> float:
-    try:
-        value = float(os.environ.get(name, default))
-    except (TypeError, ValueError):
-        value = default
-    return max(lo, min(hi, value))
-
-
+ON_SERVER = bool(os.environ.get("PORT") or os.environ.get("RAILWAY_ENVIRONMENT"))
+PORT = int(os.environ.get("PORT") or 8765)
+HERE = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.environ.get("DATA_DIR") or (os.path.isdir("/data") and "/data") or HERE
+CFG_PATH = os.path.join(DATA_DIR, "gridbot_config.json")
+APP_PASSWORD = os.environ.get("APP_PASSWORD", "")
+ENV_KEY, ENV_SECRET = os.environ.get("BYBIT_API_KEY", ""), os.environ.get("BYBIT_API_SECRET", "")
 HOSTS = {
-    "mainnet": ["https://api.bybit.com", "https://api.bytick.com"],
-    "testnet": ["https://api-testnet.bybit.com", "https://api-testnet.bytick.com"],
+    "testnet": "https://api-testnet.bybit.com",
+    "demo": "https://api-demo.bybit.com",
+    "mainnet": "https://api.bybit.com",
 }
+DEFAULT_CFG = {"api_key": "", "api_secret": "", "network": "testnet", "market": "spot",
+               "leverage": 1, "symbol": "BTCUSDT", "capital": 200, "range_pct": 8, "levels": 12,
+               "trail_up": True, "trail_down": True, "trail_up_limit": 0, "trail_down_limit": 0,
+               "radar": "pause", "radar_sens": "mid"}
+SPOT_FEE = Decimal("0.001")      # комиссия спота Bybit 0.1%
+SPOT_FEE_BUF = Decimal("0.0015") # запас: комиссия покупки на споте списывается монетой
+FUT_FEE = Decimal("0.0002")      # мейкерская комиссия фьючерсов (бот торгует лимитками Post-Only)
+CHASE_TRIES = 6        # быстрая лимитка: до 6 перестановок по лучшей цене стакана…
+CHASE_WAIT = 2.5       # …по 2.5 секунды, потом остаток добирается маркетом
+LIQ_GUARD = Decimal("0.35")      # аварийный выход, когда до ликвидации осталось 35% пути
+STOP_BELOW = Decimal("0.05")  # стоп, если цена ушла на 5% ниже нижней границы
+POLL_SEC = 3
+TRAIL_CONFIRM = 2      # цена должна продержаться за границей 2 проверки подряд (защита от прострелов)
+TRAIL_MAX_STEPS = 3    # не больше 3 сдвигов за одну проверку
+RADAR_SENS = {"low": (75, 45), "mid": (60, 35), "high": (48, 28)}  # порог тревоги / порог «успокоилось»
+RADAR_CALM_TICKS = 20  # ~1 минута спокойствия, прежде чем вернуть ордера
+RADAR_MAX_PAUSE = 30 * 60
+RADAR_EXIT = 90        # риск дампа, при котором срабатывает аварийный выход (если включён)
 
 
-class Cfg:
-    def __init__(self) -> None:
-        self.api_key = os.environ.get("BYBIT_API_KEY", "").strip()
-        self.api_secret = os.environ.get("BYBIT_API_SECRET", "").strip()
-        env = os.environ.get("BYBIT_ENV", "testnet").strip().lower()
-        self.env = env if env in HOSTS else "testnet"
-        self.base = HOSTS[self.env][0]
-        # критичний стоп-лос, % від маржі позиції (ROI як на Bybit); 0 = вимкнено
-        self.sl_roi = env_float("STOP_LOSS_ROI", 150, 0, 1000)
-        self.poll = env_int("POLL_SEC", 2, 1, 60)
-        self.scalp_min_step = env_float("SCALP_MIN_STEP_PCT", 0.12, 0.05, 2)
-        self.tg_token = os.environ.get("TELEGRAM_TOKEN", "").strip()
-        self.tg_chat = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
-        volume = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
-        if volume and os.path.isdir(volume):
-            default_state = os.path.join(volume, "state.json")
-        elif os.path.isdir("/data"):
-            default_state = "/data/state.json"
-        else:
-            default_state = str(HERE / "data" / "state.json")
-        self.state_path = Path(os.environ.get("STATE_PATH", default_state))
+def clamp(x):
+    return max(0.0, min(1.0, x))
 
 
-CFG = Cfg()
-LOCK = threading.Lock()        # стан (STATE)
-GRID_LOCK = threading.Lock()   # дії з ордерами сіток
-STOP = threading.Event()
-OFFSET_MS = 0
-HEART = {"tick": 0.0, "started": time.time()}
-ACCOUNT = {"equity": "0", "available": "0", "positions": [], "error": "", "at": 0.0}
-SPECS: dict[str, dict] = {}
-LINK_PREFIX = "mg"  # свої orderLinkId, щоб не чіпати чужі ордери
+def q(x, step):
+    """Округлить вниз до шага биржи."""
+    return (Decimal(x) / step).to_integral_value(rounding=ROUND_DOWN) * step
 
 
-def log(msg: str) -> None:
-    print(time.strftime("%Y-%m-%d %H:%M:%S"), msg, flush=True)
-
-
-# ---------------- стан ----------------
-
-def load_state() -> dict:
-    if CFG.state_path.exists():
-        try:
-            data = json.loads(CFG.state_path.read_text())
-            if isinstance(data, dict):
-                data.setdefault("grids", [])
-                data.setdefault("events", [])
-                return data
-        except (OSError, json.JSONDecodeError):
-            log("файл стану не читається, починаю з нуля")
-    return {"grids": [], "events": []}
-
-
-def save_state() -> None:
-    cutoff = time.time() - 86400
-    STATE["grids"] = [
-        g for g in STATE.get("grids") or []
-        if g.get("status") == "active" or float(g.get("closedAt") or g.get("created") or 0) > cutoff
-    ][:100]
-    CFG.state_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = CFG.state_path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(STATE, ensure_ascii=False))
-    tmp.replace(CFG.state_path)
-
-
-STATE = load_state()
-
-
-def add_event(text: str) -> None:
-    with LOCK:
-        events = STATE.setdefault("events", [])
-        events.append({"t": int(time.time()), "text": text[:300]})
-        del events[:-80]
-
-
-def notify(text: str) -> None:
-    log(text)
-    add_event(text)
-    if not CFG.tg_token or not CFG.tg_chat:
-        return
-    req = urllib.request.Request(
-        f"https://api.telegram.org/bot{CFG.tg_token}/sendMessage",
-        data=json.dumps({"chat_id": CFG.tg_chat, "text": text[:3500]}).encode(),
-        headers={"Content-Type": "application/json"},
-    )
+def load_cfg():
+    cfg = dict(DEFAULT_CFG)
+    if os.environ.get("BYBIT_ENV") in HOSTS:
+        cfg["network"] = os.environ["BYBIT_ENV"]
     try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            resp.read()
-    except Exception as exc:  # noqa: BLE001 — Telegram ніколи не зупиняє бота
-        log(f"telegram: {exc}")
+        with open(CFG_PATH, encoding="utf-8") as f:
+            cfg.update(json.load(f))
+    except Exception:
+        pass
+    if ENV_KEY and ENV_SECRET:          # ключи из переменных окружения главнее
+        cfg["api_key"], cfg["api_secret"] = ENV_KEY, ENV_SECRET
+    return cfg
 
 
-# ---------------- Bybit V5 ----------------
+def save_cfg(cfg):
+    cfg = dict(cfg)
+    if ENV_KEY and ENV_SECRET:          # не дублируем ключи из Variables на диск
+        cfg["api_key"], cfg["api_secret"] = "", ""
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        tmp = CFG_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, CFG_PATH)
+    except OSError as e:
+        print("не удалось сохранить настройки:", e)
+
+
+def set_autostart(flag):
+    cfg = load_cfg()
+    cfg["was_running"] = bool(flag)
+    save_cfg(cfg)
+
 
 class BybitError(Exception):
-    def __init__(self, message: str, code: int | None = None) -> None:
-        super().__init__(message)
-        self.code = code
-
-
-def bybit(path: str, method: str = "GET", query: dict | None = None, body: dict | None = None,
-          auth: bool = False, _retry: bool = True) -> dict:
-    global OFFSET_MS
-    q = {k: str(v) for k, v in (query or {}).items() if v is not None}
-    qs = urllib.parse.urlencode(q)
-    body_str = json.dumps(body, separators=(",", ":")) if method == "POST" else ""
-    headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
-    if auth:
-        if not CFG.api_key or not CFG.api_secret:
-            raise BybitError("Немає BYBIT_API_KEY / BYBIT_API_SECRET")
-        ts = str(int(time.time() * 1000) + OFFSET_MS)
-        recv = "20000"
-        payload = ts + CFG.api_key + recv + (qs if method == "GET" else body_str)
-        headers.update({
-            "X-BAPI-API-KEY": CFG.api_key,
-            "X-BAPI-SIGN": hmac.new(CFG.api_secret.encode(), payload.encode(), hashlib.sha256).hexdigest(),
-            "X-BAPI-SIGN-TYPE": "2",
-            "X-BAPI-TIMESTAMP": ts,
-            "X-BAPI-RECV-WINDOW": recv,
-        })
-    if method == "POST":
-        headers["Content-Type"] = "application/json"
-    url = CFG.base + path + (("?" + qs) if qs else "")
-    req = urllib.request.Request(url, data=body_str.encode() if method == "POST" else None, headers=headers, method=method)
-    try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            raw = json.loads(resp.read().decode())
-    except urllib.error.HTTPError as exc:
-        full = exc.read().decode("utf-8", "ignore")
-        detail = full[:180].strip()
-        low = full.lower()
-        if exc.code == 403 and ("country" in low or "cloudfront" in low or low.lstrip().startswith("<")):
-            raise BybitError("Bybit блокує країну сервера (HTTP 403). Railway → сервіс → Settings → Deploy → Regions: оберіть EU West (Amsterdam) або Southeast Asia (Singapore), не US, і перезапустіть.") from exc
-        if exc.code == 401:
-            raise BybitError(
-                f"Bybit не прийняв ключ (HTTP 401) на {CFG.env}. Перевірте: BYBIT_ENV = mainnet чи testnet під ваш ключ; "
-                "ключ і секрет без пробілів; ключ без прив'язки до IP або з IP цього сервера."
-            ) from exc
-        raise BybitError(f"HTTP {exc.code} {detail}".strip()) from exc
-    except urllib.error.URLError as exc:
-        raise BybitError(f"мережа: {exc.reason}") from exc
-    except (TimeoutError, OSError, ValueError) as exc:
-        raise BybitError(f"мережа: {exc}") from exc
-    if not isinstance(raw, dict):
-        raise BybitError("Bybit: дивна відповідь")
-    if raw.get("retCode") == 10002 and _retry:
-        server = int(raw.get("time") or time.time() * 1000)
-        OFFSET_MS = server - int(time.time() * 1000)
-        return bybit(path, method, query, body, auth, _retry=False)
-    if raw.get("retCode") not in (0, None):
-        raise BybitError(raw.get("retMsg") or "Bybit error", raw.get("retCode"))
-    return raw.get("result") or {}
-
-
-def pick_base() -> bool:
-    for base in HOSTS[CFG.env]:
-        CFG.base = base
-        try:
-            bybit("/v5/market/time")
-            log(f"Bybit {CFG.env}: {base}")
-            return True
-        except BybitError as exc:
-            log(f"Bybit недоступний {base}: {exc}")
-    return False
-
-
-def step_decimals(step: str) -> int:
-    return len(step.split(".", 1)[1]) if "." in step else 0
-
-
-def align(value: float, step_str: str, up: bool) -> str:
-    d = step_decimals(step_str)
-    factor = 10 ** d
-    step_int = max(1, round(float(step_str) * factor))
-    if up:
-        aligned = math.ceil(math.ceil(value * factor - 1e-6) / step_int) * step_int
-    else:
-        aligned = math.floor(math.floor(value * factor + 1e-6) / step_int) * step_int
-    return f"{aligned / factor:.{d}f}"
-
-
-def link_id(symbol: str, side: str, price: str) -> str:
-    tail = f"{time.time_ns():x}"[-6:]
-    return f"{LINK_PREFIX}{symbol[:8]}{'B' if side == 'Buy' else 'S'}{price.replace('.', '')[-6:]}{tail}"[:36]
-
-
-def instrument(symbol: str) -> dict:
-    result = bybit("/v5/market/instruments-info", query={"category": "linear", "symbol": symbol})
-    row = (result.get("list") or [None])[0]
-    if not row:
-        raise BybitError(f"Немає {symbol}")
-    if row.get("status") and row["status"] != "Trading":
-        raise BybitError(f"{symbol} зараз не торгується")
-    return {
-        "tick": row["priceFilter"]["tickSize"],
-        "qty": row["lotSizeFilter"]["qtyStep"],
-        "min_qty": float(row["lotSizeFilter"].get("minOrderQty") or 0),
-        "min_notional": float(row["lotSizeFilter"].get("minNotionalValue") or 5),
-        "max_lev": float((row.get("leverageFilter") or {}).get("maxLeverage") or 20),
-    }
-
-
-# ---------------- комісія і мінімальний крок ----------------
-# Тейк (крок сітки) завжди ≥ TAKE_FEE_MULT × комісія циклу (вхід + тейк, обидва мейкер).
-# Ставка мейкера — з рахунку Bybit (з урахуванням VIP), інакше стандартна 0.02%.
-TAKE_FEE_MULT = env_float("TAKE_FEE_MULT", 10, 1, 100)
-DEFAULT_MAKER = 0.0002
-FEES: dict = {"at": 0.0, "map": {}}
-
-
-def maker_fee(symbol: str) -> float:
-    if CFG.api_key and CFG.api_secret and time.time() - FEES["at"] > 3600:
-        FEES["at"] = time.time()
-        try:
-            res = bybit("/v5/account/fee-rate", query={"category": "linear"}, auth=True)
-            FEES["map"] = {r.get("symbol"): float(r.get("makerFeeRate") or 0) for r in res.get("list") or [] if r.get("symbol")}
-        except (BybitError, TypeError, ValueError) as exc:
-            log(f"комісія: {exc} — беру {DEFAULT_MAKER * 100:g}%")
-    fee = FEES["map"].get(symbol, 0)
-    return fee if fee > 0 else DEFAULT_MAKER  # від'ємна/нульова (ребейт) — рахуємо як стандартну, із запасом
-
-
-def min_step(symbol: str) -> float:
-    """Мінімальний крок сітки, частка ціни: TAKE_FEE_MULT × (мейкер вхід + мейкер тейк)."""
-    return TAKE_FEE_MULT * 2 * maker_fee(symbol)
-
-
-def max_lines(lower: float, upper: float, geo: bool, step_min: float) -> int:
-    """Скільки сіток вміщається в діапазон, щоб крок (у % від ціни) був ≥ step_min."""
-    if upper <= lower or step_min <= 0:
-        return 0
-    if geo:
-        return int(math.log(upper / lower) / math.log(1 + step_min) + 1e-9)
-    return int((upper - lower) / (upper * step_min) + 1e-9)  # найменший % кроку — біля верхньої межі
-
-
-def spec_of(symbol: str) -> dict:
-    if symbol not in SPECS:
-        SPECS[symbol] = instrument(symbol)
-    return SPECS[symbol]
-
-
-def ticker(symbol: str) -> dict:
-    result = bybit("/v5/market/tickers", query={"category": "linear", "symbol": symbol})
-    row = (result.get("list") or [None])[0]
-    if not row:
-        raise BybitError(f"Немає ціни {symbol}")
-    return row
-
-
-def candles(symbol: str, interval: str, limit: int) -> list[dict]:
-    result = bybit("/v5/market/kline", query={"category": "linear", "symbol": symbol, "interval": interval, "limit": str(limit)})
-    return [{"high": float(k[2]), "low": float(k[3]), "close": float(k[4])} for k in reversed(result.get("list") or [])]
-
-
-def set_leverage(symbol: str, leverage: int) -> None:
-    try:
-        bybit("/v5/position/set-leverage", "POST", body={
-            "category": "linear", "symbol": symbol, "buyLeverage": str(leverage), "sellLeverage": str(leverage),
-        }, auth=True)
-    except BybitError as exc:
-        if exc.code == 110043 or "not modified" in str(exc).lower():
-            return
-        raise
-
-
-def create_order(body: dict, side: str) -> None:
-    """One-way режим (positionIdx 0), а якщо на рахунку hedge — 1 для Buy, 2 для Sell
-    (для reduce-only навпаки: Buy закриває шорт = 2, Sell закриває лонг = 1)."""
-    try:
-        bybit("/v5/order/create", "POST", body={**body, "positionIdx": 0}, auth=True)
-    except BybitError as exc:
-        if "position idx" not in str(exc).lower():
-            raise
-        long_idx = side == "Buy"
-        if body.get("reduceOnly"):
-            long_idx = not long_idx
-        bybit("/v5/order/create", "POST", body={**body, "positionIdx": 1 if long_idx else 2}, auth=True)
-
-
-def place_limit(symbol: str, order: dict, post_only: bool = True) -> None:
-    create_order({
-        "category": "linear", "symbol": symbol, "side": order["side"], "orderType": "Limit",
-        "qty": order["qty"], "price": order["price"], "timeInForce": "PostOnly" if post_only else "GTC",
-        "orderLinkId": order["orderLinkId"], "reduceOnly": bool(order.get("reduce")),
-    }, order["side"])
-
-
-def cancel_link(symbol: str, order_link_id: str) -> None:
-    if not order_link_id.startswith(LINK_PREFIX):
-        return
-    try:
-        bybit("/v5/order/cancel", "POST", body={"category": "linear", "symbol": symbol, "orderLinkId": order_link_id}, auth=True)
-    except BybitError as exc:
-        if any(s in str(exc).lower() for s in ("not exists", "too late", "order not")):
-            return
-        raise
-
-
-def positions(symbol: str | None = None) -> list[dict]:
-    query = {"category": "linear", "limit": "200"}
-    if symbol:
-        query["symbol"] = symbol
-    else:
-        query["settleCoin"] = "USDT"
-    result = bybit("/v5/position/list", query=query, auth=True)
-    return [p for p in (result.get("list") or []) if float(p.get("size") or 0) > 0]
-
-
-def close_position(symbol: str) -> str:
-    done = []
-    for p in positions(symbol):
-        side = "Sell" if p.get("side") == "Buy" else "Buy"
-        bybit("/v5/order/create", "POST", body={
-            "category": "linear", "symbol": symbol, "side": side, "orderType": "Market", "qty": p["size"],
-            "reduceOnly": True, "timeInForce": "IOC", "positionIdx": int(p.get("positionIdx") or 0),
-        }, auth=True)
-        done.append(f"{p.get('side')} {p['size']} PnL {float(p.get('unrealisedPnl') or 0):+.2f}")
-    return ", ".join(done) if done else "позиції не було"
-
-
-def cancel_grid_orders(grid: dict, note: str) -> None:
-    for level in grid["levels"]:
-        if level["status"] != "open":
-            continue
-        try:
-            cancel_link(grid["symbol"], level["orderLinkId"])
-        except BybitError as exc:
-            log(f"зняти {grid['symbol']} {level['orderLinkId']}: {exc}")
-            continue
-        level["status"] = "done"
-        level["note"] = note
-        time.sleep(0.08)
-
-
-def parse_num(raw, name: str, lo: float, hi: float, integer: bool = False) -> float:
-    """Приймає 50, "50", "50.5", "50,5", " 1 000 ". Відкидає порожнє, текст, NaN, поза межами."""
-    if isinstance(raw, bool):
-        raise BybitError(f"{name}: потрібне число")
-    if isinstance(raw, (int, float)):
-        value = float(raw)
-    else:
-        text = str(raw if raw is not None else "").strip().replace(" ", "").replace(" ", "").replace(",", ".")
-        if not text:
-            raise BybitError(f"{name}: порожнє поле")
-        try:
-            value = float(text)
-        except ValueError:
-            raise BybitError(f"{name}: «{raw}» не число") from None
-    if not math.isfinite(value):
-        raise BybitError(f"{name}: потрібне число")
-    if integer and value != int(value):
-        raise BybitError(f"{name}: ціле число, без дробу")
-    if value < lo or value > hi:
-        raise BybitError(f"{name}: від {lo:g} до {hi:g}")
-    return value
-
-
-def parse_symbol(raw) -> str:
-    symbol = str(raw or "").strip().upper()
-    if not symbol.isalnum() or not symbol.endswith("USDT") or len(symbol) < 6:
-        raise BybitError("Монета на кшталт BTCUSDT")
-    return symbol
-
-
-# ---------------- нейтральний грід ----------------
-
-def grid_params(data: dict) -> dict:
-    symbol = parse_symbol(data.get("symbol"))
-    lower = parse_num(data.get("lower"), "Нижня ціна", 1e-12, 1e12)
-    upper = parse_num(data.get("upper"), "Верхня ціна", 1e-12, 1e12)
-    if upper <= lower * 1.002:
-        raise BybitError("Верхня ціна має бути вищою за нижню хоча б на 0.2%")
-    count = int(parse_num(data.get("count"), "Кількість сіток", 2, 150, integer=True))
-    margin = parse_num(data.get("margin"), "Маржа", 1, 1000000)
-    lev = int(parse_num(data.get("leverage"), "Плече", 1, 125, integer=True))
-    shift_min = int(parse_num(data.get("shiftMin", 0), "Іти за ціною через, хв", 0, 1440, integer=True))
-    geo = bool(data.get("geo"))
-    geo_mult = parse_num(data.get("geoMult") or 1.3, "Множник лота", 1, 3) if geo else 1.0
-    # застосунок лише під Sell: нові сітки завжди «Тільки Sell» (старі сітки інших режимів доробляють як були)
-    mode = "sell"
-    return {
-        "symbol": symbol, "lower": lower, "upper": upper, "count": count, "margin": margin, "lev": lev,
-        "trail": bool(data.get("trail", True)), "shiftMin": shift_min, "geo": geo, "geoMult": geo_mult, "mode": mode,
-    }
-
-
-# both — Buy нижче і Sell вище ціни; sell — лише Sell вище (шорт-сітка); buy — лише Buy нижче (лонг-сітка).
-# В однобічному режимі протилежна лімітка — це тейк reduce-only: закриває виконану лімітку і не відкриває зустрічну позицію.
-MODES = {"both": "Buy + Sell", "sell": "Тільки Sell", "buy": "Тільки Buy"}
-
-
-def ladder_of(lower: float, upper: float, count: int, tick: str, geo: bool = False) -> list[str]:
-    """count сіток = count + 1 ліній: рівномірно за ціною або через однаковий % (геометрична)."""
-    step = (upper - lower) / count
-    ratio = (upper / lower) ** (1 / count)
-    out: list[str] = []
-    for i in range(count + 1):
-        price = align(lower * ratio ** i if geo else lower + step * i, tick, False)
-        if float(price) > 0 and price not in out:
-            out.append(price)
-    return out
-
-
-def equal_qty(margin: float, lev: int, count: int, mid: float, spec: dict) -> str:
-    qty = align(margin * lev / count / mid, spec["qty"], False)
-    min_n = spec.get("min_notional") or 5
-    if float(qty) * mid < min_n or float(qty) < spec["min_qty"]:
-        need = max(min_n, spec["min_qty"] * mid) * count / lev
-        raise BybitError(
-            f"Замало маржі: на {count} сіток по мін. {min_n:g} USDT треба маржу від ~{math.ceil(need * 1.05 * 100) / 100:g} USDT "
-            f"при x{lev}, або менше сіток, або більше плече."
-        )
-    return qty
-
-
-def grid_orders(symbol: str, ladder: list[str], last: float, bid: float, ask: float, qty: str, mode: str = "both") -> list[dict]:
-    """Buy на кожній лінії нижче ціни, Sell — вище; лінія біля ціни лишається порожньою.
-    mode=sell — лише Sell, mode=buy — лише Buy."""
-    nearest = min(ladder, key=lambda p: abs(float(p) - last))
-    orders = []
-    for price in ladder:
-        n = float(price)
-        if price == nearest:
-            continue
-        side = "Buy" if n < last else "Sell"
-        if (side == "Buy" and n >= bid) or (side == "Sell" and n <= ask):
-            continue
-        if (mode == "sell" and side == "Buy") or (mode == "buy" and side == "Sell"):
-            continue
-        orders.append({"side": side, "price": price, "qty": qty, "orderLinkId": link_id(symbol, side, price), "status": "open", "note": "grid"})
-    return orders
-
-
-def geo_sizes(orders: list[dict], ladder: list[str], last: float, budget: float, mult: float, spec: dict) -> str:
-    """Геометричні лоти: лінія біля ціни — найменший лот, кожна наступна від ціни — у mult разів більший.
-    Усі лімітки разом = маржа × плече. Записує order['qty'], повертає 'мін–макс'."""
-    if not orders:
-        return "0"
-    centre = min(range(len(ladder)), key=lambda k: abs(float(ladder[k]) - last))
-    weights = []
-    for order in orders:
-        k = ladder.index(order["price"]) if order["price"] in ladder else centre + 1
-        weights.append(mult ** max(0, abs(k - centre) - 1))
-    total = sum(weights)
-    min_n = spec.get("min_notional") or 5
-    for order, w in zip(orders, weights):
-        price = float(order["price"])
-        qty = align(budget * w / total / price, spec["qty"], False)
-        if float(qty) * price < min_n or float(qty) < spec["min_qty"]:
-            raise BybitError(
-                f"Замало маржі для геометричної сітки: найменша лімітка {float(qty) * price:.2f} USDT, мін. {min_n:g} USDT. "
-                f"Зменште множник лота ({mult:g}) чи кількість сіток, або додайте маржу/плече."
-            )
-        order["qty"] = qty
-    qtys = sorted(float(o["qty"]) for o in orders)
-    return f"{qtys[0]:g}–{qtys[-1]:g}" if qtys[0] != qtys[-1] else f"{qtys[0]:g}"
-
-
-def fit_count(symbol: str, lower: float, upper: float, count: int, geo: bool) -> int:
-    """Кількість сіток, зменшена так, щоб тейк був ≥ TAKE_FEE_MULT × комісії."""
-    step_min = min_step(symbol)
-    limit = max_lines(lower, upper, geo, step_min)
-    if limit < 2:
-        need = (upper * step_min * 2) if not geo else lower * ((1 + step_min) ** 2 - 1)
-        raise BybitError(
-            f"Діапазон завузький: щоб тейк був ≥ {TAKE_FEE_MULT:g}× комісії, крок має бути ≥ {step_min * 100:.2f}%, "
-            f"тобто ширина діапазону має бути не менше {need:.6g} (зараз {upper - lower:.6g})."
-        )
-    return min(count, limit)
-
-
-def build(symbol: str, lower: float, upper: float, count: int, margin: float, lev: int, geo: bool, mult: float,
-          spec: dict, last: float, bid: float, ask: float, mode: str = "both") -> tuple[list[str], list[dict], str]:
-    """Кількість сіток уже має пройти fit_count (preview і start_grid роблять це самі)."""
-    ladder = ladder_of(lower, upper, count, spec["tick"], geo)
-    if geo:
-        orders = grid_orders(symbol, ladder, last, bid, ask, "0", mode)
-        return ladder, orders, geo_sizes(orders, ladder, last, margin * lev, mult, spec)
-    if mode == "both":
-        qty = equal_qty(margin, lev, count, (lower + upper) / 2, spec)
-        return ladder, grid_orders(symbol, ladder, last, bid, ask, qty, mode), qty
-    # однобічна сітка: уся маржа × плече ділиться лише на лімітки одного боку
-    orders = grid_orders(symbol, ladder, last, bid, ask, "0", mode)
-    if not orders:
-        return ladder, orders, "0"
-    qty = equal_qty(margin, lev, len(orders), sum(float(o["price"]) for o in orders) / len(orders), spec)
-    for o in orders:
-        o["qty"] = qty
-    return ladder, orders, qty
-
-
-def preview(data: dict) -> dict:
-    prm = grid_params(data)
-    spec = spec_of(prm["symbol"])
-    live = ticker(prm["symbol"])
-    last = float(live["lastPrice"])
-    lev = min(prm["lev"], int(spec["max_lev"]))
-    wanted = prm["count"]
-    prm["count"] = fit_count(prm["symbol"], prm["lower"], prm["upper"], wanted, prm["geo"])
-    _, orders, qty = build(prm["symbol"], prm["lower"], prm["upper"], prm["count"], prm["margin"], lev, prm["geo"],
-                           prm["geoMult"], spec, last, float(live.get("bid1Price") or last), float(live.get("ask1Price") or last), prm["mode"])
-    step = (prm["upper"] - prm["lower"]) / prm["count"]
-    fee = 2 * maker_fee(prm["symbol"])  # мейкер з обох боків
-    out = {
-        "symbol": prm["symbol"], "last": last, "lev": lev, "qty": qty, "step": step, "geo": prm["geo"], "mode": prm["mode"],
-        "count": prm["count"], "countWanted": wanted, "feePct": round(fee * 100, 4),
-        "minStepPct": round(min_step(prm["symbol"]) * 100, 3), "feeMult": TAKE_FEE_MULT,
-        "stepPct": round(step / prm["upper"] * 100, 3),
-        "buys": sum(1 for o in orders if o["side"] == "Buy"), "sells": sum(1 for o in orders if o["side"] == "Sell"),
-        "profitLow": round((step / prm["upper"] - fee) * 100, 3), "profitHigh": round((step / prm["lower"] - fee) * 100, 3),
-        "inside": prm["lower"] < last < prm["upper"],
-        "notional": round(sum(float(o["qty"]) * float(o["price"]) for o in orders), 2),
-    }
-    if prm["geo"]:
-        ratio = (prm["upper"] / prm["lower"]) ** (1 / prm["count"]) - 1
-        out.update({
-            "geoMult": prm["geoMult"], "stepPct": round(ratio * 100, 3),
-            "profitLow": round((ratio - fee) * 100, 3), "profitHigh": round((ratio - fee) * 100, 3),
-            "lots": [{"side": o["side"], "price": o["price"], "qty": o["qty"]} for o in sorted(orders, key=lambda o: -float(o["price"]))],
-        })
-    return out
-
-
-def place_counter(symbol: str, order: dict, bid: float, ask: float) -> None:
-    """Завжди мейкер (PostOnly), щоб комісія не з'їла тейк. Якщо ціна вже перетнула лінію — лімітка стає на найкращу
-    ціну стакану (Buy — на bid, Sell — на ask): це мейкер і навіть вигідніше за лінію. Лише якщо біржа двічі
-    відхилила PostOnly — GTC на лінії, щоб тейк не пропав."""
-    side = order["side"]
-    tick = spec_of(symbol)["tick"]
-    for attempt in range(2):
-        cross = (side == "Sell" and float(order["price"]) <= ask) or (side == "Buy" and float(order["price"]) >= bid)
-        if cross:
-            order["price"] = align(bid, tick, False) if side == "Buy" else align(ask, tick, True)
-            order["orderLinkId"] = link_id(symbol, side, order["price"])
-        try:
-            place_limit(symbol, order, post_only=True)
-            return
-        except BybitError as exc:
-            log(f"PostOnly {symbol} {side} {order['price']}: {exc}")
-            live = ticker(symbol)
-            last = float(live["lastPrice"])
-            bid, ask = float(live.get("bid1Price") or last), float(live.get("ask1Price") or last)
-    place_limit(symbol, order, post_only=False)
-
-
-def start_grid(data: dict) -> str:
-    prm = grid_params(data)
-    symbol = prm["symbol"]
-    with LOCK:
-        if any(g["symbol"] == symbol and g["status"] == "active" for g in STATE["grids"]):
-            raise BybitError(f"На {symbol} вже є жива сітка. Спочатку зупиніть її.")
-    spec = instrument(symbol)
-    SPECS[symbol] = spec
-    live = ticker(symbol)
-    last = float(live["lastPrice"])
-    bid = float(live.get("bid1Price") or last)
-    ask = float(live.get("ask1Price") or last)
-    lev = min(prm["lev"], int(spec["max_lev"]))
-    wanted = prm["count"]
-    prm["count"] = fit_count(symbol, prm["lower"], prm["upper"], wanted, prm["geo"])
-    ladder, orders, qty = build(symbol, prm["lower"], prm["upper"], prm["count"], prm["margin"], lev,
-                                prm["geo"], prm["geoMult"], spec, last, bid, ask, prm["mode"])
-    if not orders:
-        where = {"sell": " вище ціни", "buy": " нижче ціни"}.get(prm["mode"], "")
-        raise BybitError(f"Немає ліній для лімітів{where}: ціна поза діапазоном або діапазон замалий")
-    set_leverage(symbol, lev)
-    opened = []
-    with GRID_LOCK:
-        for order in orders:
-            try:
-                place_limit(symbol, order)
-                opened.append(order)
-            except BybitError as exc:
-                log(f"{symbol} {order['side']} {order['price']}: {exc}")
-            time.sleep(0.12)
-    if not opened:
-        raise BybitError("Біржа не прийняла жодну лімітку")
-    grid = {
-        "id": f"m{time.time_ns():x}", "symbol": symbol,
-        "lower": prm["lower"], "upper": prm["upper"], "count": prm["count"], "ladder": ladder,
-        "step": (prm["upper"] - prm["lower"]) / prm["count"], "tick": spec["tick"], "qty": qty, "lev": lev,
-        "margin": prm["margin"], "trail": prm["trail"], "shiftMin": prm["shiftMin"],
-        "geo": prm["geo"], "geoMult": prm["geoMult"], "mode": prm["mode"],
-        "auto": bool(data.get("auto")), "autoEq": float(data.get("autoEq") or 0),
-        "levels": opened, "status": "active", "created": int(time.time()), "last": last,
-        "fills": 0, "takes": 0, "profit": 0.0, "shifts": 0, "outSince": None,
-    }
-    with LOCK:
-        STATE["grids"].insert(0, grid)
-        save_state()
-    buys = sum(1 for o in opened if o["side"] == "Buy")
-    lots = f", геометрична (лот ×{prm['geoMult']:g}, {qty})" if prm["geo"] else f", лот {qty}"
-    side = f", {MODES[prm['mode']]}" if prm["mode"] != "both" else ""
-    text = f"Грід {symbol}: {prm['lower']:g}–{prm['upper']:g}, {prm['count']} сіток{side}{lots}, Buy {buys} / Sell {len(opened) - buys}, x{lev}"
-    if prm["count"] < wanted:
-        text += f" (сіток зменшено з {wanted}: тейк ≥ {TAKE_FEE_MULT:g}× комісії, крок ≥ {min_step(symbol) * 100:.2f}%)"
-    add_event(text)
-    return text
-
-
-def shift_grid(grid: dict, last: float, bid: float, ask: float) -> str:
-    symbol = grid["symbol"]
-    old_lo, old_hi = grid["lower"], grid["upper"]
-    mode = grid.get("mode") or "both"
-    # частка ширини нижче ціни: нейтральна — посередині, Sell — ціна біля низу, Buy — біля верху
-    below = {"both": 0.5, "sell": 0.1, "buy": 0.9}[mode]
-    if grid.get("geo"):
-        ratio = old_hi / old_lo  # той самий % ширини
-        lower, upper = last / ratio ** below, last * ratio ** (1 - below)
-        ladder = ladder_of(lower, upper, grid["count"], grid["tick"], True)
-        orders = grid_orders(symbol, ladder, last, bid, ask, "0", mode)
-        qty = geo_sizes(orders, ladder, last, grid["margin"] * grid["lev"], float(grid.get("geoMult") or 1.3), spec_of(symbol))
-    else:
-        width = old_hi - old_lo
-        lower, upper = max(last - width * below, last * 0.05), last + width * (1 - below)
-        ladder = ladder_of(lower, upper, grid["count"], grid["tick"])
-        qty = grid["qty"]
-        orders = grid_orders(symbol, ladder, last, bid, ask, qty, mode)
-    # лоти пораховані до зняття старих ліміток: помилка розрахунку не лишить сітку порожньою.
-    # Знімаються лише входи; тейки вже набраної позиції лишаються на біржі, доки не виконаються
-    # («сироти»: після виконання закривають свою частину позиції, нового входу не ставлять).
-    kept = 0
-    for level in grid["levels"]:
-        if level["status"] != "open":
-            continue
-        if is_take_level(level):
-            level["orphan"] = True
-            kept += 1
-            continue
-        try:
-            cancel_link(symbol, level["orderLinkId"])
-        except BybitError as exc:
-            log(f"зняти {symbol} {level['orderLinkId']}: {exc}")
-            continue
-        level["status"] = "done"
-        level["note"] = "shift"
-        time.sleep(0.08)
-    grid["qty"] = qty
-    # не нарощувати один бік: бік, що вже тримає маржа × плече, нових ліміток не отримує
-    budget = grid["margin"] * grid["lev"]
-    held = {p.get("side"): float(p.get("size") or 0) * last for p in positions(symbol)}
-    skipped = [s for s in ("Buy", "Sell") if held.get(s, 0) >= budget]
-    orders = [o for o in orders if o["side"] not in skipped]
-    placed = 0
-    for order in orders:
-        try:
-            place_limit(symbol, order)
-            grid["levels"].append(order)
-            placed += 1
-        except BybitError as exc:
-            log(f"зсув {symbol} {order['price']}: {exc}")
-        time.sleep(0.12)
-    done = [l for l in grid["levels"] if l["status"] != "open"]
-    grid["levels"] = done[-80:] + [l for l in grid["levels"] if l["status"] == "open"]
-    grid.update({"lower": lower, "upper": upper, "ladder": ladder, "shifts": int(grid.get("shifts") or 0) + 1})
-    return (
-        f"Грід {symbol} іде за ціною {'вгору' if last > (old_lo + old_hi) / 2 else 'вниз'}: "
-        f"{old_lo:g}–{old_hi:g} → {lower:g}–{upper:g}, лімітів {placed}."
-        + (f" Тейків набраної позиції лишилось: {kept}." if kept else "")
-        + (f" Без {'/'.join(skipped)}: позиція вже повна." if skipped else "")
-    )
-
-
-# ---------------- захист від пампів ----------------
-# 1) Детектор: ціна виросла на pct% за останні 60 с → знімаються всі Sell-входи (тейки лишаються),
-#    нові Sell і зсув сітки на паузі pauseMin хв; після паузи сітка відновлюється від нової ціни.
-# 2) Стоп на біржі над сіткою: стоп позиції не вище upper × (1 + stopAbove%) — спрацьовує на біржі миттєво.
-# 3) Пошук і автопілот не беруть монети з пампами (хвилинний сплеск ≥ pct% за годину або +20% за добу).
-# 4) closeOnPump — закривати позицію ринком одразу при пампі (за замовчуванням вимкнено).
-
-PUMP_DEFAULT = {
-    "pct": env_float("PUMP_PCT", 1.5, 0, 50), "pauseMin": env_int("PUMP_PAUSE_MIN", 15, 1, 240),
-    "stopAbove": env_float("PUMP_STOP_ABOVE", 3.0, 0, 50), "closeOnPump": False,
-}
-PUMP_WINDOW = 60
-PRICES: dict[str, deque] = {}
-
-
-def pump_cfg() -> dict:
-    cfg = STATE.setdefault("pump", {})
-    for k, v in PUMP_DEFAULT.items():
-        cfg.setdefault(k, v)
-    return cfg
-
-
-def pump_set(data: dict) -> dict:
-    cfg = pump_cfg()
-    pct = parse_num(data.get("pct", cfg["pct"]), "Памп: ріст за хвилину, %", 0, 50)
-    pause = int(parse_num(data.get("pauseMin", cfg["pauseMin"]), "Пауза після пампу, хв", 1, 240, integer=True))
-    above = parse_num(data.get("stopAbove", cfg["stopAbove"]), "Стоп над сіткою, %", 0, 50)
-    cfg.update({"pct": pct, "pauseMin": pause, "stopAbove": above, "closeOnPump": bool(data.get("closeOnPump", cfg["closeOnPump"]))})
-    with LOCK:
-        save_state()
-    add_event(f"🛡 Захист від пампів: поріг +{pct:g}%/хв, пауза {pause} хв, стоп +{above:g}% над сіткою, "
-              f"{'закривати позицію при пампі' if cfg['closeOnPump'] else 'позицію не закривати'}.")
-    return dict(cfg)
-
-
-def pump_check(grid: dict, last: float, now: float) -> str:
-    cfg = pump_cfg()
-    if cfg["pct"] <= 0 or last <= 0:
-        return ""
-    dq = PRICES.setdefault(grid["id"], deque())
-    dq.append((now, last))
-    while dq and dq[0][0] < now - PUMP_WINDOW:
-        dq.popleft()
-    t_low, low = min(dq, key=lambda x: x[1])
-    if low > 0 and last >= low * (1 + cfg["pct"] / 100):
-        dq.clear()
-        dq.append((now, last))
-        return f"+{(last / low - 1) * 100:.2f}% за {max(1, int(now - t_low))} с"
-    return ""
-
-
-def pump_trigger(grid: dict, hit: str) -> list[str]:
-    cfg = pump_cfg()
-    now = time.time()
-    symbol = grid["symbol"]
-    again = float(grid.get("pumpUntil") or 0) > now
-    grid["pumpUntil"] = now + cfg["pauseMin"] * 60
-    if not again:
-        grid["pumps"] = int(grid.get("pumps") or 0) + 1
-    removed = 0
-    for level in grid["levels"]:
-        if level["status"] != "open" or level["side"] != "Sell" or is_take_level(level):
-            continue
-        try:
-            cancel_link(symbol, level["orderLinkId"])
-        except BybitError as exc:
-            log(f"памп {symbol} {level['orderLinkId']}: {exc}")
-            continue
-        level["status"] = "done"
-        level["note"] = "pump"
-        removed += 1
-    head = f"🚀 ПАМП {symbol} {hit}{' — триває' if again else ''}: знято {removed} Sell-входів"
-    if cfg["closeOnPump"]:
-        grid["pumpClose"] = True
-        return [head + ", закриваю позицію ринком."]
-    stop = cfg["stopAbove"]
-    return [head + f"; нові Sell і зсув сітки на паузі {cfg['pauseMin']} хв. Тейки лишились."
-            + (f" Стоп на біржі: +{stop:g}% над сіткою ({grid['upper'] * (1 + stop / 100):g})." if stop > 0 else "")]
-
-
-def pump_cooldown(grid: dict) -> None:
-    """Сітка автопілота закрита пампом/стопом — монету автопілот 2 год не бере."""
-    if grid.get("auto"):
-        auto_cfg().setdefault("cooldown", {})[grid["symbol"]] = time.time() + AUTO_COOLDOWN_SEC
-
-
-def is_take_level(level: dict) -> bool:
-    return level.get("role") == "take" or (level.get("role") is None and bool(level.get("pair")))
-
-
-def watch_grid(grid: dict) -> list[str]:
-    notes: list[str] = []
-    symbol = grid["symbol"]
-    live = ticker(symbol)
-    last = float(live["lastPrice"])
-    bid = float(live.get("bid1Price") or last)
-    ask = float(live.get("ask1Price") or last)
-    grid["last"] = last
-    now = time.time()
-    if (grid.get("mode") or "both") != "buy":
-        hit = pump_check(grid, last, now)
-        if hit:
-            notes.extend(pump_trigger(grid, hit))
-            if grid.get("pumpClose"):
-                return notes
-    paused = float(grid.get("pumpUntil") or 0) > now
-    if not paused and grid.get("pumpUntil"):
-        # пауза після пампу скінчилась — сітка відновлюється від нової ціни (тейки набраного шорту лишаються)
-        grid["pumpUntil"] = 0
-        grid["outSince"] = None
-        notes.append("Пауза після пампу закінчилась. " + shift_grid(grid, last, bid, ask))
-        return notes
-    if paused:
-        grid["outSince"] = None
-    elif last > grid["upper"] or last < grid["lower"]:
-        if not grid.get("outSince"):
-            grid["outSince"] = now
-            if grid.get("trail"):
-                notes.append(f"Грід {symbol}: ціна {last:g} поза діапазоном. Через {grid.get('shiftMin', 0)} хв сітка піде за ціною.")
-        elif grid.get("trail") and now - float(grid["outSince"]) >= int(grid.get("shiftMin") or 0) * 60:
-            grid["outSince"] = None
-            notes.append(shift_grid(grid, last, bid, ask))
-            return notes
-    else:
-        grid["outSince"] = None
-    book = bybit("/v5/order/realtime", query={"category": "linear", "symbol": symbol, "limit": "50"}, auth=True)
-    resting = {o.get("orderLinkId") for o in book.get("list") or [] if o.get("orderStatus") in {"New", "PartiallyFilled"}}
-    ladder = grid.get("ladder") or []
-    for level in list(grid["levels"]):
-        if level["status"] != "open" or level["orderLinkId"] in resting:
-            continue
-        hist = bybit("/v5/order/history", query={"category": "linear", "symbol": symbol, "orderLinkId": level["orderLinkId"], "limit": "5"}, auth=True)
-        row = next((r for r in hist.get("list") or [] if r.get("orderLinkId") == level["orderLinkId"]), None)
-        if not row:
-            continue
-        filled = row.get("orderStatus") == "Filled" or float(row.get("cumExecQty") or 0) > 0
-        level["status"] = "done"
-        level["note"] = "filled" if filled else row.get("orderStatus")
-        if not filled:
-            continue
-        fill_px = float(row.get("avgPrice") or level["price"])
-        fill_qty = float(row.get("cumExecQty") or level["qty"])
-        grid["fills"] = int(grid.get("fills") or 0) + 1
-        is_take = is_take_level(level)
-        if is_take:
-            # тейк попереднього входу: один цикл сітки = один мікротейк
-            gain = (fill_px - float(level["pair"])) * fill_qty * (1 if level["side"] == "Sell" else -1)
-            grid["takes"] = int(grid.get("takes") or 0) + 1
-            grid["profit"] = float(grid.get("profit") or 0) + gain
-            notes.append(f"Мікротейк {symbol}: {level['side']} @ {fill_px:g} (від {float(level['pair']):g}), +{gain:.4f} USDT до комісій.")
-            if level.get("orphan"):
-                continue  # тейк зі старого діапазону: позицію закрито, нових входів поза сіткою не ставимо
-            if paused:
-                continue  # пауза після пампу: повторний Sell не ставимо, сітка відновиться після паузи
-        # протилежна лімітка на сусідній лінії, тим самим лотом
-        if level["price"] in ladder:
-            i = ladder.index(level["price"])
+    pass
+
+
+class Bybit:
+    def __init__(self, key, secret, network, cat="spot"):
+        self.cat = cat
+        self.key, self.secret = key.strip(), secret.strip().encode()
+        self.base = HOSTS[network]
+        self.offset = 0
+        self.recv = "10000"
+
+    def _req(self, method, path, params=None, signed=False):
+        params = params or {}
+        url, data = self.base + path, None
+        headers = {"Content-Type": "application/json"}
+        if method == "GET":
+            payload = urllib.parse.urlencode(params)
+            if payload:
+                url += "?" + payload
         else:
-            i = min(range(len(ladder)), key=lambda k: abs(float(ladder[k]) - fill_px)) if ladder else -1
-        j = i + 1 if level["side"] == "Buy" else i - 1
-        if i < 0 or j < 0 or j >= len(ladder):
-            continue  # край діапазону
-        side = "Sell" if level["side"] == "Buy" else "Buy"
-        price = ladder[j]
-        if any(l["status"] == "open" and l["price"] == price for l in grid["levels"]):
-            continue
-        one_side = (grid.get("mode") or "both") != "both"
-        if is_take:
-            # тейк виконався — на сусідній лінії знову вхід (у режимі Sell це знову Sell)
-            new = {"side": side, "price": price, "qty": level["qty"], "orderLinkId": link_id(symbol, side, price),
-                   "status": "open", "note": "grid", "role": "entry"}
+            payload = json.dumps(params, separators=(",", ":"))
+            data = payload.encode()
+        if signed:
+            ts = str(int(time.time() * 1000 + self.offset))
+            sign = hmac.new(self.secret, (ts + self.key + self.recv + payload).encode(),
+                            hashlib.sha256).hexdigest()
+            headers.update({"X-BAPI-API-KEY": self.key, "X-BAPI-TIMESTAMP": ts,
+                            "X-BAPI-SIGN": sign, "X-BAPI-RECV-WINDOW": self.recv})
+        req = urllib.request.Request(url, data=data, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=15) as r:
+                res = json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            raise BybitError(f"HTTP {e.code}: {e.read()[:200].decode(errors='ignore')}")
+        except urllib.error.URLError as e:
+            raise BybitError(f"Нет связи с Bybit: {e.reason}")
+        if res.get("retCode") != 0:
+            raise BybitError(f"{res.get('retMsg')} (код {res.get('retCode')})")
+        return res["result"]
+
+    def sync_time(self):
+        r = self._req("GET", "/v5/market/time")
+        self.offset = int(r["timeNano"]) / 1e6 - time.time() * 1000
+
+    def price(self, sym):
+        return self.bbo(sym)[0]
+
+    def bbo(self, sym):
+        """Последняя цена, лучшая покупка и лучшая продажа в стакане."""
+        t = self._req("GET", "/v5/market/tickers", {"category": self.cat, "symbol": sym})["list"][0]
+        last = Decimal(t["lastPrice"])
+        bid = Decimal(t.get("bid1Price") or "0") or last
+        ask = Decimal(t.get("ask1Price") or "0") or last
+        return last, bid, ask
+
+    def instrument(self, sym):
+        r = self._req("GET", "/v5/market/instruments-info", {"category": self.cat, "symbol": sym})
+        if not r["list"]:
+            raise BybitError(f"Пара {sym} не найдена ({'спот' if self.cat == 'spot' else 'фьючерсы USDT'})")
+        return r["list"][0]
+
+    def balances(self):
+        r = self._req("GET", "/v5/account/wallet-balance", {"accountType": "UNIFIED"}, True)
+        out = {}
+        for acc in r.get("list", []):
+            for c in acc.get("coin", []):
+                bal = Decimal(c.get("walletBalance") or "0")
+                locked = Decimal(c.get("locked") or "0")
+                out[c["coin"]] = {"total": bal, "free": bal - locked}
+            out["_margin"] = Decimal(acc.get("totalAvailableBalance") or "0")
+        return out
+
+    def place(self, sym, side, qty, price=None, market_quote=None, market=False, reduce_only=False,
+              post_only=True):
+        body = {"category": self.cat, "symbol": sym, "side": side,
+                "orderLinkId": "grid" + uuid.uuid4().hex[:24]}
+        if self.cat == "linear":
+            body["positionIdx"] = 0
+        if reduce_only:
+            body["reduceOnly"] = True
+        if market_quote is not None:
+            body.update({"orderType": "Market", "qty": str(market_quote), "marketUnit": "quoteCoin"})
+        elif market:
+            body.update({"orderType": "Market", "qty": str(qty)})
+            if self.cat == "spot":
+                body["marketUnit"] = "baseCoin"
         else:
-            # вхід виконався — тейк на сусідній лінії; в однобічному режимі reduce-only (не відкриє зустрічну позицію)
-            new = {"side": side, "price": price, "qty": level["qty"], "orderLinkId": link_id(symbol, side, price),
-                   "status": "open", "note": "counter", "role": "take", "pair": f"{fill_px}", "reduce": one_side}
+            body.update({"orderType": "Limit", "qty": str(qty), "price": str(price),
+                         "timeInForce": "PostOnly" if post_only else "GTC"})
+        return self._req("POST", "/v5/order/create", body, True)["orderId"]
+
+    def open_ids(self, sym):
+        ids, cursor = set(), ""
+        while True:
+            p = {"category": self.cat, "symbol": sym, "limit": 50}
+            if cursor:
+                p["cursor"] = cursor
+            r = self._req("GET", "/v5/order/realtime", p, True)
+            ids.update(o["orderId"] for o in r.get("list", []))
+            cursor = r.get("nextPageCursor") or ""
+            if not cursor or not r.get("list"):
+                return ids
+
+    def order(self, sym, oid):
+        r = self._req("GET", "/v5/order/history", {"category": self.cat, "symbol": sym, "orderId": oid}, True)
+        return r["list"][0] if r.get("list") else None
+
+    def set_leverage(self, sym, lev):
         try:
-            place_counter(symbol, new, bid, ask)
-            grid["levels"].append(new)
-        except BybitError as exc:
-            notes.append(f"Грід {symbol}: не поставив {side} @ {price} ({exc}).")
-        time.sleep(0.1)
-    return notes
-
-
-def finish_grid(grid: dict, status: str) -> None:
-    grid["status"] = status
-    grid["closedAt"] = int(time.time())
-
-
-def batch_cancel(symbol: str, links: list[str]) -> None:
-    """Знімає заявки пачками по 20 (швидко); якщо пачка не пройшла — по одній."""
-    links = [l for l in links if l.startswith(LINK_PREFIX)]
-    for i in range(0, len(links), 20):
-        chunk = links[i:i + 20]
+            self._req("POST", "/v5/position/switch-mode", {"category": "linear", "symbol": sym, "mode": 0}, True)
+        except BybitError:
+            pass  # уже односторонний режим или есть позиция
         try:
-            bybit("/v5/order/cancel-batch", "POST", body={
-                "category": "linear", "request": [{"symbol": symbol, "orderLinkId": l} for l in chunk],
-            }, auth=True)
-        except BybitError as exc:
-            log(f"пачка {symbol}: {exc} — знімаю по одній")
-            for link in chunk:
-                try:
-                    cancel_link(symbol, link)
-                except BybitError as e:
-                    log(f"зняти {symbol} {link}: {e}")
-
-
-def cancel_mine_on_exchange(symbol: str) -> int:
-    """Усі заявки бота на монеті, які зараз висять на біржі (навіть якщо їх немає в стані)."""
-    links = [o["link"] for o in open_orders(symbol) if o["link"].startswith(LINK_PREFIX)]
-    if links:
-        batch_cancel(symbol, links)
-    return len(links)
-
-
-def emergency_close(grid: dict, quiet: bool = False) -> str:
-    """Екстрено: сітка одразу перестає ставити лімітки, усі лімітки бота знімаються, позиція закривається ринком
-    (до 3 спроб), потім перевірка, що позиції й заявок бота не лишилось."""
-    symbol = grid["symbol"]
-    grid["status"] = "closing"  # цикл більше не чіпає цю сітку і не ставить протилежних ліміток
-    closed: list[str] = []
-    errors: list[str] = []
-    left: list[dict] = []
-    with GRID_LOCK:
-        batch_cancel(symbol, [l["orderLinkId"] for l in grid["levels"] if l["status"] == "open"])
-        for level in grid["levels"]:
-            if level["status"] == "open":
-                level["status"] = "done"
-                level["note"] = "emergency"
-        try:
-            cancel_mine_on_exchange(symbol)
-        except BybitError as exc:
-            errors.append(f"заявки: {exc}")
-        for _ in range(3):
-            try:
-                if not positions(symbol):
-                    break
-                closed.append(close_position(symbol))
-            except BybitError as exc:
-                errors.append(str(exc))
-            time.sleep(0.4)
-        try:
-            left = positions(symbol)
-            cancel_mine_on_exchange(symbol)  # раптом щось встигло з'явитись
-        except BybitError as exc:
-            errors.append(f"перевірка: {exc}")
-        finish_grid(grid, "stopped" if left else "closed")
-    with LOCK:
-        save_state()
-    if left:
-        size = ", ".join(f"{p.get('side')} {p.get('size')}" for p in left)
-        text = (f"⛔ ЕКСТРЕНО {symbol}: лімітки знято, але позицію НЕ закрито ({size}). "
-                f"Закрийте її вручну на Bybit! {'; '.join(errors[-2:])}")
-    else:
-        text = f"⛔ Екстрено закрито {symbol}: лімітки знято, позицію закрито ({'; '.join(closed) or 'позиції не було'})."
-    if not quiet:
-        notify(text)
-    return text
-
-
-def emergency(grid_id: str) -> str:
-    """Один id — одна сітка; порожній id — усі живі сітки."""
-    with LOCK:
-        grids = [g for g in STATE["grids"] if g["status"] == "active" and (not grid_id or g["id"] == grid_id)]
-    if not grids:
-        raise BybitError("Живих сіток немає" if not grid_id else "Сітку не знайдено")
-    return "\n".join(emergency_close(g) for g in grids)
-
-
-def stop_grid(grid_id: str, close: bool) -> str:
-    if close:
-        return emergency(grid_id)
-    with LOCK:
-        grid = next((g for g in STATE["grids"] if g["id"] == grid_id and g["status"] == "active"), None)
-    if not grid:
-        raise BybitError("Сітку не знайдено")
-    with GRID_LOCK:
-        cancel_grid_orders(grid, "stop")
-        if close:
-            closed = close_position(grid["symbol"])
-            finish_grid(grid, "closed")
-            text = f"Грід {grid['symbol']} закрито вручну: ліміти знято, позицію закрито ({closed})."
-        else:
-            finish_grid(grid, "stopped")
-            text = f"Грід {grid['symbol']}: ліміти знято, позиція (якщо є) лишилась під стоп-лосом."
-    with LOCK:
-        save_state()
-    add_event(text)
-    return text
-
-
-# ---------------- стоп-лос ----------------
-
-def guard() -> list[str]:
-    """Критичний стоп-лос лише для монет з живими сітками: стоп на біржі + програмна перевірка."""
-    notes: list[str] = []
-    above = pump_cfg()["stopAbove"]
-    if CFG.sl_roi <= 0 and above <= 0:
-        return notes
-    with LOCK:
-        active = {g["symbol"]: g for g in STATE["grids"] if g["status"] == "active"}
-    if not active:
-        return notes
-    r = CFG.sl_roi / 100
-    seen: set[str] = set()
-    for p in positions():
-        symbol = p["symbol"]
-        grid = active.get(symbol)
-        if not grid:
-            continue
-        seen.add(symbol)
-        grid["hadPos"] = True
-        size = float(p.get("size") or 0)
-        avg = float(p.get("avgPrice") or 0)
-        lev = float(p.get("leverage") or 0) or float(grid.get("lev") or 1)
-        upnl = float(p.get("unrealisedPnl") or 0)
-        margin = avg * size / lev if lev > 0 else avg * size
-        roi = upnl / margin * 100 if margin > 0 else 0.0
-        if CFG.sl_roi > 0 and roi <= -CFG.sl_roi:
-            with GRID_LOCK:
-                cancel_grid_orders(grid, "stoploss")
-                try:
-                    closed = close_position(symbol)
-                except BybitError as exc:
-                    notes.append(f"СТОП-ЛОС {symbol}: не вдалося закрити ({exc}), повторюю.")
-                    continue
-                finish_grid(grid, "stoploss")
-            notes.append(f"СТОП-ЛОС {roi:.0f}% від маржі {symbol}: ліміти знято, позицію закрито ({closed}).")
-            pump_cooldown(grid)
-            continue
-        long = p.get("side") == "Buy"
-        cands = []
-        if CFG.sl_roi > 0:
-            cands.append(avg * (1 - r / lev) if long else avg * (1 + r / lev))
-        if not long and above > 0 and (grid.get("mode") or "both") != "buy":
-            cands.append(grid["upper"] * (1 + above / 100))  # стоп над сіткою: швидкий памп закриває шорт на біржі
-        if not cands or avg <= 0:
-            continue
-        raw = max(cands) if long else min(cands)
-        if raw <= 0:
-            continue
-        mark = float(p.get("markPrice") or 0)
-        if mark > 0 and ((not long and mark >= raw) or (long and mark <= raw)):
-            # ціна вже за стопом (біржа такий стоп не прийме) — закриваємо програмно
-            with GRID_LOCK:
-                cancel_grid_orders(grid, "stoploss")
-                try:
-                    closed = close_position(symbol)
-                except BybitError as exc:
-                    notes.append(f"СТОП {symbol}: не вдалося закрити ({exc}), повторюю.")
-                    continue
-                finish_grid(grid, "stoploss")
-            notes.append(f"🛡 СТОП {symbol}: ціна {mark:g} за стопом {raw:g} — ліміти знято, позицію закрито ({closed}).")
-            pump_cooldown(grid)
-            continue
-        tick = spec_of(symbol)["tick"]
-        price = align(raw, tick, not long)
-        current = float(p.get("stopLoss") or 0)
-        if current and abs(current - float(price)) <= float(tick) * 1.5:
-            grid["slPx"] = float(price)
-            continue
-        try:
-            bybit("/v5/position/trading-stop", "POST", body={
-                "category": "linear", "symbol": symbol, "stopLoss": price, "slTriggerBy": "MarkPrice",
-                "tpslMode": "Full", "positionIdx": int(p.get("positionIdx") or 0),
-            }, auth=True)
-            grid["slPx"] = float(price)
-            log(f"стоп {symbol} {p.get('side')} -> {price}")
-        except BybitError as exc:
-            if "not modified" in str(exc).lower() or exc.code == 34040:
-                grid["slPx"] = float(price)
-                continue
-            key = f"{symbol}:{price}"
-            if grid.get("slErr") != key:
-                grid["slErr"] = key
-                notes.append(f"{symbol}: біржа не прийняла стоп {price} ({exc}). Програмний стоп працює, але краще зменшити плече.")
-    # позиція зникла біля ціни стопу — спрацював стоп на біржі: зупинити сітку, щоб вона не відкрила шорт знову
-    for symbol, grid in active.items():
-        if symbol in seen or not grid.get("hadPos"):
-            continue
-        grid["hadPos"] = False
-        sl, last = float(grid.get("slPx") or 0), float(grid.get("last") or 0)
-        if sl > 0 and last > 0 and last >= sl * 0.997:
-            with GRID_LOCK:
-                cancel_grid_orders(grid, "stoploss")
-                finish_grid(grid, "stoploss")
-            notes.append(f"🛡 Спрацював стоп на біржі {symbol} ({sl:g}): сітку зупинено, лімітки знято.")
-            pump_cooldown(grid)
-    return notes
-
-
-# ---------------- авто-підбір параметрів ----------------
-
-def pct_rank(values: list[float], q: float) -> float:
-    vals = sorted(values)
-    if not vals:
-        return 0.0
-    return vals[min(len(vals) - 1, max(0, int(round(q * (len(vals) - 1)))))]
-
-
-def auto_params(data: dict) -> dict:
-    """Інтрадей: канал за 24 год без шпильок, крок від 5-хв волатильності, кількість сіток і плече."""
-    symbol = parse_symbol(data.get("symbol"))
-    margin = parse_num(data.get("margin") or 20, "Маржа", 1, 1000000)
-    if str(data.get("profile") or "") == "scalp":
-        return scalp_params(symbol, margin, data)
-    spec = spec_of(symbol)
-    last = float(ticker(symbol)["lastPrice"])
-    h15 = candles(symbol, "15", 96)
-    m5 = candles(symbol, "5", 144)
-    if len(h15) < 40 or len(m5) < 40:
-        raise BybitError(f"{symbol}: замало свічок для аналізу")
-    lower = pct_rank([c["low"] for c in h15], 0.05)
-    upper = pct_rank([c["high"] for c in h15], 0.95)
-    if not lower < last < upper:
-        half = max(upper - lower, last * 0.02) / 2
-        lower, upper = last - half, last + half
-    width = upper - lower
-    lower = min(lower, last - width * 0.25)
-    upper = max(upper, last + width * 0.25)
-    width = upper - lower
-    width_pct = width / last * 100
-    trs = [max(m5[i]["high"] - m5[i]["low"], abs(m5[i]["high"] - m5[i - 1]["close"]), abs(m5[i]["low"] - m5[i - 1]["close"])) for i in range(1, len(m5))]
-    atr_pct = sum(trs[-14:]) / 14 / last * 100
-    step_floor = min_step(symbol) * 100
-    step_pct = max(step_floor, min(1.0, atr_pct * 0.5))
-    count = int(round(width_pct / step_pct))
-    lev = int(max(2, min(25, int(spec["max_lev"]), round(20 / max(width_pct, 0.5)))))
-    if str(data.get("leverage") or "").strip():
-        lev = int(min(parse_num(data["leverage"], "Плече", 1, 125, integer=True), spec["max_lev"]))
-    min_n = spec.get("min_notional") or 5
-    fit = int(margin * lev // max(min_n * 1.05, spec["min_qty"] * last * 1.05))
-    if fit < 4:
-        raise BybitError(f"Замало маржі для {symbol}: {margin:g} USDT × x{lev} вистачає лише на {fit} ліміток по мін. {min_n:g} USDT")
-    count = max(2, min(count, 100, fit, max_lines(lower, upper, False, step_floor / 100)))
-    step = width / count
-    takes = sum(int((c["high"] - c["low"]) // step) for c in m5) // 2
-    tick = spec["tick"]
-    return {
-        "symbol": symbol, "last": last,
-        "lower": align(lower, tick, False), "upper": align(upper, tick, True),
-        "count": count, "leverage": lev, "margin": margin, "trail": True, "shiftMin": 0,
-        "widthPct": round(width_pct, 2), "atrPct": round(atr_pct, 3), "stepPct": round(step / last * 100, 3),
-        "profitPct": round((step / upper - 2 * maker_fee(symbol)) * 100, 3), "takes12h": takes,
-        "why": (
-            f"Канал за 24 год без шпильок: {width_pct:.2f}%. Волатильність 5 хв (ATR): {atr_pct:.3f}%. "
-            f"Крок {step / last * 100:.3f}% ≈ половина 5-хв руху, але не менше {step_floor:.2f}% ({TAKE_FEE_MULT:g}× комісії). "
-            f"Плече x{lev} під ширину каналу. Сітка йде за ціною одразу."
-        ),
-    }
-
-
-def scalp_params(symbol: str, margin: float, data: dict) -> dict:
-    """Скальпінг: вузький канал за 4 год, малий крок від 1-хв волатильності, багато ліній."""
-    spec = spec_of(symbol)
-    last = float(ticker(symbol)["lastPrice"])
-    m5 = candles(symbol, "5", 48)
-    m1 = candles(symbol, "1", 120)
-    if len(m5) < 24 or len(m1) < 40:
-        raise BybitError(f"{symbol}: замало свічок для скальпінгу")
-    lower = pct_rank([c["low"] for c in m5], 0.10)
-    upper = pct_rank([c["high"] for c in m5], 0.90)
-    width_pct = max(1.0, min(4.0, (upper - lower) / last * 100))
-    lower, upper = last * (1 - width_pct / 200), last * (1 + width_pct / 200)
-    trs = [max(m1[i]["high"] - m1[i]["low"], abs(m1[i]["high"] - m1[i - 1]["close"]), abs(m1[i]["low"] - m1[i - 1]["close"])) for i in range(1, len(m1))]
-    atr1_pct = sum(trs[-30:]) / 30 / last * 100
-    step_floor = max(CFG.scalp_min_step, min_step(symbol) * 100)
-    step_pct = max(step_floor, min(0.4, atr1_pct * 0.7))
-    count = int(round(width_pct / step_pct))
-    lev = int(max(3, min(20, int(spec["max_lev"]), round(15 / width_pct))))
-    if str(data.get("leverage") or "").strip():
-        lev = int(min(parse_num(data["leverage"], "Плече", 1, 125, integer=True), spec["max_lev"]))
-    min_n = spec.get("min_notional") or 5
-    fit = int(margin * lev // max(min_n * 1.05, spec["min_qty"] * last * 1.05))
-    if fit < 6:
-        raise BybitError(
-            f"Для скальпінгу на {symbol} замало маржі: {margin:g} USDT × x{lev} вистачає лише на {fit} ліміток по мін. {min_n:g} USDT. "
-            f"Потрібно хоча б ~{math.ceil(min_n * 1.05 * 12 / lev):g} USDT маржі."
-        )
-    count = max(2, min(count, 100, fit, max_lines(lower, upper, False, step_floor / 100)))
-    step = (upper - lower) / count
-    tick = spec["tick"]
-    if step < float(tick) * 3:
-        raise BybitError(f"{symbol}: крок {step:g} менший за 3 тіки ціни — оберіть іншу монету для скальпінгу")
-    takes = sum(int((c["high"] - c["low"]) // step) for c in m1) // 2
-    return {
-        "symbol": symbol, "last": last, "profile": "scalp",
-        "lower": align(lower, tick, False), "upper": align(upper, tick, True),
-        "count": count, "leverage": lev, "margin": margin, "trail": True, "shiftMin": 0,
-        "widthPct": round(width_pct, 2), "atrPct": round(atr1_pct, 3), "stepPct": round(step / last * 100, 3),
-        "profitPct": round((step / upper - 2 * maker_fee(symbol)) * 100, 3), "takes12h": takes, "takesWindow": "2 год",
-        "why": (
-            f"Скальпінг: вузький канал {width_pct:.2f}% навколо ціни (за 4 год). Рух за 1 хв: {atr1_pct:.3f}%. "
-            f"Крок {step / last * 100:.3f}% (≈70% хвилинного руху, не менше {step_floor:.2f}% — {TAKE_FEE_MULT:g}× комісії). "
-            f"{count} ліній, плече x{lev}, сітка йде за ціною одразу."
-        ),
-    }
-
-
-# ---------------- пошук монет для нейтрального гріду на годину ----------------
-# Сенс: за останні 5 хв ціна ходить широко, але туди-сюди (малий зсув), а за останню годину — без тренду,
-# часто перетинає середину каналу і зараз не на краю. Такі монети найчастіше дають мікротейки в сітці.
-
-SCAN_LOCK = threading.Lock()
-SCAN_CACHE: dict = {"at": 0.0, "margin": None, "result": None}
-ALL_SPECS = {"at": 0.0}
-SCAN_MIN_TURNOVER = env_float("SCAN_MIN_TURNOVER", 5_000_000, 0, 1e12)   # USDT за 24 год
-SCAN_POOL = env_int("SCAN_POOL", 80, 10, 300)                            # скільки найліквідніших монет перевіряти
-
-
-def load_all_specs() -> None:
-    """Параметри всіх USDT-перпів одним запитом (раз на 30 хв): тік, крок кількості, мін. сума, макс. плече."""
-    if time.time() - ALL_SPECS["at"] < 1800:
-        return
-    cursor = ""
-    for _ in range(5):
-        query = {"category": "linear", "limit": "1000"}
-        if cursor:
-            query["cursor"] = cursor
-        res = bybit("/v5/market/instruments-info", query=query)
-        for row in res.get("list") or []:
-            sym = str(row.get("symbol") or "")
-            if not sym.endswith("USDT") or row.get("contractType") not in (None, "LinearPerpetual") or row.get("status") not in (None, "Trading"):
-                continue
-            try:
-                SPECS[sym] = {
-                    "tick": row["priceFilter"]["tickSize"], "qty": row["lotSizeFilter"]["qtyStep"],
-                    "min_qty": float(row["lotSizeFilter"].get("minOrderQty") or 0),
-                    "min_notional": float(row["lotSizeFilter"].get("minNotionalValue") or 5),
-                    "max_lev": float((row.get("leverageFilter") or {}).get("maxLeverage") or 20),
-                }
-            except (KeyError, TypeError, ValueError):
-                continue
-        cursor = res.get("nextPageCursor") or ""
-        if not cursor:
-            break
-    ALL_SPECS["at"] = time.time()
-
-
-def judge_coin(t: dict, margin: float) -> dict | None:
-    symbol = t["symbol"]
-    spec = SPECS.get(symbol)
-    if not spec:
-        return None
-    rows = candles(symbol, "1", 61)  # остання година хвилинками (+ поточна)
-    if len(rows) < 30:
-        return None
-    last = float(t.get("lastPrice") or rows[-1]["close"])
-    if last <= 0:
-        return None
-    # 5 хв: розмах і чистий зсув
-    r5 = rows[-5:]
-    hi5, lo5 = max(c["high"] for c in r5), min(c["low"] for c in r5)
-    range5 = (hi5 - lo5) / last * 100
-    first_open = rows[-6]["close"] if len(rows) >= 6 else r5[0]["low"]
-    net5 = abs(rows[-1]["close"] - first_open) / last * 100
-    er5 = min(1.0, net5 / range5) if range5 > 0 else 1.0
-    # година: розмах, зсув, перетини середини, де ціна зараз
-    hi60, lo60 = max(c["high"] for c in rows), min(c["low"] for c in rows)
-    range60 = (hi60 - lo60) / last * 100
-    net60 = abs(rows[-1]["close"] - rows[0]["close"]) / last * 100
-    er60 = min(1.0, net60 / range60) if range60 > 0 else 1.0
-    mid = (hi60 + lo60) / 2
-    signs = [1 if c["close"] >= mid else -1 for c in rows]
-    crosses = sum(1 for a, b in zip(signs, signs[1:]) if a != b)
-    pos = (last - lo60) / (hi60 - lo60) if hi60 > lo60 else 0.5
-    centre = 1 - abs(pos - 0.5) * 2  # 1 = посередині, 0 = на краю
-    # пробій: за останні 5 хв ціна вийшла за канал попередніх 55 хв — це тренд, а не хвиля всередині каналу
-    prev = rows[:-5]
-    phi, plo = max(c["high"] for c in prev), min(c["low"] for c in prev)
-    prng = phi - plo
-    breakout = prng > 0 and (last > phi + prng * 0.1 or last < plo - prng * 0.1)
-    # сітка на годину: канал години (без шпильок) із запасом 20%, але не вужча за 1.5 × 5-хв розмаху; ціна посередині
-    channel = (pct_rank([c["high"] for c in rows], 0.9) - pct_rank([c["low"] for c in rows], 0.1)) / last * 100
-    width_pct = max(channel * 1.2, range5 * 1.5)
-    width_pct = max(0.8, min(6.0, width_pct))
-    trs = [max(rows[i]["high"] - rows[i]["low"], abs(rows[i]["high"] - rows[i - 1]["close"]), abs(rows[i]["low"] - rows[i - 1]["close"]))
-           for i in range(max(1, len(rows) - 15), len(rows))]
-    atr1 = sum(trs) / len(trs) / last * 100 if trs else 0
-    step_floor = max(CFG.scalp_min_step, min_step(symbol) * 100)  # тейк ≥ 10× комісії
-    step_pct = max(step_floor, min(0.5, atr1 * 0.6))
-    count = int(round(width_pct / step_pct))
-    lev = int(max(3, min(20, int(spec["max_lev"]), round(15 / width_pct))))
-    min_n = spec.get("min_notional") or 5
-    fit = int(margin * lev // max(min_n * 1.05, spec["min_qty"] * last * 1.05))
-    # Sell-сітка: ціна біля низу діапазону (10% ширини нижче — місце для першого тейку), 90% — вище
-    lower, upper = last * (1 - width_pct * 0.1 / 100), last * (1 + width_pct * 0.9 / 100)
-    count = min(count, 100, fit, max_lines(lower, upper, False, step_floor / 100))
-    if count < 3:
-        count = 0  # замало руху, щоб тейк був ≥ 10× комісії хоча б на 3 лініях
-    step = (upper - lower) / count if count else 0
-    takes = sum(int((c["high"] - c["low"]) // step) for c in rows) // 2 if step > 0 else 0
-    # за 5 хв одна хвиля коливання схожа на тренд, тому зсув 5 хв має меншу вагу, ніж тренд години й пробій
-    score = range5 * (1 - 0.5 * er5) * (1 - 0.7 * er60) * (0.5 + 0.5 * centre) * (1 + min(crosses, 20) / 20)
-    # під Sell: краще, коли ціна у верхній частині каналу; година, що росте, — гірше (шорт проти тренду)
-    up60 = rows[-1]["close"] > rows[0]["close"]
-    score *= 0.6 + 0.8 * pos
-    if up60:
-        score *= 1 - 0.5 * er60
-    up_break = breakout and last > phi
-    if breakout:
-        score *= 0.05 if up_break else 0.3
-    # пампи: найбільший хвилинний ривок угору за годину і ріст за добу — такі монети під шорт не беремо
-    max_up1 = max(((c["high"] - p["close"]) / p["close"] * 100 for p, c in zip(rows, rows[1:]) if p["close"] > 0), default=0.0)
-    ch24 = float(t.get("price24hPcnt") or 0) * 100
-    pump_pct = pump_cfg()["pct"] or 1.5
-    pumpy = max_up1 >= pump_pct or ch24 >= 20
-    if pumpy:
-        score *= 0.05
-    strict = (range5 >= 0.2 and not breakout and not pumpy and er5 <= 0.85 and er60 <= 0.55
-              and centre >= 0.2 and count > 0)
-    tick = spec["tick"]
-    return {
-        "symbol": symbol, "last": last, "turnover": float(t.get("turnover24h") or 0),
-        "range5": round(range5, 3), "net5": round(net5, 3), "trend5": round(er5 * 100),
-        "range60": round(range60, 3), "trend60": round(er60 * 100), "crosses": crosses, "pos": round(pos * 100),
-        "breakout": breakout, "upBreak": up_break, "up60": up60,
-        "pumpy": pumpy, "maxUp1": round(max_up1, 2), "ch24": round(ch24, 1),
-        "score": round(score, 4), "strict": strict,
-        "lower": align(lower, tick, False), "upper": align(upper, tick, True), "count": count, "leverage": lev,
-        "widthPct": round(width_pct, 2), "stepPct": round(width_pct / count, 3) if count else 0,
-        "profitPct": round((width_pct / count - 200 * maker_fee(symbol)) if count else 0, 3), "takesHour": takes,
-        "fit": fit,
-    }
-
-
-def scan_coins(data: dict) -> dict:
-    margin = parse_num(data.get("margin") or 20, "Маржа", 1, 1000000)
-    with SCAN_LOCK:
-        cached = SCAN_CACHE["result"]
-        if cached and time.time() - SCAN_CACHE["at"] < 20 and SCAN_CACHE["margin"] == margin:
-            return cached
-        started = time.time()
-        load_all_specs()
-        tickers = bybit("/v5/market/tickers", query={"category": "linear"}).get("list") or []
-        skip = ("USDCUSDT", "USDEUSDT", "FDUSDUSDT", "DAIUSDT", "TUSDUSDT")
-        pool = [
-            t for t in tickers
-            if str(t.get("symbol", "")).endswith("USDT") and t["symbol"] not in skip and t["symbol"] in SPECS
-            and float(t.get("turnover24h") or 0) >= SCAN_MIN_TURNOVER and float(t.get("lastPrice") or 0) > 0
-        ]
-        pool.sort(key=lambda t: float(t.get("turnover24h") or 0), reverse=True)
-        pool = pool[:SCAN_POOL]
-        found: list[dict] = []
-        errors = 0
-
-        def one(t: dict):
-            try:
-                return judge_coin(t, margin)
-            except BybitError:
-                return "err"
-
-        with ThreadPoolExecutor(max_workers=8) as ex:
-            for res in ex.map(one, pool):
-                if res == "err":
-                    errors += 1
-                elif res:
-                    found.append(res)
-        strict = sorted([c for c in found if c["strict"]], key=lambda c: -c["score"])
-        relaxed = not strict
-        top = (strict or sorted([c for c in found if c["count"] > 0], key=lambda c: -c["score"]))[:12]
-        with LOCK:
-            busy = {g["symbol"] for g in STATE["grids"] if g["status"] == "active"}
-        for c in top:
-            c["busy"] = c["symbol"] in busy
-        result = {
-            "coins": top, "checked": len(found), "pool": len(pool), "errors": errors, "relaxed": relaxed,
-            "margin": margin, "sec": round(time.time() - started, 1), "at": int(time.time()),
-        }
-        SCAN_CACHE.update({"at": time.time(), "margin": margin, "result": result})
-        return result
-
-
-def sell_plan(data: dict) -> dict:
-    """Знайти монету і скласти Sell-сітку на pct% капіталу; решта (100 - pct)% капіталу завжди лишається вільною
-    для перестановки ліміток. Нічого не ставить — лише план (запуск після підтвердження через /api/start)."""
-    pct = parse_num(data.get("pct") or 90, "Відсоток депозиту", 10, 95)
-    wallet = bybit("/v5/account/wallet-balance", query={"accountType": "UNIFIED"}, auth=True)
-    acct = (wallet.get("list") or [{}])[0]
-    equity = float(acct.get("totalEquity") or 0)
-    available = float(acct.get("totalAvailableBalance") or 0)
-    reserve = equity * (100 - pct) / 100
-    margin = math.floor(min(equity * pct / 100, available - reserve) * 100) / 100
-    if margin < 5:
-        raise BybitError(
-            f"Замало вільних коштів: капітал {equity:.2f}, вільно {available:.2f} USDT, резерв {100 - pct:g}% = {reserve:.2f}. "
-            f"Під нову сітку лишається {max(margin, 0):.2f} USDT."
-        )
-    scan = scan_coins({"margin": margin})
-    exclude = set(data.get("exclude") or [])
-    pool = [c for c in scan["coins"] if not c.get("busy") and c["count"] > 0 and c["symbol"] not in exclude]
-    if not pool:
-        raise BybitError("Не знайшов вільної монети під сітку (усі зайняті або замало маржі)")
-    # для Sell краще, коли ціна у верхній половині годинного каналу
-    coin = next((c for c in pool if c["pos"] >= 50), None) or pool[0]
-    symbol = coin["symbol"]
-    spec = spec_of(symbol)
-    last = float(ticker(symbol)["lastPrice"])
-    width = last * coin["widthPct"] / 100
-    plan = {
-        "symbol": symbol, "mode": "sell", "geo": False, "trail": True, "shiftMin": 0,
-        "lower": align(last - width * 0.1, spec["tick"], False), "upper": align(last + width * 0.9, spec["tick"], True),
-        "count": coin["count"], "leverage": coin["leverage"], "margin": margin,
-    }
-    return {
-        "plan": plan, "preview": preview(plan), "coin": coin, "pct": pct,
-        "equity": round(equity, 2), "available": round(available, 2), "reserve": round(reserve, 2),
-        "relaxed": scan["relaxed"], "slRoi": CFG.sl_roi,
-    }
-
-
-def price_of(symbol) -> dict:
-    symbol = parse_symbol(symbol)
-    spec = spec_of(symbol)
-    return {"symbol": symbol, "last": float(ticker(symbol)["lastPrice"]), "tick": spec["tick"], "maxLev": spec["max_lev"]}
-
-
-# ---------------- графік і заявки ----------------
-
-INTERVALS = {"1s", "1", "5", "15", "60", "240", "D"}
-OI_INTERVAL = {"1s": "5min", "1": "5min", "5": "5min", "15": "15min", "60": "1h", "240": "4h", "D": "1d"}
-
-
-def open_interest(symbol: str, interval: str) -> list[dict]:
-    res = bybit("/v5/market/open-interest", query={
-        "category": "linear", "symbol": symbol, "intervalTime": OI_INTERVAL.get(interval, "5min"), "limit": "200",
-    })
-    return [
-        {"time": int(r["timestamp"]) // 1000, "value": float(r["openInterest"])}
-        for r in reversed(res.get("list") or []) if r.get("timestamp") and r.get("openInterest")
-    ]
-
-
-def recent_trades(symbol) -> dict:
-    """Останні 1000 угод — стартова точка для секундних свічок і CVD (далі браузер бере угоди наживо)."""
-    symbol = parse_symbol(symbol)
-    res = bybit("/v5/market/recent-trade", query={"category": "linear", "symbol": symbol, "limit": "1000"})
-    trades = [
-        {"id": r.get("execId"), "t": int(r.get("time") or 0), "p": float(r.get("price") or 0),
-         "v": float(r.get("size") or 0), "s": r.get("side")}
-        for r in res.get("list") or [] if not r.get("isBlockTrade")
-    ]
-    trades.sort(key=lambda r: r["t"])
-    return {"symbol": symbol, "trades": trades}
-
-
-def open_orders(symbol: str) -> list[dict]:
-    """Усі відкриті заявки на монеті (до 200), з позначкою, чи це заявка цього бота."""
-    out: list[dict] = []
-    cursor = ""
-    for _ in range(4):
-        query = {"category": "linear", "symbol": symbol, "limit": "50"}
-        if cursor:
-            query["cursor"] = cursor
-        res = bybit("/v5/order/realtime", query=query, auth=True)
-        for o in res.get("list") or []:
-            out.append({
-                "side": o.get("side"), "price": o.get("price") or o.get("triggerPrice"), "qty": o.get("qty"),
-                "filled": o.get("cumExecQty") or "0", "type": o.get("orderType"), "link": o.get("orderLinkId") or "",
-                "reduce": bool(o.get("reduceOnly")), "stop": o.get("stopOrderType") or "",
-            })
-        cursor = res.get("nextPageCursor") or ""
-        if not cursor:
-            break
-    return out
-
-
-def chart_data(symbol, interval) -> dict:
-    symbol = parse_symbol(symbol)
-    interval = str(interval or "5")
-    if interval not in INTERVALS:
-        interval = "5"
-    candles_: list[dict] = []
-    if interval != "1s":  # секундні свічки браузер будує сам з потоку угод
-        res = bybit("/v5/market/kline", query={"category": "linear", "symbol": symbol, "interval": interval, "limit": "300"})
-        candles_ = [
-            {"time": int(k[0]) // 1000, "open": float(k[1]), "high": float(k[2]), "low": float(k[3]), "close": float(k[4]),
-             "v": float(k[5] or 0)}
-            for k in reversed(res.get("list") or [])
-        ]
-    try:
-        oi = open_interest(symbol, interval)
-    except BybitError as exc:
-        log(f"OI {symbol}: {exc}")
-        oi = []
-    with LOCK:
-        grid = next((g for g in STATE["grids"] if g["symbol"] == symbol and g["status"] == "active"), None)
-        notes = {l["orderLinkId"]: l.get("note") for l in (grid or {}).get("levels") or []}
-        grid_info = {"lower": grid["lower"], "upper": grid["upper"], "ladder": list(grid.get("ladder") or [])} if grid else None
-    orders: list[dict] = []
-    position = None
-    if CFG.api_key and CFG.api_secret:
-        for o in open_orders(symbol):
-            o["mine"] = o["link"].startswith(LINK_PREFIX)
-            o["kind"] = "тейк" if notes.get(o["link"]) == "counter" else "сітка" if o["mine"] else "чужа"
-            orders.append(o)
-        pos = positions(symbol)
-        if pos:
-            p = pos[0]
-            position = {"side": p.get("side"), "size": p.get("size"), "avg": float(p.get("avgPrice") or 0),
-                        "liq": float(p.get("liqPrice") or 0), "sl": float(p.get("stopLoss") or 0),
-                        "pnl": float(p.get("unrealisedPnl") or 0)}
-    last = candles_[-1]["close"] if candles_ else float(ticker(symbol)["lastPrice"])
-    return {"symbol": symbol, "interval": interval, "last": last, "tick": spec_of(symbol)["tick"], "candles": candles_, "oi": oi,
-            "orders": orders, "position": position, "grid": grid_info}
-
-
-# ---------------- цикл ----------------
-
-def loop() -> None:
-    """Кожні POLL_SEC секунд: виконання ліміток → протилежна лімітка, детектор пампу; раз на ~3 с — стоп-лос."""
-    last_guard = 0.0
-    while not STOP.is_set():
-        HEART["tick"] = time.time()
-        notes: list[str] = []
-        try:
-            with LOCK:
-                grids = [g for g in STATE["grids"] if g["status"] == "active"]
-            for grid in grids:
-                try:
-                    with GRID_LOCK:
-                        if grid["status"] == "active":
-                            notes.extend(watch_grid(grid))
-                    if grid.get("pumpClose") and grid["status"] == "active":
-                        grid["pumpClose"] = False
-                        notes.append(emergency_close(grid, quiet=True))
-                        pump_cooldown(grid)
-                except Exception as exc:  # noqa: BLE001 — одна монета не зупиняє інші
-                    log(f"{grid['symbol']}: {exc}")
-            if grids and time.time() - last_guard >= 3:
-                last_guard = time.time()
-                try:
-                    notes.extend(guard())
-                except Exception as exc:  # noqa: BLE001
-                    log(f"стоп-лос: {exc}")
-            if grids:
-                with LOCK:
-                    save_state()
-        except Exception as exc:  # noqa: BLE001
-            log(f"цикл: {exc}")
-        for note in notes:
-            notify(note)
-        STOP.wait(CFG.poll)
-
-
-def refresh_account() -> None:
-    if time.time() - ACCOUNT["at"] < 8 or not CFG.api_key:
-        return
-    ACCOUNT["at"] = time.time()
-    try:
-        wallet = bybit("/v5/account/wallet-balance", query={"accountType": "UNIFIED"}, auth=True)
-        acct = (wallet.get("list") or [{}])[0]
-        ACCOUNT.update({
-            "equity": acct.get("totalEquity") or "0",
-            "available": acct.get("totalAvailableBalance") or "0",
-            "positions": [
-                {"symbol": p.get("symbol"), "side": p.get("side"), "size": p.get("size"), "avg": p.get("avgPrice"),
-                 "pnl": p.get("unrealisedPnl"), "liq": p.get("liqPrice"), "sl": p.get("stopLoss")}
-                for p in positions()
-            ],
-            "error": "",
-        })
-    except BybitError as exc:
-        ACCOUNT["error"] = str(exc)
-
-
-def grid_rows() -> list[dict]:
-    rows = []
-    with LOCK:
-        grids = [g for g in STATE.get("grids") or [] if g.get("status") == "active"]
-    for g in grids:
-        opened = [l for l in g["levels"] if l.get("status") == "open"]
-        rows.append({
-            "id": g["id"], "symbol": g["symbol"], "lower": g["lower"], "upper": g["upper"], "count": g["count"],
-            "step": g.get("step"), "qty": g.get("qty"), "lev": g.get("lev"), "margin": g.get("margin"),
-            "trail": bool(g.get("trail")), "shiftMin": g.get("shiftMin"), "last": g.get("last"),
-            "buys": sum(1 for l in opened if l["side"] == "Buy"), "sells": sum(1 for l in opened if l["side"] == "Sell"),
-            "fills": g.get("fills") or 0, "takes": g.get("takes") or 0, "profit": round(float(g.get("profit") or 0), 6),
-            "shifts": g.get("shifts") or 0, "out": bool(g.get("outSince")), "created": g.get("created"),
-            "geo": bool(g.get("geo")), "geoMult": g.get("geoMult"), "mode": g.get("mode") or "both", "auto": bool(g.get("auto")),
-            "pauseIn": max(0, int(float(g.get("pumpUntil") or 0) - time.time())), "pumps": int(g.get("pumps") or 0),
-            "slPx": g.get("slPx"),
-            "stepPct": round(((g["upper"] / g["lower"]) ** (1 / g["count"]) - 1) * 100, 3) if g.get("geo") else None,
-        })
-    return rows
-
-
-# ---------------- автопілот ----------------
-# Одна Sell-сітка автопілота за раз на pct% депозиту. Немає сітки — кожні 5 хв шукає монету і запускає без підтвердження
-# (якщо ринок трендовий — чекає). Є сітка — раз на everyMin хв перевіряє монету: почався ріст → екстрено закриває і
-# переходить на іншу (закриту монету 2 год не бере). Захист кожні 30 с: збиток сітки > stopPct% депозиту → закрити;
-# капітал просів на ddPct% від увімкнення → закрити сітку і вимкнути автопілот. За замовчуванням ВИМКНЕНИЙ.
-
-AUTO_DEFAULT = {"on": False, "pct": 90.0, "everyMin": 60, "stopPct": 10.0, "ddPct": 20.0, "geoMult": 1.3,
-                "startEq": 0.0, "nextAt": 0.0, "guardAt": 0.0, "last": "", "cooldown": {}}
-AUTO_IDLE_SEC = 300
-AUTO_COOLDOWN_SEC = 7200
-AUTO_LOCK = threading.Lock()
-
-
-def auto_cfg() -> dict:
-    cfg = STATE.setdefault("auto", {})
-    for k, v in AUTO_DEFAULT.items():
-        cfg.setdefault(k, v if not isinstance(v, dict) else dict(v))
-    return cfg
-
-
-def auto_grid() -> dict | None:
-    with LOCK:
-        return next((g for g in STATE["grids"] if g.get("auto") and g["status"] == "active"), None)
-
-
-def auto_say(text: str, loud: bool = True) -> None:
-    auto_cfg()["last"] = text
-    if loud:
-        notify("🤖 Автопілот: " + text)
-    else:
-        add_event("🤖 " + text)
-
-
-def wallet_equity() -> float:
-    wallet = bybit("/v5/account/wallet-balance", query={"accountType": "UNIFIED"}, auth=True)
-    return float(((wallet.get("list") or [{}])[0]).get("totalEquity") or 0)
-
-
-def autopilot_set(data: dict) -> dict:
-    cfg = auto_cfg()
-    pct = parse_num(data.get("pct", cfg["pct"]), "Відсоток депозиту", 10, 95)
-    every = int(parse_num(data.get("everyMin", cfg["everyMin"]), "Перевірка, хв", 10, 1440, integer=True))
-    stop = parse_num(data.get("stopPct", cfg["stopPct"]), "Стоп сітки, % депозиту", 1, 100)
-    dd = parse_num(data.get("ddPct", cfg["ddPct"]), "Просадка автопілота, %", 2, 90)
-    mult = parse_num(data.get("geoMult", cfg["geoMult"]), "Множник лота", 1, 3)
-    on = bool(data.get("on", cfg["on"]))
-    if on and not (CFG.api_key and CFG.api_secret):
-        raise BybitError("Немає ключів Bybit — автопілот не може торгувати")
-    with AUTO_LOCK:
-        was = cfg["on"]
-        cfg.update({"pct": pct, "everyMin": every, "stopPct": stop, "ddPct": dd, "geoMult": mult})
-        if on and not was:
-            cfg.update({"on": True, "startEq": wallet_equity(), "nextAt": 0.0, "cooldown": {}})
-            auto_say(f"увімкнено. Капітал {cfg['startEq']:.2f} USDT, геометрична сітка (лот ×{mult:g}) на {pct:g}% депозиту, перевірка що {every} хв, "
-                     f"стоп сітки −{stop:g}% депозиту, вимкнення при просадці −{dd:g}%.")
-        elif not on and was:
-            cfg["on"] = False
-            g = auto_grid()
-            auto_say("вимкнено." + (f" Сітка {g['symbol']} лишається працювати — закрийте її, якщо треба." if g else ""))
-    with LOCK:
-        save_state()
-    return auto_status()
-
-
-def auto_status() -> dict:
-    cfg = auto_cfg()
-    g = auto_grid()
-    return {
-        "on": cfg["on"], "pct": cfg["pct"], "everyMin": cfg["everyMin"], "stopPct": cfg["stopPct"], "ddPct": cfg["ddPct"],
-        "geoMult": cfg["geoMult"],
-        "startEq": cfg["startEq"], "last": cfg["last"], "grid": g["symbol"] if g else "",
-        "nextIn": max(0, int(cfg["nextAt"] - time.time())) if cfg["on"] else 0,
-        "cooldown": sorted(k for k, v in (cfg.get("cooldown") or {}).items() if v > time.time()),
-    }
-
-
-def auto_close(grid: dict, why: str) -> None:
-    cfg = auto_cfg()
-    text = emergency_close(grid, quiet=True)
-    cfg.setdefault("cooldown", {})[grid["symbol"]] = time.time() + AUTO_COOLDOWN_SEC
-    auto_say(f"{why} {text}")
-
-
-def autopilot_guard(cfg: dict, grid: dict | None) -> None:
-    """Кожні 30 с: просадка капіталу і стоп сітки у % депозиту."""
-    if time.time() - cfg.get("guardAt", 0) < 30:
-        return
-    cfg["guardAt"] = time.time()
-    equity = wallet_equity()
-    if cfg["startEq"] > 0 and equity < cfg["startEq"] * (1 - cfg["ddPct"] / 100):
-        if grid:
-            auto_close(grid, f"просадка капіталу {equity:.2f} < −{cfg['ddPct']:g}% від {cfg['startEq']:.2f}.")
-        cfg["on"] = False
-        auto_say(f"ВИМКНЕНО через просадку: капітал {equity:.2f} USDT (було {cfg['startEq']:.2f}).")
-        return
-    if grid:
-        upnl = sum(float(p.get("unrealisedPnl") or 0) for p in positions(grid["symbol"]))
-        base = float(grid.get("autoEq") or cfg["startEq"] or equity)
-        if upnl <= -base * cfg["stopPct"] / 100:
-            auto_close(grid, f"стоп сітки {grid['symbol']}: збиток {upnl:.2f} USDT > {cfg['stopPct']:g}% депозиту.")
-            cfg["nextAt"] = time.time() + AUTO_IDLE_SEC  # пауза перед наступною монетою
-
-
-def coin_turned_up(symbol: str, margin: float) -> str:
-    """Порожній рядок — монета ще годиться під Sell; інакше — причина закрити."""
-    load_all_specs()
-    t = ticker(symbol)
-    c = judge_coin({"symbol": symbol, "lastPrice": t.get("lastPrice"), "turnover24h": t.get("turnover24h"),
-                    "price24hPcnt": t.get("price24hPcnt")}, margin)
-    if not c:
-        return ""
-    if c["upBreak"]:
-        return f"{symbol} пробив годинний канал угору."
-    if c["pumpy"]:
-        return f"{symbol}: пампи (ривок +{c['maxUp1']}% за хвилину, за добу {c['ch24']:+}%)."
-    if c["up60"] and c["trend60"] >= 55:
-        return f"{symbol} росте: тренд години {c['trend60']}% угору."
-    return ""
-
-
-def autopilot_step() -> None:
-    cfg = auto_cfg()
-    if not cfg["on"]:
-        return
-    grid = auto_grid()
-    autopilot_guard(cfg, grid)
-    if not cfg["on"]:
-        return
-    grid = auto_grid()
-    now = time.time()
-    if now < cfg["nextAt"]:
-        return
-    if grid:
-        cfg["nextAt"] = now + cfg["everyMin"] * 60
-        why = coin_turned_up(grid["symbol"], float(grid.get("margin") or 20))
-        if not why:
-            auto_say(f"{grid['symbol']} без росту — сітка працює далі.", loud=False)
-            return
-        auto_close(grid, why + " Закриваю і шукаю іншу монету.")
-        grid = None
-    cfg["nextAt"] = now + AUTO_IDLE_SEC
-    cool = cfg.setdefault("cooldown", {})
-    for k in [k for k, v in cool.items() if v <= now]:
-        cool.pop(k, None)
-    try:
-        plan = sell_plan({"pct": cfg["pct"], "exclude": list(cool)})
-    except BybitError as exc:
-        auto_say(f"не запускаю: {exc} Повтор через {AUTO_IDLE_SEC // 60} хв.", loud=False)
-        return
-    if plan["relaxed"]:
-        auto_say(f"ринок трендовий — жодна монета не проходить умови. Чекаю {AUTO_IDLE_SEC // 60} хв.", loud=False)
-        return
-    # автопілот завжди ставить геометричну сітку; якщо найменша лімітка менша за мінімум біржі — менше ліній
-    pl = dict(plan["plan"], auto=True, autoEq=plan["equity"], geo=True, geoMult=cfg["geoMult"])
-    text, err = None, None
-    for count in range(int(pl["count"]), 3, -1):
-        try:
-            text = start_grid(dict(pl, count=count))
-            pl["count"] = count
-            break
-        except BybitError as exc:
-            if "Замало маржі" not in str(exc):
+            self._req("POST", "/v5/position/set-leverage", {"category": "linear", "symbol": sym,
+                      "buyLeverage": str(lev), "sellLeverage": str(lev)}, True)
+        except BybitError as e:
+            if "110043" not in str(e):  # плечо уже такое
                 raise
-            err = exc
-    if text is None:
-        auto_say(f"не запускаю {pl['symbol']}: {err} Повтор через {AUTO_IDLE_SEC // 60} хв.", loud=False)
-        return
-    cfg["nextAt"] = time.time() + cfg["everyMin"] * 60
-    c = plan["coin"]
-    auto_say(f"запустив {text}. Маржа {pl['margin']} з {plan['equity']} USDT. "
-             f"За 5 хв рух {c['range5']}%, тренд години {c['trend60']}% {'↑' if c.get('up60') else '↓'}, ціна на {c['pos']}% каналу.")
+
+    def position(self, sym):
+        r = self._req("GET", "/v5/position/list", {"category": "linear", "symbol": sym}, True)
+        for p in r.get("list", []):
+            if Decimal(p.get("size") or "0") > 0:
+                return p
+        return None
+
+    def cancel(self, sym, oid):
+        self._req("POST", "/v5/order/cancel", {"category": self.cat, "symbol": sym, "orderId": oid}, True)
+
+    def cancel_all(self, sym):
+        self._req("POST", "/v5/order/cancel-all", {"category": self.cat, "symbol": sym}, True)
 
 
-def autopilot_loop() -> None:
-    while not STOP.is_set():
+class Radar:
+    """Ранняя защита: лента принтов, стакан, скорость цены, открытый интерес, фандинг.
+    Данные берутся с фьючерсного рынка той же пары: он обычно двигается первым."""
+
+    def __init__(self, network, symbol):
+        self.pub = Bybit("", "", "mainnet" if network == "demo" else network, "linear")
+        self.sym, self.cat = symbol, "linear"
+        self.trades, self.seen, self.seen_q = deque(), set(), deque()
+        self.prices, self.moves = deque(), deque(maxlen=300)
+        self.books = deque(maxlen=40)
+        self.oi_chg, self.funding, self.n = 0.0, 0.0, 0
+        self.dump = self.pump = 0.0
+        self.m = {"warm": False}
+
+    def init(self):
         try:
-            with AUTO_LOCK:
-                autopilot_step()
-                with LOCK:
-                    save_state()
-        except Exception as exc:  # noqa: BLE001 — автопілот не повинен падати
-            log(f"автопілот: {exc}")
-            auto_cfg()["last"] = f"помилка: {exc}"
-        STOP.wait(5)
+            self.pub._req("GET", "/v5/market/tickers", {"category": "linear", "symbol": self.sym})
+        except BybitError:
+            self.cat = self.pub.cat = "spot"
 
+    def update(self):
+        now = time.time() * 1000
+        r = self.pub._req("GET", "/v5/market/recent-trade",
+                          {"category": self.cat, "symbol": self.sym, "limit": 1000 if self.cat == "linear" else 60})
+        for t in reversed(r.get("list", [])):
+            if t["execId"] in self.seen:
+                continue
+            self.seen.add(t["execId"]); self.seen_q.append(t["execId"])
+            pr = float(t["price"])
+            self.trades.append((int(t["time"]), t["side"], float(t["size"]) * pr, pr))
+        while len(self.seen_q) > 30000:
+            self.seen.discard(self.seen_q.popleft())
+        while self.trades and self.trades[0][0] < now - 12 * 60000:
+            self.trades.popleft()
+        if not self.trades:
+            return self.m
+        price = self.trades[-1][3]
+        self.prices.append((now, price))
+        while self.prices and self.prices[0][0] < now - 15 * 60000:
+            self.prices.popleft()
 
-def snapshot() -> dict:
-    refresh_account()
-    with LOCK:
-        events = list(reversed((STATE.get("events") or [])[-40:]))
-    return {
-        "env": CFG.env, "keys": bool(CFG.api_key and CFG.api_secret), "slRoi": CFG.sl_roi,
-        "loopAgo": int(time.time() - HEART["tick"]) if HEART["tick"] else -1,
-        "upMin": int((time.time() - HEART["started"]) // 60),
-        "grids": grid_rows(), "events": events, "auto": auto_status(), "pump": dict(pump_cfg()),
-        "account": {k: ACCOUNT[k] for k in ("equity", "available", "positions", "error")},
-    }
+        ob = self.pub._req("GET", "/v5/market/orderbook", {"category": self.cat, "symbol": self.sym, "limit": 50})
+        bids = [(float(p), float(q_)) for p, q_ in ob.get("b", [])]
+        asks = [(float(p), float(q_)) for p, q_ in ob.get("a", [])]
+        if bids and asks:
+            mid = (bids[0][0] + asks[0][0]) / 2
+            bid_d = sum(p * q_ for p, q_ in bids if p >= mid * 0.995)
+            ask_d = sum(p * q_ for p, q_ in asks if p <= mid * 1.005)
+        else:
+            bid_d = ask_d = 0.0
+        prev_books = list(self.books)
+        self.books.append((bid_d, ask_d))
 
-
-# ---------------- веб-сторінка ----------------
-
-def serve() -> None:
-    port = int(os.environ.get("PORT", "8080"))
-    page = HERE / "index.html"
-
-    class Handler(BaseHTTPRequestHandler):
-        def send_bytes(self, code: int, body: bytes, content_type: str) -> None:
-            self.send_response(code)
-            self.send_header("Content-Type", content_type)
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("Cache-Control", "no-store")
-            self.end_headers()
-            self.wfile.write(body)
-
-        def send_json(self, code: int, payload: dict) -> None:
-            self.send_bytes(code, json.dumps(payload, ensure_ascii=False).encode(), "application/json; charset=utf-8")
-
-        def do_GET(self):  # noqa: N802
-            path = urllib.parse.urlparse(self.path).path
-            if path == "/api/ping":
-                self.send_json(200, {"ok": True})
-            elif path == "/api/status":
-                try:
-                    self.send_json(200, snapshot())
-                except Exception as exc:  # noqa: BLE001
-                    self.send_json(500, {"error": str(exc)})
-            else:
-                self.send_bytes(200, page.read_bytes() if page.exists() else b"index.html missing", "text/html; charset=utf-8")
-
-        def do_POST(self):  # noqa: N802
-            path = urllib.parse.urlparse(self.path).path
-            length = int(self.headers.get("Content-Length") or 0)
+        if self.cat == "linear" and self.n % 20 == 0:
             try:
-                data = json.loads(self.rfile.read(length).decode()) if 0 < length <= 20000 else {}
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                data = {}
-            if not isinstance(data, dict):
-                data = {}
-            routes = {
-                "/api/auto": lambda: auto_params(data),
-                "/api/price": lambda: price_of(data.get("symbol")),
-                "/api/scan": lambda: scan_coins(data),
-                "/api/sellplan": lambda: sell_plan(data),
-                "/api/autopilot": lambda: autopilot_set(data),
-                "/api/pump": lambda: pump_set(data),
-                "/api/chart": lambda: chart_data(data.get("symbol"), data.get("interval")),
-                "/api/trades": lambda: recent_trades(data.get("symbol")),
-                "/api/preview": lambda: preview(data),
-                "/api/start": lambda: {"ok": True, "text": start_grid(data)},
-                "/api/stop": lambda: {"ok": True, "text": stop_grid(str(data.get("id") or ""), bool(data.get("close")))},
-                "/api/emergency": lambda: {"ok": True, "text": emergency(str(data.get("id") or ""))},
-            }
-            if path not in routes:
-                self.send_json(404, {"error": "немає такого запиту"})
-                return
-            try:
-                self.send_json(200, routes[path]())
-            except BybitError as exc:
-                self.send_json(400, {"error": str(exc)})
-            except Exception as exc:  # noqa: BLE001
-                self.send_json(500, {"error": str(exc)})
+                oi = self.pub._req("GET", "/v5/market/open-interest", {"category": "linear", "symbol": self.sym,
+                                   "intervalTime": "5min", "limit": 3}).get("list", [])
+                if len(oi) >= 3 and float(oi[2]["openInterest"]):
+                    self.oi_chg = (float(oi[0]["openInterest"]) / float(oi[2]["openInterest"]) - 1) * 100
+                tk = self.pub._req("GET", "/v5/market/tickers", {"category": "linear", "symbol": self.sym})
+                self.funding = float(tk["list"][0].get("fundingRate") or 0)
+            except (BybitError, KeyError, IndexError, ValueError):
+                pass
+        self.n += 1
 
-        def log_message(self, fmt, *args):
+        # ---- лента: объём, скорость принтов, дельта за 30 секунд против фона последних 10 минут
+        W = 30000
+        rec = [x for x in self.trades if x[0] >= now - W]
+        base = [x for x in self.trades if now - 11 * 60000 <= x[0] < now - W]
+        span = (now - W - base[0][0]) if base else 0
+        warm = span >= 120000 and len(self.moves) >= 20
+        vol = sum(x[2] for x in rec)
+        buy = sum(x[2] for x in rec if x[1] == "Buy")
+        delta = (2 * buy - vol) / vol if vol else 0.0
+        burst = speed_x = 1.0
+        if span > 0:
+            bv = sum(x[2] for x in base) / span * W
+            bc = len(base) / span * W
+            burst = vol / bv if bv else 1.0
+            speed_x = len(rec) / bc if bc else 1.0
+        tps = len(rec) / (W / 1000)
+
+        # ---- скорость цены: движение за 60 с относительно обычного для этой пары
+        def price_ago(ms):
+            for t, p in self.prices:
+                if t >= now - ms:
+                    return p
+            return price
+        p60 = price_ago(60000)
+        move60 = (price / p60 - 1) * 100 if p60 else 0.0
+        self.moves.append(abs(move60))
+        med = max(statistics.median(self.moves), 0.02) if self.moves else 0.05
+        move_x = move60 / med
+        move5 = (price / price_ago(5 * 60000) - 1) * 100
+
+        # ---- стакан: перекос в пределах 0.5% и снятая ликвидность
+        imb = (bid_d - ask_d) / (bid_d + ask_d) if bid_d + ask_d else 0.0
+        if prev_books:
+            ab = sum(b for b, _ in prev_books) / len(prev_books)
+            aa = sum(a for _, a in prev_books) / len(prev_books)
+            bid_pull = 1 - bid_d / ab if ab else 0.0
+            ask_pull = 1 - ask_d / aa if aa else 0.0
+        else:
+            bid_pull = ask_pull = 0.0
+
+        # ---- оценка риска (0–100)
+        flow = clamp((max(burst, speed_x) - 1.5) / 3)
+        oi_d = clamp(abs(self.oi_chg) / 2) if move5 < -0.3 else 0.0
+        oi_p = clamp(abs(self.oi_chg) / 2) if move5 > 0.3 else 0.0
+        dump = 100 * (0.30 * clamp((-move_x - 2) / 4)
+                      + 0.25 * clamp((-delta - 0.2) / 0.5)
+                      + 0.20 * flow * (1 if delta < -0.1 else 0.3)
+                      + 0.15 * max(clamp((-imb - 0.2) / 0.5), clamp((bid_pull - 0.25) / 0.5))
+                      + 0.10 * max(oi_d, clamp((self.funding - 0.0003) / 0.0007)))
+        pump = 100 * (0.30 * clamp((move_x - 2) / 4)
+                      + 0.25 * clamp((delta - 0.2) / 0.5)
+                      + 0.20 * flow * (1 if delta > 0.1 else 0.3)
+                      + 0.15 * max(clamp((imb - 0.2) / 0.5), clamp((ask_pull - 0.25) / 0.5))
+                      + 0.10 * max(oi_p, clamp((-self.funding - 0.0003) / 0.0007)))
+        if not warm:
+            dump, pump = min(dump, 40), min(pump, 40)
+        self.dump = max(dump, self.dump * 0.8)
+        self.pump = max(pump, self.pump * 0.8)
+        self.m = {"warm": warm, "tps": round(tps, 1), "speed_x": round(speed_x, 2), "burst": round(burst, 2),
+                  "delta": round(delta, 3), "move60": round(move60, 3), "move_x": round(move_x, 1),
+                  "imb": round(imb, 3), "bid_pull": round(bid_pull, 2), "ask_pull": round(ask_pull, 2),
+                  "oi": round(self.oi_chg, 2), "funding": self.funding, "src": self.cat,
+                  "dump": round(self.dump), "pump": round(self.pump)}
+        return self.m
+
+
+class Bot:
+    def __init__(self):
+        self.lock = threading.RLock()
+        self.running = False
+        self.busy = False
+        self.thread = None
+        self.reset()
+
+    def reset(self):
+        self.status, self.error = "Остановлен", ""
+        self.symbol, self.base_coin, self.quote_coin = "", "", ""
+        self.hist, self.fills, self.log, self.levels = [], [], [], []
+        self.price, self.profit, self.trades = None, 0.0, 0
+        self.orders, self.bal, self.network = {}, {}, ""
+        self.cat, self.lev, self.pos = "spot", 1, None
+        self.cells, self.kmin, self.n, self._lv = {}, 0, 0, {}
+        self.out_up = self.out_dn = 0
+        self.shift_up = self.shift_dn = 0
+        self.trail_pnl = 0.0
+        self.trail_up = self.trail_down = False
+        self.up_limit = self.dn_limit = Decimal(0)
+        self.radar, self.radar_mode, self.radar_sens = None, "off", "mid"
+        self.guard, self.guard_t, self.paused, self.calm = None, 0, {}, 0
+        self.exit_spot = False
+        self.bid = self.ask = None
+        self.maker_n = self.taker_n = 0
+
+    def say(self, kind, text, val=None):
+        with self.lock:
+            self.log.insert(0, {"t": time.strftime("%H:%M:%S"), "k": kind, "text": text, "v": val})
+            del self.log[120:]
+        print(time.strftime("%H:%M:%S"), kind, text, "" if val is None else val)
+
+    def state(self):
+        with self.lock:
+            b = {k: float(v["free"]) for k, v in self.bal.items() if k in (self.base_coin, self.quote_coin)}
+            if "_margin" in self.bal:
+                b["_margin"] = float(self.bal["_margin"])
+            pos = None
+            if self.pos:
+                pos = {"side": self.pos.get("side"), "size": self.pos.get("size"),
+                       "entry": float(self.pos.get("avgPrice") or 0),
+                       "liq": float(self.pos.get("liqPrice") or 0),
+                       "upnl": float(self.pos.get("unrealisedPnl") or 0)}
+            return {"running": self.running, "busy": self.busy, "status": self.status, "error": self.error,
+                    "symbol": self.symbol, "base": self.base_coin, "quote": self.quote_coin,
+                    "network": self.network, "price": float(self.price) if self.price else None,
+                    "levels": [float(x) for x in self.levels], "hist": self.hist[-400:],
+                    "fills": self.fills[-100:], "log": self.log[:60], "profit": self.profit,
+                    "trades": self.trades, "open": len(self.orders), "bal": b,
+                    "market": self.cat, "leverage": self.lev, "pos": pos,
+                    "trail": {"up": self.trail_up, "down": self.trail_down,
+                              "nup": self.shift_up, "ndn": self.shift_dn, "pnl": self.trail_pnl},
+                    "fees": {"maker": self.maker_n, "taker": self.taker_n},
+                    "radar": dict(self.radar.m, mode=self.radar_mode, guard=self.guard,
+                                  paused=len(self.paused)) if self.radar else {"mode": "off"}}
+
+    def start(self, cfg):
+        if self.running or self.busy:
             return
+        self.reset()
+        self.running = self.busy = True
+        self.status = "Запускаю…"
+        set_autostart(True)
+        self.thread = threading.Thread(target=self._run, args=(cfg,), daemon=True)
+        self.thread.start()
 
-    host = os.environ.get("HOST") or ("127.0.0.1" if LOCAL else "0.0.0.0")
-    try:
-        httpd = ThreadingHTTPServer((host, port), Handler)
-    except OSError as exc:
-        log(f"Порт {port} зайнятий ({exc}). Бот, схоже, вже запущений — друга копія не стартує.")
-        os._exit(1)
-    log(f"сторінка: http://{'127.0.0.1' if host == '0.0.0.0' else host}:{port}")
-    httpd.serve_forever()
+    def stop(self, remember=True):
+        if remember:
+            set_autostart(False)
+        if self.running:
+            self.running = False
+            self.busy = True
+            self.status = "Останавливаю…"
 
-
-def keep_alive() -> None:
-    """Railway: пінгуємо свою адресу, щоб сервіс не засинав."""
-    domain = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "").strip()
-    if not domain:
-        return
-    while not STOP.is_set():
+    # ---------- основной цикл ----------
+    def _run(self, cfg):
+        api = None
         try:
-            with urllib.request.urlopen(urllib.request.Request(f"https://{domain}/api/ping", headers={"User-Agent": "keepalive"}), timeout=20) as r:
-                r.read()
-        except Exception as exc:  # noqa: BLE001
-            log(f"keepalive: {exc}")
-        STOP.wait(240)
+            if not cfg["api_key"] or not cfg["api_secret"]:
+                raise BybitError("Введите API ключ и секрет в настройках")
+            cat = "linear" if cfg.get("market") == "futures" else "spot"
+            api = Bybit(cfg["api_key"], cfg["api_secret"], cfg["network"], cat)
+            api.sync_time()
+            self._setup(api, cfg)
+            self.busy = False
+            self.status = "Работает"
+            errors, n = 0, 0
+            while self.running:
+                try:
+                    self._tick(api)
+                    errors = 0
+                    n += 1
+                    if n % 10 == 0:
+                        self.bal = api.balances()
+                except BybitError as e:
+                    errors += 1
+                    self.say("err", str(e))
+                    if errors >= 10:
+                        raise BybitError("10 ошибок подряд, бот остановлен: " + str(e))
+                    time.sleep(5)
+                    continue
+                for _ in range(POLL_SEC * 10):
+                    if not self.running:
+                        break
+                    time.sleep(0.1)
+        except Exception as e:
+            self.error = str(e)
+            self.say("err", str(e))
+        finally:
+            if api and self.symbol:
+                try:
+                    coins = sum((o["qty"] for o in self.orders.values() if o["side"] == "Sell"), Decimal(0))
+                    coins += sum((c["sell_qty"] for c in self.paused.values() if c["side"] == "Sell"), Decimal(0))
+                    api.cancel_all(self.symbol)
+                    if self.exit_spot and self.cat == "spot" and coins >= self.min_qty:
+                        api.place(self.symbol, "Sell", q(coins, self.bstep), market=True)
+                        self.say("sell", f"аварийная продажа {q(coins, self.bstep)} {self.base_coin} по рынку")
+                    if self.cat == "linear":
+                        self.say("info", "все ордера бота отменены")
+                        self._close_position(api)
+                    else:
+                        self.say("info", "все ордера бота отменены, монеты остались на счёте")
+                except Exception as e:
+                    self.say("err", "не удалось отменить ордера или закрыть позицию: " + str(e)
+                             + ". Проверьте счёт на Bybit вручную!")
+            with self.lock:
+                self.orders = {}
+                self.running = False
+                self.busy = False
+                self.status = "Ошибка" if self.error else "Остановлен"
 
+    def _setup(self, api, cfg):
+        sym = cfg["symbol"].upper().strip()
+        self.cat = api.cat
+        inst = api.instrument(sym)
+        self.symbol, self.network = sym, cfg["network"]
+        self.base_coin, self.quote_coin = inst["baseCoin"], inst["quoteCoin"]
+        lot, pf = inst["lotSizeFilter"], inst["priceFilter"]
+        self.tick = Decimal(pf["tickSize"])
+        if self.cat == "linear":
+            self.fee, self.fee_buf = FUT_FEE, Decimal(0)
+            self.bstep = Decimal(lot["qtyStep"])
+            min_amt = Decimal(lot.get("minNotionalValue") or "5")
+            max_lev = Decimal(inst.get("leverageFilter", {}).get("maxLeverage") or "100")
+            lev = int(cfg.get("leverage") or 1)
+            if not 1 <= lev <= 100:
+                raise BybitError("Плечо должно быть от 1 до 100")
+            if lev > max_lev:
+                raise BybitError(f"Для {sym} Bybit даёт максимум {max_lev}x")
+            self.lev = lev
+        else:
+            self.fee, self.fee_buf = SPOT_FEE, SPOT_FEE_BUF
+            self.bstep = Decimal(lot["basePrecision"])
+            self.qstep = Decimal(lot.get("quotePrecision") or "0.0001")
+            min_amt = Decimal(lot.get("minOrderAmt") or "0")
+            self.lev = 1
+        min_qty = Decimal(lot.get("minOrderQty") or "0")
 
-def main() -> None:
-    threading.Thread(target=serve, name="http", daemon=True).start()
-    if LOCAL:
-        url = f"http://127.0.0.1:{int(os.environ.get('PORT', '8080'))}"
-        log(f"Бот працює на цьому комп'ютері: {url}. Не закривайте вікно. Зупинити: Ctrl+C.")
-        if os.environ.get("OPEN_BROWSER", "1") != "0":
-            threading.Timer(1.5, lambda: webbrowser.open(url)).start()
-    else:
-        threading.Thread(target=keep_alive, name="keepalive", daemon=True).start()
-    if not pick_base():
-        log("Bybit недоступний з цього сервера")
-    if not CFG.api_key or not CFG.api_secret:
-        log("немає BYBIT_API_KEY / BYBIT_API_SECRET — сторінка відкривається, ордери не ставляться")
-    else:
+        p = api.price(sym)
+        self.price = p
+        self.hist.append({"t": int(time.time() * 1000), "p": float(p)})
+        n = int(cfg["levels"])
+        if not 3 <= n <= 50:
+            raise BybitError("Уровней должно быть от 3 до 50")
+        rng = float(cfg["range_pct"]) / 100
+        lo, hi = float(p) * (1 - rng), float(p) * (1 + rng)
+        self.lo0, self.r, self.n, self.kmin, self._lv = lo, (hi / lo) ** (1 / (n - 1)), n, 0, {}
+        L = [self.lv(i) for i in range(n)]
+        self.levels = L
+        self.trail_up, self.trail_down = bool(cfg.get("trail_up")), bool(cfg.get("trail_down"))
+        self.up_limit = Decimal(str(cfg.get("trail_up_limit") or 0))
+        self.dn_limit = Decimal(str(cfg.get("trail_down_limit") or 0))
+        self.radar_mode = cfg.get("radar") or "off"
+        self.radar_sens = cfg.get("radar_sens") if cfg.get("radar_sens") in RADAR_SENS else "mid"
+        if self.radar_mode != "off":
+            self.radar = Radar(cfg["network"], sym)
+            try:
+                self.radar.init()
+            except BybitError as e:
+                self.say("err", "радар не запустился: " + str(e))
+                self.radar = None
+
+        cap = Decimal(str(cfg["capital"]))
+        per = cap * self.lev / (n - 1)   # объём на уровень (с учётом плеча)
+        if per < min_amt * Decimal("1.05"):
+            raise BybitError(f"На один уровень выходит {per:.2f} {self.quote_coin}, а минимум ордера на Bybit "
+                             f"{min_amt} {self.quote_coin}. Увеличьте капитал или уменьшите число уровней.")
+        self.min_amt, self.min_qty = min_amt, min_qty
+        self.cells = {}
+        for i in range(n - 1):
+            qty = q(per / L[i], self.bstep)
+            if qty < min_qty:
+                raise BybitError("Объём на уровень меньше минимального. Увеличьте капитал.")
+            self.cells[i] = {"i": i, "qty": qty, "cost": qty * L[i] * (1 + self.fee)}
+
+        sell_cells = [c for c in self.cells.values() if L[c["i"]] > p]
+        buy_cells = [c for c in self.cells.values() if L[c["i"]] <= p]
+        need_base = sum(c["qty"] for c in sell_cells)
+        need_quote = sum(c["qty"] * L[c["i"]] for c in buy_cells)
+
+        self.bal = api.balances()
+        if self.cat == "linear":
+            self._setup_futures(api, cfg, p, cap, sell_cells, buy_cells, need_base)
+            return
+        free_base = self.bal.get(self.base_coin, {}).get("free", Decimal(0))
+        free_quote = self.bal.get(self.quote_coin, {}).get("free", Decimal(0))
+        short = need_base - free_base
+        buy_qty = Decimal(0)
+        if short > 0:
+            buy_qty = q(short * (1 + self.fee_buf * 2), self.bstep)
+            if buy_qty * p < min_amt:
+                buy_qty = q(min_amt * Decimal("1.05") / p, self.bstep) + self.bstep
+        market_amt = buy_qty * p * Decimal("1.003")
+        if free_quote < need_quote + market_amt:
+            raise BybitError(f"Не хватает {self.quote_coin}: нужно {need_quote + market_amt:.2f}, "
+                             f"свободно {free_quote:.2f}. Пополните счёт или уменьшите капитал.")
+        self.say("info", f"сетка {L[0]} – {L[-1]}, {n} уровней, {cap} {self.quote_coin}, " + self._trail_text())
+
+        if buy_qty > 0:
+            got, spent = self._chase(api, "Buy", buy_qty)
+            self.say("buy", f"быстрой лимиткой {got} {self.base_coin} на {spent:.2f} {self.quote_coin} для верхних ордеров")
+            if got > 0:
+                p = spent / got
+        _, self.bid, self.ask = api.bbo(sym)
+        self._place_grid(api, p, sell_cells, buy_cells)
+
+    def _place_grid(self, api, p, sell_cells, buy_cells):
+        for c in sell_cells:
+            c["cost"] = c["qty"] * p * (1 + self.fee)
+            self._put(api, c, "Sell", q(c["qty"] * (1 - self.fee_buf), self.bstep))
+        for c in buy_cells:
+            self._put(api, c, "Buy", c["qty"])
+        self.say("info", f"выставлено ордеров: {len(self.orders)}")
+
+    def _setup_futures(self, api, cfg, p, cap, sell_cells, buy_cells, need_base):
+        sym, L = self.symbol, self.levels
+        margin = self.bal.get("_margin", Decimal(0))
+        if margin < cap:
+            raise BybitError(f"Свободной маржи {margin:.2f} USDT, а капитал бота {cap} USDT. "
+                             f"Пополните счёт или уменьшите капитал.")
+        if api.position(sym):
+            raise BybitError(f"По {sym} уже есть открытая позиция. Закройте её или выберите другую пару.")
+        api.set_leverage(sym, self.lev)
+        liq_move = 100 / self.lev
+        rng = float(cfg["range_pct"])
+        self.say("info", f"фьючерсы, плечо {self.lev}x, объём сетки {cap * self.lev:.0f} USDT, " + self._trail_text())
+        if liq_move < rng * 1.2:
+            self.say("err", f"плечо {self.lev}x: ликвидация примерно при движении на {liq_move:.1f}%, "
+                            f"а диапазон ±{rng}%. Бот закроет позицию раньше ликвидации.")
+        if need_base > 0:
+            got, spent = self._chase(api, "Buy", q(need_base, self.bstep))
+            self.say("buy", f"лонг быстрой лимиткой {got} {self.base_coin} для верхних ордеров")
+            if got > 0:
+                p = spent / got
+        _, self.bid, self.ask = api.bbo(sym)
+        self._place_grid(api, p, sell_cells, buy_cells)
+
+    def _close_position(self, api):
+        pos = api.position(self.symbol)
+        if not pos:
+            self.say("info", "открытой позиции нет")
+            return
+        side = "Sell" if pos["side"] == "Buy" else "Buy"
+        api.place(self.symbol, side, pos["size"], market=True, reduce_only=True)
+        self.say("info", f"позиция {pos['size']} {self.base_coin} закрыта по рынку, "
+                         f"нереализованный PnL был {float(pos.get('unrealisedPnl') or 0):.2f} USDT")
+        self.pos = None
+
+    # ---------- уровни с абсолютным номером: сетка может сдвигаться бесконечно ----------
+    def lv(self, k):
+        if k not in self._lv:
+            self._lv[k] = q(Decimal(repr(self.lo0 * self.r ** k)), self.tick)
+        return self._lv[k]
+
+    def _refresh_levels(self):
+        with self.lock:
+            self.levels = [self.lv(k) for k in range(self.kmin, self.kmin + self.n)]
+
+    def _trail_text(self):
+        up = "вверх" + (f" до {self.up_limit}" if self.up_limit else "") if self.trail_up else ""
+        dn = "вниз" + (f" до {self.dn_limit}" if self.dn_limit else "") if self.trail_down else ""
+        both = " и ".join(x for x in (up, dn) if x)
+        return "трейлинг " + both if both else "без трейлинга"
+
+    def _order_of(self, k):
+        for oid, o in self.orders.items():
+            if o["cell"]["i"] == k:
+                return oid, o
+        return None, None
+
+    def _can_trail_down(self):
+        return self.trail_down and (not self.dn_limit or self.lv(self.kmin - 1) >= self.dn_limit)
+
+    def _can_trail_up(self):
+        return self.trail_up and (not self.up_limit or self.lv(self.kmin + self.n) <= self.up_limit)
+
+    def _trail(self, api, p):
+        bottom, top = self.lv(self.kmin), self.lv(self.kmin + self.n - 1)
+        self.out_up = self.out_up + 1 if p > top else 0
+        self.out_dn = self.out_dn + 1 if p < bottom else 0
+        steps = 0
+        while steps < TRAIL_MAX_STEPS and self.out_up >= TRAIL_CONFIRM and self._can_trail_up() \
+                and p > self.lv(self.kmin + self.n - 1):
+            if not self._shift_up(api, p):
+                break
+            steps += 1
+        while steps < TRAIL_MAX_STEPS and self.out_dn >= TRAIL_CONFIRM and self._can_trail_down() \
+                and p < self.lv(self.kmin):
+            if not self._shift_down(api, p):
+                break
+            steps += 1
+        if steps:
+            self._refresh_levels()
+
+    def _shift_up(self, api, p):
+        """Цена выше сетки: снимаем самый нижний ордер на покупку и переносим ячейку наверх."""
+        oid, o = self._order_of(self.kmin)
+        if not o or o["side"] != "Buy":
+            return False
+        if self.cat == "spot" and q(o["qty"] * o["price"] / p * (1 - self.fee_buf), self.bstep) < self.min_qty:
+            self.say("err", "сдвиг вверх: объём ячейки меньше минимума биржи, трейлинг вверх выключен")
+            self.trail_up = False
+            return False
         try:
-            bybit("/v5/account/wallet-balance", query={"accountType": "UNIFIED"}, auth=True)
-            log(f"ключ Bybit приймається ({CFG.env})")
-        except BybitError as exc:
-            log(f"УВАГА: ключ не підходить до {CFG.env} ({exc}). Перевірте BYBIT_ENV = mainnet/testnet")
-        if CFG.env == "mainnet":
-            log("MAINNET: лімітки реальні")
-        threading.Thread(target=autopilot_loop, name="autopilot", daemon=True).start()
-        if auto_cfg()["on"]:
-            log("автопілот увімкнений (після перезапуску продовжує)")
+            api.cancel(self.symbol, oid)
+        except BybitError:
+            return False  # ордер успел исполниться, разберёмся на следующей проверке
+        with self.lock:
+            self.orders.pop(oid, None)
+            self.cells.pop(self.kmin, None)
+            self.kmin += 1
+        freed = o["qty"] * o["price"]
+        k = self.kmin + self.n - 2
+        want = o["qty"] if self.cat == "linear" else q(freed / p * (1 - self.fee_buf), self.bstep)
+        got, spent = self._chase(api, "Buy", want)
+        if got <= 0:
+            self.say("err", "сдвиг вверх: не удалось купить, ячейка вернётся при следующем сдвиге")
+            return False
+        qty = got if self.cat == "linear" else q(got * (1 - self.fee_buf), self.bstep)
+        cell = {"i": k, "qty": qty, "cost": spent * (1 + self.fee)}
+        self.cells[k] = cell
+        self._put(api, cell, "Sell", qty)
+        self.shift_up += 1
+        self.fills.append({"t": int(time.time() * 1000), "p": float(p), "k": "buy"})
+        self.say("info", f"трейлинг ↑ сетка сдвинута: {self.lv(self.kmin)} – {self.lv(self.kmin + self.n - 1)}")
+        return True
+
+    def _shift_down(self, api, p):
+        """Цена ниже сетки: продаём монету самой верхней ячейки и ставим новую покупку ниже."""
+        ktop = self.kmin + self.n - 2
+        oid, o = self._order_of(ktop)
+        if not o or o["side"] != "Sell":
+            return False
+        if self.cat == "spot":
+            est = q(o["qty"] * p * (1 - self.fee) / self.lv(self.kmin - 1), self.bstep)
+            if est < self.min_qty or o["qty"] * p < self.min_amt:
+                self.say("err", "сдвиг вниз: объём ячейки меньше минимума биржи, трейлинг вниз выключен")
+                self.trail_down = False
+                return False
+        try:
+            api.cancel(self.symbol, oid)
+        except BybitError:
+            return False
+        with self.lock:
+            self.orders.pop(oid, None)
+            cell = self.cells.pop(ktop)
+        sold, money = self._chase(api, "Sell", o["qty"], reduce_only=(self.cat == "linear"))
+        got = money * (1 - self.fee)
+        loss = float(got - cell["cost"] * sold / cell["qty"]) if sold else 0.0
+        self.trail_pnl += loss
+        self.profit += loss
+        with self.lock:
+            self.kmin -= 1
+        k = self.kmin
+        qty = cell["qty"] if self.cat == "linear" else q(got / self.lv(k), self.bstep)
+        cell = {"i": k, "qty": qty, "cost": qty * self.lv(k) * (1 + self.fee)}
+        self.cells[k] = cell
+        self._put(api, cell, "Buy", qty)
+        self.shift_dn += 1
+        self.fills.append({"t": int(time.time() * 1000), "p": float(p), "k": "sell"})
+        self.say("info", f"трейлинг ↓ сетка сдвинута: {self.lv(self.kmin)} – {self.lv(self.kmin + self.n - 1)}",
+                 round(loss, 4))
+        return True
+
+    def _chase(self, api, side, qty, reduce_only=False):
+        """Быстрая лимитка вместо маркета: Post-Only по лучшей цене стакана, переставляется за ценой.
+        Платим мейкерскую комиссию. Что не исполнилось за ~15 секунд, добирается маркетом.
+        Возвращает (исполнено монет, потрачено/получено в USDT)."""
+        sym, done, money = self.symbol, Decimal(0), Decimal(0)
+        for _ in range(CHASE_TRIES):
+            left = q(qty - done, self.bstep)
+            if left < self.min_qty:
+                break
+            _, bid, ask = api.bbo(sym)
+            px = bid if side == "Buy" else ask
+            if left * px < self.min_amt:
+                break
+            try:
+                oid = api.place(sym, side, left, px, reduce_only=reduce_only)
+            except BybitError as e:
+                self.say("err", "быстрая лимитка: " + str(e))
+                break
+            time.sleep(CHASE_WAIT)
+            try:
+                api.cancel(sym, oid)
+            except BybitError:
+                pass  # уже исполнилась или отклонена
+            h = None
+            for _ in range(3):
+                h = api.order(sym, oid)
+                if h and h["orderStatus"] not in ("New", "PartiallyFilled", "Untriggered"):
+                    break
+                time.sleep(0.3)
+            f = Decimal(h.get("cumExecQty") or "0") if h else Decimal(0)
+            if f > 0:
+                done += f
+                money += f * (Decimal(h.get("avgPrice") or "0") or px)
+                self.maker_n += 1
+        left = q(qty - done, self.bstep)
+        if left >= self.min_qty:
+            _, bid, ask = api.bbo(sym)
+            px = ask if side == "Buy" else bid
+            if left * px >= self.min_amt:
+                api.place(sym, side, left, market=True, reduce_only=reduce_only)
+                done += left
+                money += left * px
+                self.taker_n += 1
+                self.say("info", f"лимитка не успела, остаток {left} {self.base_coin} добран маркетом")
+        return done, money
+
+    def _put(self, api, cell, side, qty):
+        i = cell["i"]
+        price = self.lv(i + 1) if side == "Sell" else self.lv(i)
+        # если уровень уже «за ценой», не берём ликвидность: ставим по лучшей цене стакана (мейкер)
+        if side == "Buy" and self.ask and price >= self.ask:
+            price = self.bid
+        elif side == "Sell" and self.bid and price <= self.bid:
+            price = self.ask
+        oid = api.place(self.symbol, side, qty, price)
+        with self.lock:
+            self.orders[oid] = {"cell": cell, "side": side, "qty": qty, "price": price}
+
+    def _tick(self, api):
+        p, self.bid, self.ask = api.bbo(self.symbol)
+        with self.lock:
+            self.price = p
+            self.hist.append({"t": int(time.time() * 1000), "p": float(p)})
+            del self.hist[:-1500]
+        if not self._can_trail_down() and p < self.lv(self.kmin) * (1 - STOP_BELOW):
+            why = "достигнут предел трейлинга вниз, " if self.trail_down else ""
+            self.error = (f"Цена {p}: {why}ушла ниже сетки более чем на {int(STOP_BELOW*100)}%. "
+                          f"Бот остановлен для защиты.")
+            self.running = False
+            return
+        if self.cat == "linear":
+            self.pos = api.position(self.symbol)
+            liq = Decimal(self.pos.get("liqPrice") or "0") if self.pos else Decimal(0)
+            if liq > 0:
+                entry = Decimal(self.pos.get("avgPrice") or p)
+                long_ = self.pos.get("side") == "Buy"
+                left = (p - liq) / (entry - liq) if long_ and entry != liq else \
+                       (liq - p) / (liq - entry) if (not long_) and liq != entry else Decimal(1)
+                if left < LIQ_GUARD:
+                    self.error = (f"Цена {p} близко к ликвидации ({liq}). Позиция закрыта, бот остановлен.")
+                    self.running = False
+                    return
+        open_ids = api.open_ids(self.symbol)
+        for oid, o in list(self.orders.items()):
+            if oid in open_ids:
+                continue
+            h = api.order(self.symbol, oid)
+            if not h:
+                continue
+            st = h["orderStatus"]
+            if st not in ("Filled", "Cancelled", "Rejected", "Deactivated", "PartiallyFilledCanceled"):
+                continue
+            with self.lock:
+                self.orders.pop(oid, None)
+            c = o["cell"]
+            filled = Decimal(h.get("cumExecQty") or "0")
+            avg = Decimal(h.get("avgPrice") or "0") or o["price"]
+            if st == "Filled" or (st == "PartiallyFilledCanceled" and filled > 0 and o["side"] == "Sell"):
+                self._on_fill(api, c, o, filled, avg)
+            else:
+                if "PostOnly" not in str(h.get("rejectReason", "")) + str(h.get("cancelType", "")):
+                    self.say("info", f"ордер {o['side']} {o['price']} отменён вне бота, выставляю заново")
+                if c["i"] in self.cells:
+                    self._put(api, c, o["side"], o["qty"])
+        if self.radar and self._guard(api, p) == "exit":
+            return
+        if not self.guard:
+            self._trail(api, p)
+
+    # ---------- ранняя защита ----------
+    def _guard(self, api, p):
+        try:
+            m = self.radar.update()
+        except BybitError as e:
+            self.radar_errs = getattr(self, "radar_errs", 0) + 1
+            if self.radar_errs in (1, 20) or self.radar_errs % 200 == 0:
+                self.say("err", f"радар без данных ({self.radar_errs} раз): {e}")
+            return
+        self.radar_errs = 0
+        if not m.get("warm"):
+            return
+        alert, calm = RADAR_SENS[self.radar_sens]
+        why = lambda: (f"принты ×{m['speed_x']}, объём ×{m['burst']}, дельта {m['delta']:+.2f}, "
+                       f"цена 60с {m['move60']:+.2f}%, стакан {m['imb']:+.2f}")
+        if self.guard is None:
+            if m["dump"] >= alert:
+                self._pause(api, "dump", "Buy", f"ранний сигнал ДАМПА ({m['dump']}): " + why())
+            elif m["pump"] >= alert:
+                self._pause(api, "pump", "Sell", f"ранний сигнал ПАМПА ({m['pump']}): " + why())
+            return
+        if self.guard == "dump" and self.radar_mode == "exit" and m["dump"] >= RADAR_EXIT:
+            self.error = f"Аварийный выход: сильный дамп ({m['dump']}). " + why()
+            self.exit_spot = True
+            self.running = False
+            return "exit"
+        score = m["dump"] if self.guard == "dump" else m["pump"]
+        self.calm = self.calm + 1 if score < calm else 0
+        if self.calm >= RADAR_CALM_TICKS:
+            self._resume(api, "рынок успокоился")
+        elif time.time() - self.guard_t > RADAR_MAX_PAUSE:
+            self._resume(api, "пауза длится 30 минут")
+
+    def _pause(self, api, kind, side, text):
+        n = 0
+        for oid, o in list(self.orders.items()):
+            if o["side"] != side:
+                continue
+            try:
+                api.cancel(self.symbol, oid)
+            except BybitError:
+                continue  # успел исполниться — обработаем как обычно
+            with self.lock:
+                self.orders.pop(oid, None)
+                self.paused[o["cell"]["i"]] = {"cell": o["cell"], "side": side, "sell_qty": o["qty"]}
+            n += 1
+        self.guard, self.guard_t, self.calm = kind, time.time(), 0
+        what = "покупки" if side == "Buy" else "продажи"
+        self.say("err", f"{text}. Сняты {what}: {n}")
+
+    def _resume(self, api, why):
+        n = 0
+        for k, c in sorted(self.paused.items()):
+            if k not in self.cells:
+                continue
+            self._put(api, c["cell"], c["side"], c["sell_qty"])
+            n += 1
+        with self.lock:
+            self.paused = {}
+        self.say("info", f"{why}, защита снята, вернул ордеров: {n}")
+        self.guard, self.calm = None, 0
+
+    def _on_fill(self, api, c, o, filled, avg):
+        self.trades += 1
+        self.maker_n += 1
+        t = int(time.time() * 1000)
+        if o["side"] == "Buy":
+            c["cost"] = filled * avg * (1 + self.fee)
+            self.fills.append({"t": t, "p": float(avg), "k": "buy"})
+            self.say("buy", f"{filled} {self.base_coin} по {avg}")
+            self._put(api, c, "Sell", q(filled * (1 - self.fee_buf), self.bstep))
+        else:
+            got = filled * avg * (1 - self.fee)
+            pr = float(got - c["cost"])
+            self.profit += pr
+            self.fills.append({"t": t, "p": float(avg), "k": "sell"})
+            self.say("sell", f"{filled} {self.base_coin} по {avg}", round(pr, 4))
+            self._put(api, c, "Buy", c["qty"])
+
+
+BOT = Bot()
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def _auth_ok(self):
+        if not APP_PASSWORD:
+            return True
+        h = self.headers.get("Authorization", "")
+        if h.startswith("Basic "):
+            try:
+                _, _, pw = base64.b64decode(h[6:]).decode("utf-8").partition(":")
+                return hmac.compare_digest(pw, APP_PASSWORD)
+            except Exception:
+                return False
+        return False
+
+    def _deny(self):
+        self.send_response(401)
+        self.send_header("WWW-Authenticate", 'Basic realm="Grid bot", charset="UTF-8"')
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def _locked(self):
+        """На сервере без пароля управлять ботом нельзя: страница была бы открыта всему интернету."""
+        return ON_SERVER and not APP_PASSWORD
+
+    def _send(self, code, body, ctype="application/json; charset=utf-8"):
+        data = body if isinstance(body, bytes) else json.dumps(body, ensure_ascii=False).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):
+        if self.path == "/api/ping":
+            return self._send(200, {"ok": True, "running": BOT.running})
+        if not self._auth_ok():
+            return self._deny()
+        if self.path == "/":
+            self._send(200, PAGE.encode(), "text/html; charset=utf-8")
+        elif self.path == "/api/state":
+            self._send(200, BOT.state())
+        elif self.path == "/api/config":
+            cfg = load_cfg()
+            cfg["has_secret"] = bool(cfg.pop("api_secret"))
+            cfg["env_keys"] = bool(ENV_KEY and ENV_SECRET)
+            cfg["locked"] = self._locked()
+            if cfg["env_keys"]:
+                cfg["api_key"] = cfg["api_key"][:4] + "…" + cfg["api_key"][-3:]
+            self._send(200, cfg)
+        else:
+            self._send(404, {"error": "not found"})
+
+    def do_POST(self):
+        if not self._auth_ok():
+            return self._deny()
+        if self._locked():
+            return self._send(403, {"error": "Задайте переменную APP_PASSWORD на Railway"})
+        n = int(self.headers.get("Content-Length") or 0)
+        body = json.loads(self.rfile.read(n) or b"{}")
+        if self.path == "/api/start":
+            cfg = load_cfg()
+            for k in DEFAULT_CFG:
+                v = body.get(k)
+                if k in ("api_key", "api_secret") and ENV_KEY and ENV_SECRET:
+                    continue
+                if v not in (None, "") and not (k == "api_secret" and v == "********"):
+                    cfg[k] = v
+            save_cfg(cfg)
+            BOT.start(cfg)
+            self._send(200, {"ok": True})
+        elif self.path == "/api/stop":
+            BOT.stop()
+            self._send(200, {"ok": True})
+        else:
+            self._send(404, {"error": "not found"})
+
+
+PAGE = r"""<!doctype html><html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Сеточный бот Bybit</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Unbounded:wght@500;700&family=Onest:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+<style>
+:root{--bg:#eef1ee;--panel:#f8faf8;--fg:#17201b;--muted:#5d6b63;--line:#d3dbd5;--buy:#1d8a59;--sell:#c2412d;--warn:#b7791f;--ink:#17201b;--ink-fg:#f8faf8;
+--display:"Unbounded",system-ui,sans-serif;--body:"Onest",system-ui,sans-serif;--mono:"JetBrains Mono",ui-monospace,monospace}
+@media (prefers-color-scheme:dark){:root{--bg:#111614;--panel:#171e1b;--fg:#e4ebe6;--muted:#8c9a92;--line:#2a3530;--buy:#3fbf85;--sell:#ec6a54;--warn:#e0a84a;--ink:#e4ebe6;--ink-fg:#111614;color-scheme:dark}}
+*{box-sizing:border-box}[hidden]{display:none!important}
+body{margin:0;background:var(--bg);color:var(--fg);font-family:var(--body);font-size:15px;line-height:1.5}
+.wrap{max-width:860px;margin:0 auto;padding:28px 16px 48px;display:grid;gap:22px}
+header{display:flex;justify-content:space-between;align-items:baseline;gap:12px;flex-wrap:wrap}
+.pair{font-family:var(--display);font-weight:700;font-size:20px}
+.tag{font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted)}
+.tag.live{color:var(--sell);font-weight:600}
+.status{display:inline-flex;align-items:center;gap:8px;font-size:13px;color:var(--muted)}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--muted)}
+.on .dot{background:var(--buy);box-shadow:0 0 0 4px color-mix(in srgb,var(--buy) 20%,transparent)}
+.hero{display:flex;justify-content:space-between;align-items:flex-end;gap:20px;flex-wrap:wrap}
+.lbl{font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted)}
+.pnl{font-family:var(--display);font-weight:500;font-size:clamp(40px,9vw,68px);line-height:1;font-variant-numeric:tabular-nums}
+.pnl.up{color:var(--buy)}.pnl.down{color:var(--sell)}
+.price{font-family:var(--mono);font-size:22px;text-align:right;font-variant-numeric:tabular-nums}
+.chart{background:var(--panel);border:1px solid var(--line);border-radius:6px;height:300px}
+canvas{width:100%;height:100%;display:block}
+#go{font-family:var(--display);font-weight:500;font-size:18px;border:0;border-radius:6px;padding:20px;background:var(--ink);color:var(--ink-fg);cursor:pointer}
+#go.stop{background:transparent;color:var(--fg);box-shadow:inset 0 0 0 2px var(--fg)}
+#go:disabled{opacity:.5;cursor:wait}
+#go:focus-visible{outline:3px solid var(--buy);outline-offset:3px}
+.err{border:1px solid var(--sell);color:var(--sell);border-radius:6px;padding:12px 14px}
+.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:1px;background:var(--line);border:1px solid var(--line);border-radius:6px;overflow:hidden}
+.stat{background:var(--panel);padding:12px 14px;min-width:0}
+.stat b{display:block;font-family:var(--mono);font-weight:500;font-size:17px;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
+.stat span{font-size:12px;color:var(--muted)}
+@media (max-width:560px){.stats{grid-template-columns:repeat(2,1fr)}}
+details{background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:12px 14px}
+summary{cursor:pointer;font-weight:600}
+.form{display:grid;grid-template-columns:repeat(2,1fr);gap:12px;margin-top:14px}
+.form label{display:grid;gap:4px;font-size:12px;color:var(--muted);min-width:0}
+.form .full{grid-column:1/-1}
+input,select{font:inherit;font-family:var(--mono);font-size:14px;padding:9px 10px;border:1px solid var(--line);border-radius:4px;background:var(--bg);color:var(--fg);width:100%}
+@media (max-width:560px){.form{grid-template-columns:1fr}}
+.log{font-family:var(--mono);font-size:13px;max-height:260px;overflow:auto}
+.log div{display:grid;grid-template-columns:70px 64px 1fr auto;gap:10px;padding:5px 0;border-bottom:1px solid var(--line)}
+.b{color:var(--buy)}.s{color:var(--sell)}.i{color:var(--muted)}.e{color:var(--sell)}
+.note{font-size:13px;color:var(--muted)}
+.warn{font-size:13px;color:var(--warn);border-left:3px solid var(--warn);padding:6px 10px}
+input[type=range]{padding:0;border:0;background:none;accent-color:var(--fg)}
+#levval{font-family:var(--mono);color:var(--fg)}
+.chk{display:flex!important;align-items:center;gap:8px;font-size:14px!important;color:var(--fg)!important}
+.chk input{width:auto;accent-color:var(--fg)}
+.gridline{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;font-family:var(--mono);font-size:13px;color:var(--muted);margin-top:-12px}
+.radar{background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:14px;display:grid;gap:14px}
+.rhead{display:flex;justify-content:space-between;align-items:center}
+.pill{font-size:12px;font-weight:600;padding:3px 10px;border-radius:99px;background:var(--line);color:var(--muted)}
+.pill.ok{background:color-mix(in srgb,var(--buy) 16%,transparent);color:var(--buy)}
+.pill.warn{background:color-mix(in srgb,var(--warn) 18%,transparent);color:var(--warn)}
+.pill.bad{background:var(--sell);color:var(--ink-fg)}
+.bars{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+@media (max-width:560px){.bars{grid-template-columns:1fr}}
+.bt{display:flex;justify-content:space-between;font-size:13px;color:var(--muted)}
+.bt b{font-family:var(--mono);color:var(--fg)}
+.track{position:relative;height:8px;border-radius:4px;background:var(--line);margin-top:6px}
+.track i{position:absolute;left:0;top:0;bottom:0;border-radius:4px;width:0;transition:width .4s}
+.track i.dn{background:var(--sell)}.track i.up{background:var(--buy)}
+.track em{position:absolute;top:-3px;bottom:-3px;width:2px;background:var(--fg);opacity:.5}
+.chips{display:grid;grid-template-columns:repeat(auto-fill,minmax(130px,1fr));gap:8px 16px}
+.chips div{min-width:0}.chips span{display:block;font-size:11px;color:var(--muted)}
+.chips b{font-family:var(--mono);font-weight:500;font-size:14px;font-variant-numeric:tabular-nums}
+@media (prefers-reduced-motion:reduce){.track i{transition:none}}
+.posrow{display:none}.fut .posrow{display:grid}
+</style></head><body>
+<div class="wrap">
+<header><div><div class="pair" id="pair">—</div><div class="tag" id="net">—</div></div>
+<div class="status" id="status"><span class="dot"></span><span id="statusText">Остановлен</span></div></header>
+<section class="hero"><div><div class="lbl">Прибыль сетки</div><div class="pnl" id="pnl">+0.00</div></div>
+<div class="price"><div class="lbl">Цена</div><span id="price">—</span></div></section>
+<div class="chart"><canvas id="cv"></canvas></div>
+<div class="gridline"><span id="grange">Сетка: —</span><span id="gtrail">Трейлинг: —</span><span id="gfee">Лимиток: 0 · маркетом: 0</span></div>
+<section class="radar" id="radarbox">
+<div class="rhead"><span class="lbl">Радар</span><span class="pill" id="rpill">выключен</span></div>
+<div class="bars">
+<div class="bar"><div class="bt"><span>Риск дампа</span><b id="rdv">—</b></div><div class="track"><i id="rd" class="dn"></i><em id="rth1"></em></div></div>
+<div class="bar"><div class="bt"><span>Риск пампа</span><b id="rpv">—</b></div><div class="track"><i id="rp" class="up"></i><em id="rth2"></em></div></div>
+</div>
+<div class="chips">
+<div><span>Принтов/с</span><b id="m_tps">—</b></div>
+<div><span>Объём 30с</span><b id="m_burst">—</b></div>
+<div><span>Дельта покуп./прод.</span><b id="m_delta">—</b></div>
+<div><span>Цена 60с</span><b id="m_move">—</b></div>
+<div><span>Стакан ±0.5%</span><b id="m_imb">—</b></div>
+<div><span>Открытый интерес 10м</span><b id="m_oi">—</b></div>
+<div><span>Фандинг</span><b id="m_fund">—</b></div>
+</div>
+</section>
+<div class="err" id="err" hidden></div>
+<button id="go" type="button">Запустить бота</button>
+<section class="stats">
+<div class="stat"><span>Сделок</span><b id="tc">0</b></div>
+<div class="stat"><span>Ордеров в стакане</span><b id="oc">0</b></div>
+<div class="stat"><span id="qlab">Свободно USDT</span><b id="qb">—</b></div>
+<div class="stat"><span id="blab">Свободно монет</span><b id="bb">—</b></div>
+</section>
+<section class="stats posrow" id="posbox">
+<div class="stat"><span>Позиция</span><b id="ps">—</b></div>
+<div class="stat"><span>Вход</span><b id="pe">—</b></div>
+<div class="stat"><span>Ликвидация</span><b id="pl" class="s">—</b></div>
+<div class="stat"><span>Нереализ. PnL</span><b id="pu">—</b></div>
+</section>
+<details id="set"><summary>Настройки и API ключ</summary>
+<div class="form">
+<div class="full note" id="envkeys" hidden>API ключ взят из переменных сервера (BYBIT_API_KEY): <b id="envkeyval"></b></div>
+<label class="full" id="kbox1">API ключ<input id="api_key" autocomplete="off"></label>
+<label class="full" id="kbox2">API секрет<input id="api_secret" type="password" autocomplete="off"></label>
+<label>Сеть<select id="network"><option value="testnet">Testnet (тест)</option><option value="demo">Demo trading</option><option value="mainnet">Mainnet (реальные деньги)</option></select></label>
+<label>Рынок<select id="market"><option value="spot">Спот (без плеча)</option><option value="futures">Фьючерсы USDT (с плечом)</option></select></label>
+<label>Пара<input id="symbol"></label>
+<label id="levbox">Плечо: <b id="levval">1x</b><input id="leverage" type="range" min="1" max="100" step="1"></label>
+<div class="full warn" id="levwarn" hidden></div>
+<label>Ранняя защита от дампа/пампа<select id="radar"><option value="off">Выключена</option><option value="pause">Снимать ордера на время всплеска</option><option value="exit">Снимать ордера + аварийный выход при сильном дампе</option></select></label>
+<label>Чувствительность<select id="radar_sens"><option value="low">Низкая (реже, только сильные всплески)</option><option value="mid">Средняя</option><option value="high">Высокая (раньше, больше ложных)</option></select></label>
+<label class="chk"><input type="checkbox" id="trail_up"> Трейлинг вверх</label>
+<label class="chk"><input type="checkbox" id="trail_down"> Трейлинг вниз</label>
+<label>Предел вверх, цена (0 = без предела)<input id="trail_up_limit" type="number" min="0" step="any"></label>
+<label>Предел вниз, цена (0 = без предела)<input id="trail_down_limit" type="number" min="0" step="any"></label>
+<p class="full note" style="margin:0">Вверх: цена вышла над сеткой, бот снимает нижнюю покупку, докупает по рынку и сдвигает сетку на шаг выше. Вниз: цена ушла под сетку, бот продаёт монету верхней ячейки (фиксирует убыток) и ставит новую покупку ниже. Сдвиг только если цена держится за границей 2 проверки подряд.</p>
+<label>Капитал (маржа), USDT<input id="capital" type="number" min="10"></label>
+<label>Диапазон ± %<input id="range_pct" type="number" min="1" max="50" step="0.5"></label>
+<label>Уровней<input id="levels" type="number" min="3" max="50"></label>
+</div>
+<p class="note">Ключ создайте на Bybit только с правом «Спот торговля», без вывода средств, лучше с привязкой к вашему IP. Сохраняется в gridbot_config.json рядом с программой.</p>
+</details>
+<section><div class="lbl" style="margin-bottom:6px">Журнал</div><div class="log" id="log"></div></section>
+<p class="note">При остановке бот снимает все свои ордера. На споте купленные монеты остаются на счёте, на фьючерсах позиция закрывается по рынку. Бот останавливается сам, если цена падает на 5% ниже сетки, а на фьючерсах ещё и когда до ликвидации остаётся треть пути.</p>
+</div>
+<script>
+const $=id=>document.getElementById(id);
+const F=["api_key","api_secret","network","market","leverage","symbol","capital","range_pct","levels","trail_up","trail_down","trail_up_limit","trail_down_limit","radar","radar_sens"];
+const CHK=["trail_up","trail_down"];
+function levUI(){const fut=$("market").value==="futures",lv=Number($("leverage").value)||1,rng=Number($("range_pct").value)||8;
+ $("levbox").hidden=!fut;$("levval").textContent=lv+"x";const w=$("levwarn");
+ if(!fut){w.hidden=true;return}
+ const liq=100/lv;w.hidden=lv<=3&&liq>rng*1.2;
+ w.textContent=`Объём сетки ${(Number($("capital").value)*lv||0).toLocaleString("ru-RU")} USDT. Ликвидация примерно при движении цены на ${liq.toFixed(1)}%`+
+  (liq<rng*1.2?`, это внутри диапазона ±${rng}%. Бот закроет позицию раньше, но убыток будет почти весь капитал. Уменьшите плечо или диапазон.`:". Комиссии и просадки умножаются на плечо.");}
+["market","leverage","range_pct","capital"].forEach(k=>$(k).addEventListener("input",levUI));
+const fmt=(n,d=2)=>n==null?"—":Number(n).toLocaleString("ru-RU",{minimumFractionDigits:d,maximumFractionDigits:d});
+let S=null,LOCK="";
+fetch("/api/config").then(r=>r.json()).then(c=>{F.forEach(k=>{if(k==="api_secret"){$(k).value=c.has_secret?"********":""}else if(CHK.includes(k)){$(k).checked=!!c[k]}else $(k).value=c[k]});
+ if(c.env_keys){$("envkeys").hidden=false;$("envkeyval").textContent=c.api_key;$("kbox1").hidden=$("kbox2").hidden=true}
+ else if(!c.api_key||!c.has_secret)$("set").open=true;
+ if(c.locked){LOCK="На сервере не задан пароль. Добавьте переменную APP_PASSWORD в Railway → Variables, иначе бот был бы открыт всему интернету.";$("go").disabled=true} $("pair").textContent=c.symbol; netTag(c.network);levUI()});
+function netTag(n,m,lv){const t=$("net");m=m||$("market").value;lv=lv||$("leverage").value;
+ const mk=m==="futures"||m==="linear"?`фьючерсы ${lv}x`:"спот";
+ t.textContent={testnet:"Bybit testnet",demo:"Bybit demo",mainnet:"Bybit · реальные деньги"}[n]+" · "+mk;t.className="tag"+(n==="mainnet"?" live":"")}
+$("market").addEventListener("input",()=>netTag($("network").value));$("leverage").addEventListener("input",()=>netTag($("network").value));
+$("network").onchange=e=>netTag(e.target.value);
+$("go").onclick=async()=>{
+ $("go").disabled=true;
+ if(S&&S.running){await fetch("/api/stop",{method:"POST"})}
+ else{const b={};F.forEach(k=>b[k]=CHK.includes(k)?$(k).checked:$(k).value);["capital","range_pct","levels","leverage","trail_up_limit","trail_down_limit"].forEach(k=>b[k]=Number(b[k])||0);
+  await fetch("/api/start",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(b)});$("set").open=false}
+ poll();
+};
+async function poll(){try{S=await (await fetch("/api/state")).json();render()}catch(e){$("statusText").textContent="Программа не отвечает"}}
+setInterval(poll,2000);poll();
+function render(){
+ const g=$("go");g.disabled=S.busy||!!LOCK;g.textContent=S.running?(S.busy?"Запускаю…":"Остановить"):(S.busy?"Останавливаю…":"Запустить бота");
+ g.classList.toggle("stop",S.running&&!S.busy);
+ $("status").classList.toggle("on",S.running&&!S.busy);$("statusText").textContent=S.status;
+ if(S.symbol){$("pair").textContent=S.base+" / "+S.quote;netTag(S.network,S.market,S.leverage)}
+ const fut=S.market==="linear";document.body.classList.toggle("fut",fut&&!!S.symbol);
+ if(fut){const P=S.pos;$("ps").textContent=P?(P.side==="Buy"?"Лонг ":"Шорт ")+P.size:"нет";
+  $("pe").textContent=P?fmt(P.entry):"—";$("pl").textContent=P&&P.liq?fmt(P.liq):"—";
+  $("pu").textContent=P?(P.upnl>=0?"+":"")+fmt(P.upnl):"—";$("pu").className=P&&P.upnl<0?"s":"b";
+  $("qlab").textContent="Свободная маржа";$("qb").textContent=fmt(S.bal._margin)}
+ $("price").textContent=fmt(S.price,S.price&&S.price<10?4:2);
+ const p=$("pnl");p.textContent=(S.profit>=0?"+":"−")+fmt(Math.abs(S.profit))+" "+(S.quote||"USDT");
+ p.className="pnl"+(S.profit>0.0001?" up":S.profit<-0.0001?" down":"");
+ $("tc").textContent=S.trades;$("oc").textContent=S.open;
+ if(!fut){$("qlab").textContent="Свободно "+(S.quote||"USDT");$("qb").textContent=fmt(S.bal[S.quote])}
+ $("blab").textContent=fut?"Плечо":"Свободно "+(S.base||"монет");$("bb").textContent=fut?S.leverage+"x":fmt(S.bal[S.base],6);
+ const e=$("err");e.hidden=!(S.error||LOCK);e.textContent=LOCK||S.error;
+ if(S.levels.length){const L=S.levels,d=L[0]<10?4:0;$("grange").textContent=`Сетка: ${fmt(L[0],d)} – ${fmt(L[L.length-1],d)}`}
+ radarUI(S.radar);
+ if(S.fees)$("gfee").textContent=`Лимиток (мейкер): ${S.fees.maker} · маркетом: ${S.fees.taker}`;
+ const T=S.trail;$("gtrail").textContent=!S.symbol?"Трейлинг: —":(!T.up&&!T.down?"Трейлинг выключен":
+  `Трейлинг ${T.up?"↑":""}${T.down?"↓":""} · сдвигов ↑${T.nup} ↓${T.ndn}`+(T.pnl?` · итог сдвигов ${T.pnl>=0?"+":""}${fmt(T.pnl)}`:""));
+ $("log").innerHTML=S.log.map(l=>{const c={buy:"b",sell:"s",info:"i",err:"e"}[l.k],n={buy:"КУПИЛ",sell:"ПРОДАЛ",info:"БОТ",err:"ОШИБКА"}[l.k];
+  const v=l.v==null?"":`<span class="${l.v>=0?"b":"s"}">${l.v>=0?"+":""}${fmt(l.v,4)}</span>`;
+  return `<div><span class="i">${l.t}</span><span class="${c}">${n}</span><span>${esc(l.text)}</span>${v}</div>`}).join("");
+ draw();
+}
+const SENS={low:75,mid:60,high:48};
+function radarUI(R){
+ const pill=$("rpill"),sg=(v,d=2)=>(v>0?"+":"")+fmt(v,d);
+ const on=R&&R.mode!=="off"&&S.running;
+ if(!R||R.mode==="off"){pill.textContent="выключен";pill.className="pill"}
+ else if(!S.running){pill.textContent="ждёт запуска";pill.className="pill"}
+ else if(R.guard==="dump"){pill.textContent=`дамп: покупки сняты (${R.paused})`;pill.className="pill bad"}
+ else if(R.guard==="pump"){pill.textContent=`памп: продажи сняты (${R.paused})`;pill.className="pill bad"}
+ else if(!R.warm){pill.textContent="прогрев ~2 мин";pill.className="pill warn"}
+ else if(Math.max(R.dump||0,R.pump||0)>=35){pill.textContent="внимание";pill.className="pill warn"}
+ else{pill.textContent="спокойно";pill.className="pill ok"}
+ const th=SENS[$("radar_sens").value]||60;$("rth1").style.left=$("rth2").style.left=th+"%";
+ $("rd").style.width=(on?R.dump||0:0)+"%";$("rp").style.width=(on?R.pump||0:0)+"%";
+ $("rdv").textContent=on&&R.dump!=null?R.dump:"—";$("rpv").textContent=on&&R.pump!=null?R.pump:"—";
+ const has=on&&R.tps!=null;
+ $("m_tps").textContent=has?`${fmt(R.tps,1)} ×${fmt(R.speed_x,1)}`:"—";
+ $("m_burst").textContent=has?`×${fmt(R.burst,1)}`:"—";
+ $("m_delta").textContent=has?sg(R.delta*100,0)+"%":"—";
+ $("m_move").textContent=has?sg(R.move60)+"%":"—";
+ $("m_imb").textContent=has?(R.imb>0?"покуп. ":"продав. ")+fmt(Math.abs(R.imb*100),0)+"%":"—";
+ $("m_oi").textContent=has&&R.src==="linear"?sg(R.oi)+"%":"—";
+ $("m_fund").textContent=has&&R.src==="linear"?sg(R.funding*100,4)+"%":"—";
+ ["m_delta","m_move"].forEach(id=>{const v=id==="m_delta"?R&&R.delta:R&&R.move60;$(id).className=!has?"":v>0?"b":v<0?"s":""});
+}
+function esc(s){return String(s).replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"})[c])}
+const cv=$("cv"),ctx=cv.getContext("2d");
+function draw(){
+ const dpr=devicePixelRatio||1,w=cv.clientWidth,h=cv.clientHeight;
+ if(cv.width!==w*dpr||cv.height!==h*dpr){cv.width=w*dpr;cv.height=h*dpr}
+ ctx.setTransform(dpr,0,0,dpr,0,0);ctx.clearRect(0,0,w,h);
+ const cs=getComputedStyle(document.documentElement),col=n=>cs.getPropertyValue(n).trim();
+ if(!S||!S.hist.length){ctx.fillStyle=col("--muted");ctx.font='14px "Onest", sans-serif';ctx.textAlign="center";ctx.textBaseline="middle";
+  ctx.fillText("Здесь появится график цены и сетка после запуска",w/2,h/2);ctx.textAlign="left";return}
+ const H=S.hist,L=S.levels,padR=72,padY=14,pw=w-padR-8;
+ let mn=Math.min(...H.map(x=>x.p),...(L.length?[L[0]]:[])),mx=Math.max(...H.map(x=>x.p),...(L.length?[L[L.length-1]]:[]));
+ const m=(mx-mn)*.06||mx*.001;mn-=m;mx+=m;
+ const t0=H[0].t,t1=Math.max(H[H.length-1].t,t0+60000);
+ const Y=v=>padY+(1-(v-mn)/(mx-mn))*(h-2*padY),X=t=>8+(t-t0)/(t1-t0)*pw;
+ const p=S.price;ctx.font='11px "JetBrains Mono", monospace';ctx.textBaseline="middle";
+ L.forEach(v=>{const y=Y(v),c=v<p?col("--buy"):col("--sell");ctx.strokeStyle=c;ctx.globalAlpha=.35;ctx.setLineDash([4,4]);
+  ctx.beginPath();ctx.moveTo(8,y);ctx.lineTo(8+pw,y);ctx.stroke();ctx.setLineDash([]);ctx.globalAlpha=.85;ctx.fillStyle=c;ctx.fillText(fmt(v,v<10?4:0),w-padR+4,y)});
+ ctx.globalAlpha=1;ctx.beginPath();H.forEach((x,i)=>{i?ctx.lineTo(X(x.t),Y(x.p)):ctx.moveTo(X(x.t),Y(x.p))});
+ ctx.strokeStyle=col("--fg");ctx.lineWidth=1.6;ctx.stroke();
+ S.fills.filter(f=>f.t>=t0).forEach(f=>{const x=X(f.t),y=Y(f.p);ctx.fillStyle=f.k==="buy"?col("--buy"):col("--sell");ctx.beginPath();
+  if(f.k==="buy"){ctx.moveTo(x,y-1);ctx.lineTo(x-5,y+8);ctx.lineTo(x+5,y+8)}else{ctx.moveTo(x,y+1);ctx.lineTo(x-5,y-8);ctx.lineTo(x+5,y-8)}ctx.fill()});
+ const l=H[H.length-1];ctx.fillStyle=col("--fg");ctx.beginPath();ctx.arc(X(l.t),Y(l.p),3.5,0,7);ctx.fill();
+}
+addEventListener("resize",draw);
+</script></body></html>"""
+
+
+def shutdown(*_):
+    """Railway при перезапуске шлёт SIGTERM: аккуратно снимаем ордера, флаг автозапуска сохраняем."""
+    print("получен сигнал остановки, снимаю ордера…", flush=True)
+    BOT.stop(remember=False)
+    if BOT.thread:
+        BOT.thread.join(timeout=25)
+    sys.exit(0)
+
+
+def main():
+    host = "0.0.0.0" if ON_SERVER else "127.0.0.1"
+    srv = ThreadingHTTPServer((host, PORT), Handler)
+    signal.signal(signal.SIGTERM, shutdown)
+    if ON_SERVER:
+        print(f"Сеточный бот слушает порт {PORT}. Настройки: {CFG_PATH}", flush=True)
+        if not APP_PASSWORD:
+            print("ВНИМАНИЕ: не задан APP_PASSWORD — управление ботом заблокировано", flush=True)
+    else:
+        url = f"http://127.0.0.1:{PORT}"
+        print(f"Сеточный бот запущен: {url}  (Ctrl+C, чтобы выйти)")
+        threading.Timer(0.8, lambda: webbrowser.open(url)).start()
+    cfg = load_cfg()
+    if cfg.get("was_running") and cfg.get("api_key") and cfg.get("api_secret") and not (ON_SERVER and not APP_PASSWORD):
+        print("бот работал до перезапуска — запускаю снова", flush=True)
+        try:
+            Bybit(cfg["api_key"], cfg["api_secret"], cfg["network"],
+                  "linear" if cfg.get("market") == "futures" else "spot").cancel_all(cfg["symbol"].upper())
+        except Exception as e:
+            print("не удалось снять старые ордера:", e, flush=True)
+        BOT.start(cfg)
     try:
-        loop()
+        srv.serve_forever()
     except KeyboardInterrupt:
-        STOP.set()
-        log("Зупинено. Лімітки на біржі лишаються, стопи на позиціях теж.")
-        with LOCK:
-            save_state()
+        shutdown()
 
 
 if __name__ == "__main__":

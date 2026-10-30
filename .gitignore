@@ -1,5 +1,6 @@
 .env
 data/
+gridbot_config.json
+*.tmp
 __pycache__/
 *.pyc
-*.tmp
