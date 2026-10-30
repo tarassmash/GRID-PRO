@@ -60,7 +60,21 @@ def load(coin, month):
 
 
 # ---------------------------------------------------------------- симуляция
-def sim(O, H, L, C, rng, n, trail, fut):
+def estimate_tick(prices):
+    """Шаг цены биржи: самая маленькая разница между разными ценами."""
+    v = sorted(set(round(x, 12) for x in prices[:60000]))
+    diffs = [b - a for a, b in zip(v, v[1:]) if b - a > 0]
+    if not diffs:
+        return 0.0
+    d = min(diffs)
+    e = math.floor(math.log10(d))
+    for m in (1, 2, 5, 10):                     # округляем до «красивого» шага: 1, 2, 5 × 10^k
+        if d <= m * 10 ** e * 1.01:
+            return m * 10 ** e
+    return d
+
+
+def sim(O, H, L, C, rng, n, trail, fut, tick=0.0):
     """Один прогон сетки. Возвращает {плечо: результат}. Фьючерсы считаются один раз при 1x:
     все ордера масштабируются линейно, поэтому PnL при плече L = L × PnL(1x),
     а момент аварийного закрытия ищется отдельно для каждого плеча."""
@@ -70,7 +84,13 @@ def sim(O, H, L, C, rng, n, trail, fut):
     lo = p0 * (1 - rng)
     hi = p0 * (1 + rng)
     lnr = math.log(hi / lo) / (n - 1)
-    lv = lambda k: lo * math.exp(k * lnr)
+    if tick > 0:
+        lv = lambda k: max(round(lo * math.exp(k * lnr) / tick), 1) * tick
+    else:
+        lv = lambda k: lo * math.exp(k * lnr)
+    half = tick * 0.5
+    below = lambda x: min(x - half, x * (1 - EPS))   # покупка исполнится, если цена ушла ниже хотя бы на тик
+    above = lambda x: max(x + half, x * (1 + EPS))
     per = CAP / (n - 1)
     kmin = 0
     cash, coin, hold = CAP, 0.0, {}
@@ -93,7 +113,7 @@ def sim(O, H, L, C, rng, n, trail, fut):
 
     def move(b):
         nonlocal z, cash, coin, trades
-        while b < lv(z) * (1 - EPS):             # вниз через уровень покупки ячейки z
+        while b < below(lv(z)):                  # вниз через уровень покупки ячейки z
             if kmin <= z <= kmin + n - 2 and z not in hold:
                 x = lv(z)
                 q = per / x
@@ -102,7 +122,7 @@ def sim(O, H, L, C, rng, n, trail, fut):
                 hold[z] = q
                 trades += 1
             z -= 1
-        while b > lv(z + 1) * (1 + EPS):         # вверх через уровень продажи ячейки z
+        while b > above(lv(z + 1)):              # вверх через уровень продажи ячейки z
             q = hold.pop(z, None)
             if q is not None:
                 cash += q * lv(z + 1) * (1 - fee)
@@ -210,15 +230,23 @@ def configs(quick=False):
 
 
 def run_window(task):
-    coin, start_ts, O, H, L, C, quick = task
+    coin, start_ts, O, H, L, C, quick, tick, prev = task
     res = []
     hold = C[-1] / O[0] - 1
+    # что было за 3 дня до старта: для проверки фильтра «запускать только во флэте»
+    pre_chg = prev[-1] / prev[0] - 1 if prev else 0.0
+    pre_rng = max(prev) / min(prev) - 1 if prev else 0.0
+    hourly = prev[::60]
+    path = sum(abs(b / a - 1) for a, b in zip(hourly, hourly[1:]))
+    pre_chop = path / max(abs(pre_chg), 0.002)
     for fut, rng, n, tr, step in configs(quick):
-        for L_, r in sim(O, H, L, C, rng, n, tr, fut).items():
+        if tick and ((1 + rng) / (1 - rng)) ** (1 / (n - 1)) * O[0] - O[0] < 3 * tick:
+            continue                              # шаг сетки меньше трёх тиков — так бот не поставит
+        for L_, r in sim(O, H, L, C, rng, n, tr, fut, tick).items():
             res.append(dict(coin=coin, start=start_ts, market="futures" if fut else "spot", range=rng, levels=n,
                             step=round(step * 100, 3), trail=tr, lev=L_, ret=r["final"] / CAP - 1,
                             mdd=r["mdd"], stopped=r["stopped"], trades=r["trades"], shifts=r["shifts"],
-                            hold=hold))
+                            hold=hold, pre_chg=pre_chg, pre_rng=pre_rng, pre_chop=pre_chop))
     return res
 
 
@@ -279,12 +307,14 @@ def main():
         if not rows:
             continue
         rows.sort()
-        W, S = WINDOW_DAYS * 1440, STEP_DAYS * 1440
-        for s in range(0, len(rows) - W + 1, S):
+        tick = estimate_tick([x[4] for x in rows])
+        W, S, P = WINDOW_DAYS * 1440, STEP_DAYS * 1440, 3 * 1440
+        for s in range(P, len(rows) - W + 1, S):
             seg = rows[s:s + W]
+            prev = [x[4] for x in rows[s - P:s]]
             tasks.append((coin, seg[0][0], [x[1] for x in seg], [x[2] for x in seg],
-                          [x[3] for x in seg], [x[4] for x in seg], a.quick))
-        print(f"{coin}: {len(rows)} свечей", flush=True)
+                          [x[3] for x in seg], [x[4] for x in seg], a.quick, tick, prev))
+        print(f"{coin}: {len(rows)} свечей, шаг цены {tick:g} ({tick / rows[-1][4] * 100:.3f}% от цены)", flush=True)
     print(f"окон: {len(tasks)}, процессов: {os.cpu_count()}", flush=True)
     out = []
     with Pool() as pool:
