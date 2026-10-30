@@ -54,38 +54,68 @@ def q(x, step):
     return (Decimal(x) / step).to_integral_value(rounding=ROUND_DOWN) * step
 
 
+GLOBAL_KEYS = ("api_key", "api_secret", "network")   # один аккаунт Bybit на все сетки
+GRID_KEYS = tuple(k for k in DEFAULT_CFG if k not in GLOBAL_KEYS)
+CFG_LOCK = threading.RLock()
+
+
+def load_store():
+    """Файл настроек: ключи и сеть общие, у каждой сетки свои настройки."""
+    with CFG_LOCK:
+        raw = {}
+        try:
+            with open(CFG_PATH, encoding="utf-8") as f:
+                raw = json.load(f)
+        except Exception:
+            pass
+        st = {k: raw.get(k, DEFAULT_CFG[k]) for k in GLOBAL_KEYS}
+        if os.environ.get("BYBIT_ENV") in HOSTS and "network" not in raw:
+            st["network"] = os.environ["BYBIT_ENV"]
+        grids = raw.get("grids")
+        if not isinstance(grids, dict):          # старый файл с одной сеткой
+            g = {k: raw[k] for k in GRID_KEYS if k in raw}
+            g["was_running"] = bool(raw.get("was_running"))
+            grids = {"1": g}
+        st["grids"] = {gid: dict({k: DEFAULT_CFG[k] for k in GRID_KEYS}, **g) for gid, g in grids.items()}
+        if ENV_KEY and ENV_SECRET:          # ключи из переменных окружения главнее
+            st["api_key"], st["api_secret"] = ENV_KEY, ENV_SECRET
+        return st
+
+
+def save_store(st):
+    with CFG_LOCK:
+        st = dict(st)
+        if ENV_KEY and ENV_SECRET:          # не дублируем ключи из Variables на диск
+            st["api_key"], st["api_secret"] = "", ""
+        try:
+            os.makedirs(DATA_DIR, exist_ok=True)
+            tmp = CFG_PATH + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(st, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, CFG_PATH)
+        except OSError as e:
+            print("не удалось сохранить настройки:", e)
+
+
+def grid_cfg(gid, st=None):
+    """Полные настройки одной сетки: её собственные + общие ключи."""
+    st = st or load_store()
+    g = st["grids"].get(gid) or {k: DEFAULT_CFG[k] for k in GRID_KEYS}
+    return dict(g, **{k: st[k] for k in GLOBAL_KEYS})
+
+
 def load_cfg():
-    cfg = dict(DEFAULT_CFG)
-    if os.environ.get("BYBIT_ENV") in HOSTS:
-        cfg["network"] = os.environ["BYBIT_ENV"]
-    try:
-        with open(CFG_PATH, encoding="utf-8") as f:
-            cfg.update(json.load(f))
-    except Exception:
-        pass
-    if ENV_KEY and ENV_SECRET:          # ключи из переменных окружения главнее
-        cfg["api_key"], cfg["api_secret"] = ENV_KEY, ENV_SECRET
-    return cfg
+    """Совместимость: настройки первой сетки."""
+    st = load_store()
+    return grid_cfg(sorted(st["grids"], key=int)[0] if st["grids"] else "1", st)
 
 
-def save_cfg(cfg):
-    cfg = dict(cfg)
-    if ENV_KEY and ENV_SECRET:          # не дублируем ключи из Variables на диск
-        cfg["api_key"], cfg["api_secret"] = "", ""
-    try:
-        os.makedirs(DATA_DIR, exist_ok=True)
-        tmp = CFG_PATH + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, CFG_PATH)
-    except OSError as e:
-        print("не удалось сохранить настройки:", e)
-
-
-def set_autostart(flag):
-    cfg = load_cfg()
-    cfg["was_running"] = bool(flag)
-    save_cfg(cfg)
+def set_autostart(flag, gid="1"):
+    with CFG_LOCK:
+        st = load_store()
+        if gid in st["grids"]:
+            st["grids"][gid]["was_running"] = bool(flag)
+            save_store(st)
 
 
 class BybitError(Exception):
@@ -354,7 +384,8 @@ class Radar:
 
 
 class Bot:
-    def __init__(self):
+    def __init__(self, gid="1"):
+        self.gid = gid
         self.lock = threading.RLock()
         self.running = False
         self.busy = False
@@ -388,7 +419,8 @@ class Bot:
         with self.lock:
             self.log.insert(0, {"t": time.strftime("%H:%M:%S"), "k": kind, "text": text, "v": val})
             del self.log[120:]
-        print(time.strftime("%H:%M:%S"), kind, text, "" if val is None else val)
+        print(time.strftime("%H:%M:%S"), f"[сетка {self.gid} {self.symbol}]", kind, text,
+              "" if val is None else val, flush=True)
 
     def state(self):
         with self.lock:
@@ -401,7 +433,7 @@ class Bot:
                        "entry": float(self.pos.get("avgPrice") or 0),
                        "liq": float(self.pos.get("liqPrice") or 0),
                        "upnl": float(self.pos.get("unrealisedPnl") or 0)}
-            return {"running": self.running, "busy": self.busy, "status": self.status, "error": self.error,
+            return {"id": self.gid, "running": self.running, "busy": self.busy, "status": self.status, "error": self.error,
                     "symbol": self.symbol, "base": self.base_coin, "quote": self.quote_coin,
                     "network": self.network, "price": float(self.price) if self.price else None,
                     "levels": [float(x) for x in self.levels], "hist": self.hist[-400:],
@@ -423,13 +455,13 @@ class Bot:
         self.reset()
         self.running = self.busy = True
         self.status = "Запускаю…"
-        set_autostart(True)
+        set_autostart(True, self.gid)
         self.thread = threading.Thread(target=self._run, args=(cfg,), daemon=True)
         self.thread.start()
 
     def stop(self, remember=True):
         if remember:
-            set_autostart(False)
+            set_autostart(False, self.gid)
         if self.running:
             self.running = False
             self.busy = True
@@ -1045,7 +1077,33 @@ def scan_volatile(market="spot", minutes=30):
     return res
 
 
-BOT = Bot()
+BOTS = {}
+BOTS_LOCK = threading.Lock()
+
+
+def bot(gid):
+    with BOTS_LOCK:
+        if gid not in BOTS:
+            BOTS[gid] = Bot(gid)
+        return BOTS[gid]
+
+
+def grids_summary():
+    st = load_store()
+    out = []
+    for gid in sorted(st["grids"], key=int):
+        g, b = st["grids"][gid], BOTS.get(gid)
+        live = b is not None and (b.running or b.busy or b.symbol)
+        out.append({"id": gid, "symbol": (b.symbol if live and b.symbol else g.get("symbol", "")).upper(),
+                    "market": g.get("market", "spot"), "leverage": g.get("leverage", 1),
+                    "running": bool(b and b.running), "busy": bool(b and b.busy),
+                    "status": b.status if b else "Остановлен", "error": b.error if b else "",
+                    "profit": b.profit if b else 0.0, "trades": b.trades if b else 0})
+    return out
+
+
+def new_grid_id(st):
+    return str(max([int(x) for x in st["grids"]] + [0]) + 1)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1084,13 +1142,19 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/api/ping":
-            return self._send(200, {"ok": True, "running": BOT.running})
+            return self._send(200, {"ok": True, "running": sum(b.running for b in BOTS.values())})
         if not self._auth_ok():
             return self._deny()
         if self.path == "/":
             self._send(200, PAGE.encode(), "text/html; charset=utf-8")
-        elif self.path == "/api/state":
-            self._send(200, BOT.state())
+        elif self.path.startswith("/api/state"):
+            qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            gid = qs.get("id", ["1"])[0]
+            if gid not in load_store()["grids"]:
+                return self._send(404, {"error": "нет такой сетки"})
+            self._send(200, bot(gid).state())
+        elif self.path == "/api/grids":
+            self._send(200, grids_summary())
         elif self.path.startswith("/api/scan"):
             qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             try:
@@ -1098,7 +1162,7 @@ class Handler(BaseHTTPRequestHandler):
             except BybitError as e:
                 self._send(502, {"error": str(e)})
         elif self.path == "/api/config":
-            cfg = load_cfg()
+            cfg = load_store()
             cfg["has_secret"] = bool(cfg.pop("api_secret"))
             cfg["env_keys"] = bool(ENV_KEY and ENV_SECRET)
             cfg["locked"] = self._locked()
@@ -1115,19 +1179,56 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(403, {"error": "Задайте переменную APP_PASSWORD на Railway"})
         n = int(self.headers.get("Content-Length") or 0)
         body = json.loads(self.rfile.read(n) or b"{}")
-        if self.path == "/api/start":
-            cfg = load_cfg()
-            for k in DEFAULT_CFG:
-                v = body.get(k)
-                if k in ("api_key", "api_secret") and ENV_KEY and ENV_SECRET:
-                    continue
-                if v not in (None, "") and not (k == "api_secret" and v == "********"):
-                    cfg[k] = v
-            save_cfg(cfg)
-            BOT.start(cfg)
-            self._send(200, {"ok": True})
+        if self.path in ("/api/start", "/api/save", "/api/new"):
+            with CFG_LOCK:
+                st = load_store()
+                gid = str(body.get("id") or "")
+                if self.path == "/api/save" and gid not in st["grids"]:
+                    return self._send(404, {"error": "нет такой сетки"})
+                if self.path == "/api/new" or gid not in st["grids"]:
+                    gid = new_grid_id(st)
+                    src = st["grids"].get(str(body.get("copy_from") or ""), {})
+                    st["grids"][gid] = dict({k: DEFAULT_CFG[k] for k in GRID_KEYS},
+                                            **{k: v for k, v in src.items() if k in GRID_KEYS}, was_running=False)
+                g = st["grids"][gid]
+                for k in DEFAULT_CFG:
+                    v = body.get(k)
+                    if v in (None, "") or (k == "api_secret" and v == "********"):
+                        continue
+                    if k in GLOBAL_KEYS:
+                        if not (k in ("api_key", "api_secret") and ENV_KEY and ENV_SECRET):
+                            st[k] = v
+                    else:
+                        g[k] = v
+                if self.path == "/api/start":
+                    sym, mk = str(g.get("symbol", "")).upper().strip(), g.get("market")
+                    for og, ob in BOTS.items():
+                        if og != gid and (ob.running or ob.busy) and ob.symbol == sym \
+                                and ob.cat == ("linear" if mk == "futures" else "spot"):
+                            return self._send(409, {"error": f"{sym} уже торгует сетка {og}. Две сетки на одной "
+                                                             f"паре мешают друг другу: выберите другую монету.",
+                                                    "id": gid})
+                save_store(st)
+            if self.path == "/api/start":
+                bot(gid).start(grid_cfg(gid))
+            self._send(200, {"ok": True, "id": gid})
         elif self.path == "/api/stop":
-            BOT.stop()
+            gid = str(body.get("id") or "1")
+            if gid in BOTS:
+                BOTS[gid].stop()
+            self._send(200, {"ok": True})
+        elif self.path == "/api/delete":
+            gid = str(body.get("id") or "")
+            b = BOTS.get(gid)
+            if b and (b.running or b.busy):
+                return self._send(409, {"error": "Сначала остановите сетку"})
+            with CFG_LOCK:
+                st = load_store()
+                st["grids"].pop(gid, None)
+                if not st["grids"]:
+                    st["grids"]["1"] = dict({k: DEFAULT_CFG[k] for k in GRID_KEYS}, was_running=False)
+                save_store(st)
+            BOTS.pop(gid, None)
             self._send(200, {"ok": True})
         else:
             self._send(404, {"error": "not found"})
@@ -1204,6 +1305,20 @@ input[type=range]{padding:0;border:0;background:none;accent-color:var(--fg)}
 .chips b{font-family:var(--mono);font-weight:500;font-size:14px;font-variant-numeric:tabular-nums}
 @media (prefers-reduced-motion:reduce){.track i{transition:none}}
 .posrow{display:none}.fut .posrow{display:grid}
+.tabs{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.tab{font:inherit;font-size:13px;display:inline-flex;align-items:center;gap:8px;padding:8px 12px;border-radius:6px;border:0;background:var(--panel);color:var(--fg);box-shadow:inset 0 0 0 1px var(--line);cursor:pointer}
+.tab b{font-family:var(--mono);font-weight:500}
+.tab .d{width:7px;height:7px;border-radius:50%;background:var(--muted)}
+.tab.on .d{background:var(--buy)}.tab.err .d{background:var(--sell)}
+.tab[aria-current="true"]{box-shadow:inset 0 0 0 2px var(--fg)}
+.tab:focus-visible{outline:3px solid var(--buy);outline-offset:2px}
+.tab.add{color:var(--muted)}
+.tabs .total{margin-left:auto;font-size:13px;color:var(--muted)}
+.tabs .total b{font-family:var(--mono);color:var(--fg)}
+.delrow{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-top:14px}
+#delbtn{font:inherit;font-size:13px;padding:7px 12px;border-radius:4px;border:0;background:transparent;color:var(--sell);box-shadow:inset 0 0 0 1px var(--sell);cursor:pointer}
+#delbtn.sure{background:var(--sell);color:var(--ink-fg)}
+#delbtn:disabled{opacity:.4;cursor:not-allowed}
 .scan{display:grid;gap:12px}
 .scanhead{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}
 #scanbtn{font:inherit;font-weight:600;font-size:15px;padding:12px 16px;border-radius:6px;border:0;background:var(--panel);color:var(--fg);box-shadow:inset 0 0 0 1px var(--line);cursor:pointer}
@@ -1225,6 +1340,7 @@ input[type=range]{padding:0;border:0;background:none;accent-color:var(--fg)}
 .take:disabled{opacity:.4;cursor:not-allowed}
 </style></head><body>
 <div class="wrap">
+<nav class="tabs" id="tabs" aria-label="Сетки"></nav>
 <header><div><div class="pair" id="pair">—</div><div class="tag" id="net">—</div></div>
 <div class="status" id="status"><span class="dot"></span><span id="statusText">Остановлен</span></div></header>
 <section class="hero"><div><div class="lbl">Прибыль сетки</div><div class="pnl" id="pnl">+0.00</div></div>
@@ -1287,6 +1403,7 @@ input[type=range]{padding:0;border:0;background:none;accent-color:var(--fg)}
 <label id="multbox">Множитель лота<input id="lot_mult" type="number" min="1.05" max="3" step="0.05"></label>
 <div class="full note" id="lotinfo" style="margin:0"></div>
 </div>
+<div class="delrow"><button type="button" id="delbtn">Удалить эту сетку</button><span class="note" id="delnote"></span></div>
 <p class="note">Ключ создайте на Bybit только с правом «Спот торговля», без вывода средств, лучше с привязкой к вашему IP. Сохраняется в gridbot_config.json рядом с программой.</p>
 </details>
 <section class="scan">
@@ -1319,24 +1436,77 @@ function lotUI(){
 ["lot_mode","lot_mult","levels","capital","market","leverage"].forEach(k=>$(k).addEventListener("input",lotUI));
 const fmt=(n,d=2)=>n==null?"—":Number(n).toLocaleString("ru-RU",{minimumFractionDigits:d,maximumFractionDigits:d});
 let S=null,LOCK="";
-fetch("/api/config").then(r=>r.json()).then(c=>{F.forEach(k=>{if(k==="api_secret"){$(k).value=c.has_secret?"********":""}else if(CHK.includes(k)){$(k).checked=!!c[k]}else $(k).value=c[k]});
- if(c.env_keys){$("envkeys").hidden=false;$("envkeyval").textContent=c.api_key;$("kbox1").hidden=$("kbox2").hidden=true}
- else if(!c.api_key||!c.has_secret)$("set").open=true;
- if(c.locked){LOCK="На сервере не задан пароль. Добавьте переменную APP_PASSWORD в Railway → Variables, иначе бот был бы открыт всему интернету.";$("go").disabled=true} $("pair").textContent=c.symbol; netTag(c.network);levUI();lotUI()});
+const GLOBAL=["api_key","api_secret","network"];
+let CFG=null,CUR=null;
+try{CUR=localStorage.getItem("grid")}catch(e){}
+function fillForm(){
+ const g=CFG.grids[CUR]||{};
+ F.forEach(k=>{
+  if(GLOBAL.includes(k)){if(k==="api_secret")$(k).value=CFG.has_secret?"********":"";else $(k).value=CFG[k]??"";return}
+  if(CHK.includes(k))$(k).checked=!!g[k];else $(k).value=g[k]??"";
+ });
+ $("pair").textContent=(g.symbol||"—").replace("USDT"," / USDT");netTag(CFG.network);levUI();lotUI();
+}
+async function loadCfg(){
+ CFG=await (await fetch("/api/config")).json();
+ const ids=Object.keys(CFG.grids).sort((a,b)=>a-b);
+ if(!CUR||!CFG.grids[CUR])CUR=ids[0];
+ fillForm();
+ if(CFG.env_keys){$("envkeys").hidden=false;$("envkeyval").textContent=CFG.api_key;$("kbox1").hidden=$("kbox2").hidden=true}
+ else if(!CFG.api_key||!CFG.has_secret)$("set").open=true;
+ if(CFG.locked){LOCK="На сервере не задан пароль. Добавьте переменную APP_PASSWORD в Railway → Variables, иначе бот был бы открыт всему интернету.";$("go").disabled=true}
+}
+function formBody(){const b={id:CUR};F.forEach(k=>b[k]=CHK.includes(k)?$(k).checked:$(k).value);
+ ["capital","range_pct","levels","leverage","trail_up_limit","trail_down_limit","lot_mult","trail_pct","trail_down_cap"].forEach(k=>b[k]=Number(b[k])||0);return b}
+let saveT=null;
+function saveSoon(){clearTimeout(saveT);saveT=setTimeout(saveNow,500)}
+async function saveNow(){clearTimeout(saveT);if(!CFG)return;const b=formBody();
+ await fetch("/api/save",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(b)});
+ F.forEach(k=>{if(!GLOBAL.includes(k)&&CFG.grids[CUR])CFG.grids[CUR][k]=b[k]})}
+F.forEach(k=>$(k).addEventListener("change",saveSoon));
+async function selectGrid(id){await saveNow();CUR=id;try{localStorage.setItem("grid",id)}catch(e){}
+ S=null;$("delbtn").classList.remove("sure");$("delbtn").textContent="Удалить эту сетку";$("delnote").textContent="";
+ await loadCfg();poll()}
+async function newGrid(prefill){await saveNow();
+ const r=await (await fetch("/api/new",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(Object.assign({copy_from:CUR},prefill||{}))})).json();
+ await selectGrid(r.id);$("set").open=true}
+let GRIDS=[];
+function renderTabs(){
+ const t=$("tabs"),tot=GRIDS.reduce((a,g)=>a+(g.profit||0),0),run=GRIDS.filter(g=>g.running).length;
+ t.innerHTML=GRIDS.map(g=>{const sym=(g.symbol||"—").replace("USDT",""),mk=g.market==="futures"?` ${g.leverage}x`:" спот";
+  const p=g.trades||g.profit?` <b class="${g.profit>=0?"b":"s"}">${g.profit>=0?"+":""}${fmt(g.profit)}</b>`:"";
+  return `<button type="button" class="tab${g.running?" on":""}${g.error?" err":""}" data-id="${g.id}" aria-current="${g.id===CUR}"><span class="d"></span>${esc(sym)}<span class="i">${mk}</span>${p}</button>`}).join("")+
+  `<button type="button" class="tab add" id="addtab">+ Новая сетка</button>`+
+  `<span class="total">Работает ${run} из ${GRIDS.length} · всего <b class="${tot>=0?"b":"s"}">${tot>=0?"+":""}${fmt(tot)} USDT</b></span>`;
+}
+$("tabs").addEventListener("click",e=>{const b=e.target.closest(".tab");if(!b)return;
+ if(b.id==="addtab")newGrid();else if(b.dataset.id!==CUR)selectGrid(b.dataset.id)});
+$("delbtn").onclick=async()=>{const b=$("delbtn");
+ if(S&&(S.running||S.busy)){$("delnote").textContent="Сначала остановите сетку";return}
+ if(!b.classList.contains("sure")){b.classList.add("sure");b.textContent="Точно удалить? Нажмите ещё раз";return}
+ const r=await fetch("/api/delete",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id:CUR})});
+ if(!r.ok){$("delnote").textContent=(await r.json()).error;return}
+ clearTimeout(saveT);CFG=null;CUR=null;await selectGrid(null)};
+loadCfg().then(poll);
 function netTag(n,m,lv){const t=$("net");m=m||$("market").value;lv=lv||$("leverage").value;
  const mk=m==="futures"||m==="linear"?`фьючерсы ${lv}x`:"спот";
  t.textContent={testnet:"Bybit testnet",demo:"Bybit demo",mainnet:"Bybit · реальные деньги"}[n]+" · "+mk;t.className="tag"+(n==="mainnet"?" live":"")}
 $("market").addEventListener("input",()=>netTag($("network").value));$("leverage").addEventListener("input",()=>netTag($("network").value));
 $("network").onchange=e=>netTag(e.target.value);
+let STARTERR="";
 $("go").onclick=async()=>{
- $("go").disabled=true;
- if(S&&S.running){await fetch("/api/stop",{method:"POST"})}
- else{const b={};F.forEach(k=>b[k]=CHK.includes(k)?$(k).checked:$(k).value);["capital","range_pct","levels","leverage","trail_up_limit","trail_down_limit","lot_mult","trail_pct","trail_down_cap"].forEach(k=>b[k]=Number(b[k])||0);
-  await fetch("/api/start",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(b)});$("set").open=false}
+ $("go").disabled=true;STARTERR="";
+ if(S&&S.running){await fetch("/api/stop",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id:CUR})})}
+ else{clearTimeout(saveT);
+  const r=await fetch("/api/start",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(formBody())});
+  if(!r.ok)STARTERR=(await r.json()).error||"Не удалось запустить";else $("set").open=false}
  poll();
 };
-async function poll(){try{S=await (await fetch("/api/state")).json();render()}catch(e){$("statusText").textContent="Программа не отвечает"}}
-setInterval(poll,2000);poll();
+async function poll(){if(!CUR)return;
+ try{const [st,gr]=await Promise.all([fetch("/api/state?id="+CUR),fetch("/api/grids")]);
+  GRIDS=await gr.json();renderTabs();if(st.ok){S=await st.json();render()}}
+ catch(e){$("statusText").textContent="Программа не отвечает"}}
+setInterval(poll,2000);
 function render(){
  const g=$("go");g.disabled=S.busy||!!LOCK;g.textContent=S.running?(S.busy?"Запускаю…":"Остановить"):(S.busy?"Останавливаю…":"Запустить бота");
  g.classList.toggle("stop",S.running&&!S.busy);
@@ -1353,7 +1523,8 @@ function render(){
  $("tc").textContent=S.trades;$("oc").textContent=S.open;
  if(!fut){$("qlab").textContent="Свободно "+(S.quote||"USDT");$("qb").textContent=fmt(S.bal[S.quote])}
  $("blab").textContent=fut?"Плечо":"Свободно "+(S.base||"монет");$("bb").textContent=fut?S.leverage+"x":fmt(S.bal[S.base],6);
- const e=$("err");e.hidden=!(S.error||LOCK);e.textContent=LOCK||S.error;
+ const e=$("err");e.hidden=!(S.error||LOCK||STARTERR);e.textContent=LOCK||STARTERR||S.error;
+ $("delbtn").disabled=S.running||S.busy;
  if(S.levels.length){const L=S.levels,d=L[0]<10?4:0;$("grange").textContent=`Сетка: ${fmt(L[0],d)} – ${fmt(L[L.length-1],d)}`}
  radarUI(S.radar);
  if(S.fees)$("gfee").textContent=`Лимиток (мейкер): ${S.fees.maker} · маркетом: ${S.fees.taker}`;
@@ -1407,13 +1578,14 @@ $("scanbtn").onclick=async()=>{
    <td class="${x.change>0?"b":x.change<0?"s":""}">${x.change>0?"+":""}${fmt(x.change)}%</td>
    <td>×${fmt(x.chop,1)}</td><td>${money(x.turn30)}</td>
    <td><span class="kind ${k}" title="${tip}">${x.kind}</span></td>
-   <td><button class="take" data-i="${i}" ${S&&S.running?"disabled":""}>Взять</button></td></tr>`}).join("");
+   <td><button class="take" data-i="${i}">${S&&S.running?"В новую сетку":"Взять"}</button></td></tr>`}).join("");
  }catch(e){info.textContent="Не получилось найти: "+e.message}
  b.disabled=false;b.textContent="Найти самые волатильные за 30 минут";
 };
-$("scanbody").addEventListener("click",e=>{
+$("scanbody").addEventListener("click",async e=>{
  const btn=e.target.closest(".take");if(!btn)return;const x=SCAN[+btn.dataset.i];
- $("symbol").value=x.symbol;$("range_pct").value=x.sugg_range;$("levels").value=x.sugg_levels;
+ if(S&&(S.running||S.busy))await newGrid();          // текущая сетка работает — монета пойдёт в новую сетку
+ $("symbol").value=x.symbol;$("range_pct").value=x.sugg_range;$("levels").value=x.sugg_levels;saveSoon();
  $("pair").textContent=x.symbol.replace("USDT","")+" / USDT";levUI();
  $("scaninfo").textContent=`Взято ${x.symbol}: диапазон ±${x.sugg_range}%, ${x.sugg_levels} уровней. Нажмите «Запустить бота».`+
   (x.grid_ok?"":x.kind==="пила"?" Осторожно: монета сейчас почти не двигается.":" Осторожно: монета сейчас в "+x.kind+"е.");
@@ -1449,9 +1621,12 @@ addEventListener("resize",draw);
 def shutdown(*_):
     """Railway при перезапуске шлёт SIGTERM: аккуратно снимаем ордера, флаг автозапуска сохраняем."""
     print("получен сигнал остановки, снимаю ордера…", flush=True)
-    BOT.stop(remember=False)
-    if BOT.thread:
-        BOT.thread.join(timeout=25)
+    bots = list(BOTS.values())
+    for b in bots:
+        b.stop(remember=False)
+    for b in bots:
+        if b.thread:
+            b.thread.join(timeout=25)
     sys.exit(0)
 
 
@@ -1467,15 +1642,21 @@ def main():
         url = f"http://127.0.0.1:{PORT}"
         print(f"Сеточный бот запущен: {url}  (Ctrl+C, чтобы выйти)")
         threading.Timer(0.8, lambda: webbrowser.open(url)).start()
-    cfg = load_cfg()
-    if cfg.get("was_running") and cfg.get("api_key") and cfg.get("api_secret") and not (ON_SERVER and not APP_PASSWORD):
-        print("бот работал до перезапуска — запускаю снова", flush=True)
-        try:
-            Bybit(cfg["api_key"], cfg["api_secret"], cfg["network"],
-                  "linear" if cfg.get("market") == "futures" else "spot").cancel_all(cfg["symbol"].upper())
-        except Exception as e:
-            print("не удалось снять старые ордера:", e, flush=True)
-        BOT.start(cfg)
+    st = load_store()
+    save_store(st)                       # перевести старый файл настроек в формат с несколькими сетками
+    if st.get("api_key") and st.get("api_secret") and not (ON_SERVER and not APP_PASSWORD):
+        for gid in sorted(st["grids"], key=int):
+            cfg = grid_cfg(gid, st)
+            if not cfg.get("was_running"):
+                continue
+            print(f"сетка {gid} ({cfg['symbol']}) работала до перезапуска — запускаю снова", flush=True)
+            try:
+                Bybit(cfg["api_key"], cfg["api_secret"], cfg["network"],
+                      "linear" if cfg.get("market") == "futures" else "spot").cancel_all(cfg["symbol"].upper())
+            except Exception as e:
+                print("не удалось снять старые ордера:", e, flush=True)
+            bot(gid).start(cfg)
+            time.sleep(1)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
