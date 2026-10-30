@@ -27,6 +27,7 @@ HOSTS = {
 DEFAULT_CFG = {"api_key": "", "api_secret": "", "network": "testnet", "market": "spot",
                "leverage": 1, "symbol": "BTCUSDT", "capital": 200, "range_pct": 8, "levels": 12,
                "trail_up": True, "trail_down": False, "trail_up_limit": 0, "trail_down_limit": 0,
+               "trail_pct": 2, "trail_down_cap": 5,
                "radar": "pause", "radar_sens": "mid", "lot_mode": "equal", "lot_mult": 1.3}
 SPOT_FEE = Decimal("0.001")      # комиссия спота Bybit 0.1%
 SPOT_FEE_BUF = Decimal("0.0015") # запас: комиссия покупки на споте списывается монетой
@@ -36,13 +37,7 @@ CHASE_WAIT = 2.5       # …по 2.5 секунды, потом остаток �
 LIQ_GUARD = Decimal("0.35")      # аварийный выход, когда до ликвидации осталось 35% пути
 STOP_BELOW = Decimal("0.05")  # стоп, если цена ушла на 5% ниже нижней границы
 POLL_SEC = 3
-# Трейлинг: защита от «пилы» на границе сетки, из-за которой каждый сдвиг стоил денег
-TRAIL_BUFFER = 1          # сдвиг, только когда цена ушла за границу хотя бы на 1 шаг сетки…
-TRAIL_UP_SEC = 60         # …и держится там: вверх 1 минуту,
-TRAIL_DOWN_SEC = 300      # вниз 5 минут (сдвиг вниз фиксирует убыток, поэтому строже)
-TRAIL_COOLDOWN = 1800     # 30 минут после сдвига в одну сторону нет сдвига в обратную…
-TRAIL_REVERSE_STEPS = 3   # …если только цена не ушла за границу на 3 шага
-TRAIL_DOWN_DAY_LOSS = Decimal("0.05")  # сдвиги вниз за сутки зафиксировали 5% капитала — пауза до конца суток
+# Трейлинг по проценту: сетка сдвигается, когда цена ушла за её границу на trail_pct %. Никаких таймеров.
 TRAIL_MAX_STEPS = 10      # сколько шагов можно сдвинуть за одну проверку после подтверждения
 RADAR_SENS = {"low": (75, 45), "mid": (60, 35), "high": (48, 28)}  # порог тревоги / порог «успокоилось»
 RADAR_CALM_TICKS = 20  # ~1 минута спокойствия, прежде чем вернуть ордера
@@ -375,9 +370,9 @@ class Bot:
         self.cat, self.lev, self.pos = "spot", 1, None
         self.cells, self.kmin, self.n, self._lv = {}, 0, 0, {}
         self.out_up = self.out_dn = 0
-        self.up_since = self.dn_since = None
-        self.last_shift, self.last_shift_t = None, 0.0
         self.dn_losses, self.trail_wait, self.cap = [], "", Decimal(0)
+        self.trail_pct, self.down_cap = Decimal("0.02"), Decimal("0.05")
+        self.up_at = self.dn_at = None
         self.shift_up = self.shift_dn = 0
         self.trail_pnl = 0.0
         self.per_min, self.geo = Decimal(0), False
@@ -415,7 +410,9 @@ class Bot:
                     "market": self.cat, "leverage": self.lev, "pos": pos,
                     "trail": {"up": self.trail_up, "down": self.trail_down,
                               "nup": self.shift_up, "ndn": self.shift_dn, "pnl": self.trail_pnl,
-                              "wait": self.trail_wait},
+                              "wait": self.trail_wait, "pct": float(self.trail_pct * 100),
+                              "up_at": float(self.up_at) if self.up_at else None,
+                              "dn_at": float(self.dn_at) if self.dn_at else None},
                     "fees": {"maker": self.maker_n, "taker": self.taker_n},
                     "radar": dict(self.radar.m, mode=self.radar_mode, guard=self.guard,
                                   paused=len(self.paused)) if self.radar else {"mode": "off"}}
@@ -548,6 +545,8 @@ class Bot:
 
         cap = Decimal(str(cfg["capital"]))
         self.cap = cap
+        self.trail_pct = min(max(Decimal(str(cfg.get("trail_pct") if cfg.get("trail_pct") is not None else 2)), Decimal(0)), Decimal(50)) / 100
+        self.down_cap = max(Decimal(str(cfg.get("trail_down_cap") if cfg.get("trail_down_cap") is not None else 5)), Decimal(0)) / 100
         total = cap * self.lev           # объём всей сетки (с учётом плеча)
         # лоты: одинаковые или геометрические — у цены самый маленький, к краям каждый больше в mult раз
         mult = Decimal(1)
@@ -678,55 +677,39 @@ class Bot:
         return self.trail_up and (not self.up_limit or self.lv(self.kmin + self.n) <= self.up_limit)
 
     def _down_day_limit(self, now):
-        """Сдвиги вниз за последние сутки уже зафиксировали 5% капитала — больше не сдвигаем."""
+        """Лимит убытка: сдвиги вниз за последние сутки уже зафиксировали down_cap капитала. 0 — без лимита."""
+        if not self.down_cap or not self.cap:
+            return False
         self.dn_losses = [(t, x) for t, x in self.dn_losses if now - t < 86400]
         lost = -sum(x for _, x in self.dn_losses)
-        if self.cap and lost >= float(self.cap * TRAIL_DOWN_DAY_LOSS):
-            self.trail_wait = f"↓ пауза до завтра: сдвиги вниз за сутки уже −{lost:.2f} {self.quote_coin}"
+        if lost >= float(self.cap * self.down_cap):
+            self.trail_wait = f"↓ лимит: сдвиги вниз за сутки уже −{lost:.2f} {self.quote_coin}"
             return True
         return False
 
     def _trail(self, api, p):
-        now = time.time()
-        top_i, bot_i = self.kmin + self.n - 1, self.kmin
-        up_trig = p > self.lv(top_i + TRAIL_BUFFER) and self._can_trail_up()
-        dn_trig = p < self.lv(bot_i - TRAIL_BUFFER) and self._can_trail_down()
-        self.up_since = (self.up_since or now) if up_trig else None
-        self.dn_since = (self.dn_since or now) if dn_trig else None
+        """Сдвиг сетки, когда цена ушла за границу на trail_pct %. Сдвигаем столько шагов, сколько нужно,
+        чтобы цена снова оказалась внутри сетки."""
+        top, bot = self.lv(self.kmin + self.n - 1), self.lv(self.kmin)
+        self.up_at = top * (1 + self.trail_pct) if self.trail_up else None
+        self.dn_at = bot * (1 - self.trail_pct) if self.trail_down else None
         self.trail_wait = ""
-        # запрет обратного сдвига сразу после сдвига: это и есть «пила», которая съедает деньги
-        recent = now - self.last_shift_t < TRAIL_COOLDOWN
-        if up_trig and recent and self.last_shift == "down" and p <= self.lv(top_i + TRAIL_REVERSE_STEPS):
-            self.trail_wait = f"↑ пауза после сдвига вниз ещё {int(TRAIL_COOLDOWN - (now - self.last_shift_t)) // 60} мин"
-            return
-        if dn_trig and recent and self.last_shift == "up" and p >= self.lv(bot_i - TRAIL_REVERSE_STEPS):
-            self.trail_wait = f"↓ пауза после сдвига вверх ещё {int(TRAIL_COOLDOWN - (now - self.last_shift_t)) // 60} мин"
-            return
-        if dn_trig and self._down_day_limit(now):
-            return
         steps = 0
-        if up_trig:
-            if now - self.up_since < TRAIL_UP_SEC:
-                self.trail_wait = f"↑ жду подтверждения {int(now - self.up_since)}/{TRAIL_UP_SEC} с"
-                return
+        if self._can_trail_up() and p > top * (1 + self.trail_pct):
             while steps < TRAIL_MAX_STEPS and self._can_trail_up() and p > self.lv(self.kmin + self.n - 1):
                 if not self._shift_up(api, p):
                     break
                 steps += 1
-            if steps:
-                self.last_shift, self.last_shift_t, self.up_since = "up", now, None
-        elif dn_trig:
-            if now - self.dn_since < TRAIL_DOWN_SEC:
-                self.trail_wait = f"↓ жду подтверждения {int(now - self.dn_since)}/{TRAIL_DOWN_SEC} с"
-                return
+        elif self._can_trail_down() and p < bot * (1 - self.trail_pct):
             while steps < TRAIL_MAX_STEPS and self._can_trail_down() and p < self.lv(self.kmin):
-                if self._down_day_limit(now) or not self._shift_down(api, p):
+                if self._down_day_limit(time.time()) or not self._shift_down(api, p):
                     break
                 steps += 1
-            if steps:
-                self.last_shift, self.last_shift_t, self.dn_since = "down", now, None
         if steps:
             self._refresh_levels()
+            top, bot = self.lv(self.kmin + self.n - 1), self.lv(self.kmin)
+            self.up_at = top * (1 + self.trail_pct) if self.trail_up else None
+            self.dn_at = bot * (1 - self.trail_pct) if self.trail_down else None
 
     def _shift_up(self, api, p):
         """Цена выше сетки: снимаем самый нижний ордер на покупку и переносим ячейку наверх."""
@@ -1292,9 +1275,11 @@ input[type=range]{padding:0;border:0;background:none;accent-color:var(--fg)}
 <label>Чувствительность<select id="radar_sens"><option value="low">Низкая (реже, только сильные всплески)</option><option value="mid">Средняя</option><option value="high">Высокая (раньше, больше ложных)</option></select></label>
 <label class="chk"><input type="checkbox" id="trail_up"> Трейлинг вверх</label>
 <label class="chk"><input type="checkbox" id="trail_down"> Трейлинг вниз</label>
+<label>Перестановка: цена ушла за границу на, %<input id="trail_pct" type="number" min="0" max="50" step="0.5"></label>
+<label>Лимит убытка сдвигов вниз, % капитала в сутки (0 = без лимита)<input id="trail_down_cap" type="number" min="0" max="100" step="1"></label>
 <label>Предел вверх, цена (0 = без предела)<input id="trail_up_limit" type="number" min="0" step="any"></label>
 <label>Предел вниз, цена (0 = без предела)<input id="trail_down_limit" type="number" min="0" step="any"></label>
-<p class="full note" style="margin:0">Вверх: цена ушла над сеткой, бот снимает нижнюю покупку, докупает монету и сдвигает сетку выше. Вниз: цена ушла под сетку, бот продаёт монету верхней ячейки и ставит покупку ниже. <b>Каждый сдвиг вниз фиксирует убыток</b> примерно на ширину диапазона на один лот, поэтому он выключен по умолчанию. Защита от пилы: сдвиг, только когда цена ушла за границу на шаг сетки и держится там 1 минуту (вниз 5 минут); после сдвига 30 минут нет сдвига обратно; сдвиги вниз за сутки не больше 5% капитала.</p>
+<p class="full note" style="margin:0">Сетка сдвигается, когда цена ушла за её границу на заданный процент, сразу, без ожидания по времени. Сдвигается столько шагов, сколько нужно, чтобы цена снова оказалась внутри. Вверх: бот снимает нижнюю покупку, докупает монету и ставит продажу выше. Вниз: продаёт монету верхней ячейки и ставит покупку ниже — <b>каждый сдвиг вниз фиксирует убыток</b>, поэтому он выключен по умолчанию.</p>
 <label>Капитал (маржа), USDT<input id="capital" type="number" min="10"></label>
 <label>Диапазон ± %<input id="range_pct" type="number" min="1" max="50" step="0.5"></label>
 <label>Уровней<input id="levels" type="number" min="3" max="50"></label>
@@ -1313,7 +1298,7 @@ input[type=range]{padding:0;border:0;background:none;accent-color:var(--fg)}
 </div>
 <script>
 const $=id=>document.getElementById(id);
-const F=["api_key","api_secret","network","market","leverage","symbol","capital","range_pct","levels","trail_up","trail_down","trail_up_limit","trail_down_limit","radar","radar_sens","lot_mode","lot_mult"];
+const F=["api_key","api_secret","network","market","leverage","symbol","capital","range_pct","levels","trail_up","trail_down","trail_up_limit","trail_down_limit","radar","radar_sens","lot_mode","lot_mult","trail_pct","trail_down_cap"];
 const CHK=["trail_up","trail_down"];
 function levUI(){const fut=$("market").value==="futures",lv=Number($("leverage").value)||1,rng=Number($("range_pct").value)||8;
  $("levbox").hidden=!fut;$("levval").textContent=lv+"x";const w=$("levwarn");
@@ -1346,7 +1331,7 @@ $("network").onchange=e=>netTag(e.target.value);
 $("go").onclick=async()=>{
  $("go").disabled=true;
  if(S&&S.running){await fetch("/api/stop",{method:"POST"})}
- else{const b={};F.forEach(k=>b[k]=CHK.includes(k)?$(k).checked:$(k).value);["capital","range_pct","levels","leverage","trail_up_limit","trail_down_limit","lot_mult"].forEach(k=>b[k]=Number(b[k])||0);
+ else{const b={};F.forEach(k=>b[k]=CHK.includes(k)?$(k).checked:$(k).value);["capital","range_pct","levels","leverage","trail_up_limit","trail_down_limit","lot_mult","trail_pct","trail_down_cap"].forEach(k=>b[k]=Number(b[k])||0);
   await fetch("/api/start",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(b)});$("set").open=false}
  poll();
 };
@@ -1373,7 +1358,7 @@ function render(){
  radarUI(S.radar);
  if(S.fees)$("gfee").textContent=`Лимиток (мейкер): ${S.fees.maker} · маркетом: ${S.fees.taker}`;
  const T=S.trail;$("gtrail").textContent=!S.symbol?"Трейлинг: —":(!T.up&&!T.down?"Трейлинг выключен":
-  `Трейлинг ${T.up?"↑":""}${T.down?"↓":""} · сдвигов ↑${T.nup} ↓${T.ndn}`+(T.pnl?` · итог сдвигов ${T.pnl>=0?"+":""}${fmt(T.pnl)}`:"")+(T.wait?` · ${T.wait}`:""));
+  `Трейлинг ${T.up?"↑":""}${T.down?"↓":""} · сдвигов ↑${T.nup} ↓${T.ndn}`+(T.pnl?` · итог сдвигов ${T.pnl>=0?"+":""}${fmt(T.pnl)}`:"")+(T.up_at?` · ↑ при ${fmt(T.up_at,T.up_at<10?5:1)}`:"")+(T.dn_at?` · ↓ при ${fmt(T.dn_at,T.dn_at<10?5:1)}`:"")+(T.wait?` · ${T.wait}`:""));
  $("log").innerHTML=S.log.map(l=>{const c={buy:"b",sell:"s",info:"i",err:"e"}[l.k],n={buy:"КУПИЛ",sell:"ПРОДАЛ",info:"БОТ",err:"ОШИБКА"}[l.k];
   const v=l.v==null?"":`<span class="${l.v>=0?"b":"s"}">${l.v>=0?"+":""}${fmt(l.v,4)}</span>`;
   return `<div><span class="i">${l.t}</span><span class="${c}">${n}</span><span>${esc(l.text)}</span>${v}</div>`}).join("");
