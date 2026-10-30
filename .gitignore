@@ -4,3 +4,4 @@ gridbot_config.json
 *.tmp
 __pycache__/
 *.pyc
+data_cache/
