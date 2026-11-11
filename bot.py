@@ -1299,6 +1299,81 @@ def grids_summary():
     return out
 
 
+def free_funds(market):
+    """Свободные деньги на счёте для новых сеток: USDT на споте или свободная маржа на фьючерсах."""
+    st = load_store()
+    if not st["api_key"] or not st["api_secret"]:
+        raise BybitError("Введите API ключ и секрет в настройках")
+    api = Bybit(st["api_key"], st["api_secret"], st["network"], "linear" if market == "futures" else "spot")
+    api.sync_time()
+    bal = api.balances()
+    if market == "futures":
+        return api, bal.get("_margin", Decimal(0)), CAP_MAX_FUT
+    return api, bal.get("USDT", {}).get("free", Decimal(0)), CAP_MAX_SPOT
+
+
+def split_start(body):
+    """Поделить свободный депозит поровну между выбранными монетами и запустить по сетке на каждую."""
+    market = "futures" if body.get("market") != "spot" else "spot"
+    cat = "linear" if market == "futures" else "spot"
+    lev = int(body.get("leverage") or 3) if market == "futures" else 1
+    if not 1 <= lev <= 100:
+        raise BybitError("Плечо должно быть от 1 до 100")
+    sugg = body.get("sugg") or {}
+    syms = []
+    for x in body.get("symbols") or []:
+        x = str(x).upper().strip().replace("/", "")
+        if x and not x.endswith("USDT"):
+            x += "USDT"
+        if x and x not in syms:
+            syms.append(x)
+    if not syms:
+        raise BybitError("Выберите хотя бы одну монету")
+    busy = {b.symbol for b in BOTS.values() if (b.running or b.busy) and b.cat == cat}
+    taken = [x for x in syms if x in busy]
+    if taken:
+        raise BybitError("Уже торгуются: " + ", ".join(taken) + ". Уберите их из списка или остановите эти сетки.")
+    api, free, k = free_funds(market)
+    bad = []
+    for x in syms:
+        try:
+            api.instrument(x)
+        except BybitError:
+            bad.append(x)
+    if bad:
+        raise BybitError("На Bybit нет такой пары (" + ("фьючерсы" if cat == "linear" else "спот") + "): " + ", ".join(bad))
+    per = (free * k / len(syms)).quantize(Decimal("0.01"), ROUND_DOWN)
+    if per < 10:
+        raise BybitError(f"Свободно {free:.2f} USDT: на {len(syms)} сеток выходит по {per} USDT, это слишком мало. "
+                         f"Уберите часть монет или пополните счёт.")
+    ids = []
+    with CFG_LOCK:
+        st = load_store()
+        tpl = st["grids"].get(str(body.get("copy_from") or ""), {})
+        for x in syms:
+            gid = next((g for g, c in st["grids"].items()
+                        if str(c.get("symbol", "")).upper() == x and c.get("market") == market
+                        and not (BOTS.get(g) and (BOTS[g].running or BOTS[g].busy))), None)
+            if gid is None:
+                gid = new_grid_id(st)
+                st["grids"][gid] = dict({k2: DEFAULT_CFG[k2] for k2 in GRID_KEYS},
+                                        **{k2: v for k2, v in tpl.items() if k2 in GRID_KEYS}, was_running=False)
+            g = st["grids"][gid]
+            g.update(symbol=x, market=market, leverage=lev, capital=float(per), cap_max=False)
+            if market == "spot" and g.get("direction") == "sell":
+                g["direction"] = "both"
+            sg = sugg.get(x) or {}
+            if sg.get("range"):
+                g["range_pct"] = sg["range"]
+            if sg.get("levels"):
+                g["levels"] = sg["levels"]
+            ids.append(gid)
+        save_store(st)
+    for gid in ids:
+        bot(gid).start(grid_cfg(gid))
+    return {"ok": True, "ids": ids, "per": float(per), "free": float(free), "leverage": lev}
+
+
 def new_grid_id(st):
     return str(max([int(x) for x in st["grids"]] + [0]) + 1)
 
@@ -1358,6 +1433,14 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, scan_volatile(qs.get("market", ["spot"])[0]))
             except BybitError as e:
                 self._send(502, {"error": str(e)})
+        elif self.path.startswith("/api/funds"):
+            qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            mk = qs.get("market", ["futures"])[0]
+            try:
+                _, free, k = free_funds(mk)
+                self._send(200, {"free": float(free), "k": float(k)})
+            except BybitError as e:
+                self._send(502, {"error": str(e)})
         elif self.path == "/api/config":
             cfg = load_store()
             cfg["has_secret"] = bool(cfg.pop("api_secret"))
@@ -1409,6 +1492,11 @@ class Handler(BaseHTTPRequestHandler):
             if self.path == "/api/start":
                 bot(gid).start(grid_cfg(gid))
             self._send(200, {"ok": True, "id": gid})
+        elif self.path == "/api/split":
+            try:
+                self._send(200, split_start(body))
+            except BybitError as e:
+                self._send(400, {"error": str(e)})
         elif self.path == "/api/stop":
             gid = str(body.get("id") or "1")
             if gid in BOTS:
@@ -1511,6 +1599,18 @@ input[type=range]{padding:0;border:0;background:none;accent-color:var(--fg)}
 .seg button[data-dir="sell"][aria-checked="true"]{background:var(--sell);color:#fff}
 .seg button:disabled{cursor:not-allowed;opacity:.6}
 .seg button:focus-visible{outline:3px solid var(--buy);outline-offset:2px}
+.split{display:grid;gap:10px;padding:16px;border-radius:8px;background:var(--panel);box-shadow:inset 0 0 0 1px var(--line)}
+.split .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.split input,.split select{font:inherit;font-size:14px;padding:8px 10px;border-radius:4px;border:1px solid var(--line);background:var(--bg);color:var(--fg)}
+.split #spadd{flex:1;min-width:140px}
+.split #splev{width:70px}
+.chips{display:flex;gap:6px;flex-wrap:wrap;min-height:10px}
+.chip{display:inline-flex;align-items:center;gap:6px;font-weight:600;font-size:14px;padding:6px 6px 6px 12px;border-radius:999px;background:var(--bg);box-shadow:inset 0 0 0 1px var(--line)}
+.chip button{font:inherit;border:0;background:transparent;color:var(--muted);cursor:pointer;font-size:16px;line-height:1;padding:0 6px}
+.split .btn2{font:inherit;font-weight:600;font-size:14px;padding:8px 14px;border-radius:4px;border:0;background:var(--ink);color:var(--ink-fg);cursor:pointer}
+#spgo{font:inherit;font-weight:600;font-size:16px;padding:16px;border:0;border-radius:6px;background:var(--buy);color:#fff;cursor:pointer}
+#spgo:disabled{opacity:.5;cursor:not-allowed}
+.take.add{background:transparent;color:var(--fg);box-shadow:inset 0 0 0 1px var(--line);margin-left:4px}
 #maxbtn{font:inherit;font-weight:600;font-size:15px;padding:14px;border:0;border-radius:6px;background:var(--panel);color:var(--fg);box-shadow:inset 0 0 0 1px var(--line);cursor:pointer}
 #maxbtn[aria-pressed="true"]{background:var(--buy);color:#fff;box-shadow:none}
 #maxbtn:disabled{cursor:not-allowed;opacity:.6}
@@ -1630,6 +1730,16 @@ input[type=range]{padding:0;border:0;background:none;accent-color:var(--fg)}
 <div class="delrow"><button type="button" id="delbtn">Удалить эту сетку</button><span class="note" id="delnote"></span></div>
 <p class="note">Ключ создайте на Bybit только с правом «Спот торговля», без вывода средств, лучше с привязкой к вашему IP. Сохраняется в gridbot_config.json рядом с программой.</p>
 </details>
+<section class="split" id="split">
+<div class="lbl">Сетки на весь депозит</div>
+<div class="note" style="margin:0">1. Выберите монеты: впишите или добавьте из поиска волатильных ниже кнопкой «+ В список». 2. Нажмите кнопку — свободный депозит поделится поровну, на каждую монету запустится своя сетка.</div>
+<div class="row"><input id="spadd" placeholder="Монета, например SOL или BTC, ETH" autocomplete="off"><button type="button" class="btn2" id="spaddbtn">Добавить</button></div>
+<div class="chips" id="spchips"></div>
+<div class="row"><select id="spmk"><option value="futures">Фьючерсы USDT</option><option value="spot">Спот (без плеча)</option></select>
+<label class="row" id="splevbox" style="gap:6px">Плечо <input id="splev" type="number" min="1" max="100" value="3">x</label></div>
+<div class="note" id="spinfo" style="margin:0"></div>
+<button id="spgo" type="button" disabled>Выберите монеты</button>
+</section>
 <section class="scan">
 <div class="scanhead"><button id="scanbtn" type="button">Найти самые волатильные за 30 минут</button><span class="note" id="scaninfo">Ищет на рынке из настроек (спот или фьючерсы)</span></div>
 <div class="tbl" id="scantbl" hidden><table><thead><tr><th>Монета</th><th>Размах 30м</th><th>Свеча 1м</th><th>Изменение</th><th>Пила</th><th>Оборот 30м</th><th>Характер</th><th></th></tr></thead><tbody id="scanbody"></tbody></table></div>
@@ -1742,7 +1852,7 @@ $("delbtn").onclick=async()=>{const b=$("delbtn");
  const r=await fetch("/api/delete",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id:CUR})});
  if(!r.ok){$("delnote").textContent=(await r.json()).error;return}
  clearTimeout(saveT);CFG=null;CUR=null;await selectGrid(null)};
-loadCfg().then(poll);
+loadCfg().then(()=>{poll();spFunds()});
 function netTag(n,m,lv){const t=$("net");m=m||$("market").value;lv=lv||$("leverage").value;
  const mk=m==="futures"||m==="linear"?`фьючерсы ${lv}x`:"спот";
  t.textContent={testnet:"Bybit testnet",demo:"Bybit demo",mainnet:"Bybit · реальные деньги"}[n]+" · "+mk;t.className="tag"+(n==="mainnet"?" live":"")}
@@ -1759,7 +1869,7 @@ $("go").onclick=async()=>{
 };
 async function poll(){if(!CUR)return;
  try{const [st,gr]=await Promise.all([fetch("/api/state?id="+CUR),fetch("/api/grids")]);
-  GRIDS=await gr.json();renderTabs();if(st.ok){S=await st.json();render();capUI()}}
+  GRIDS=await gr.json();renderTabs();spUI();if(st.ok){S=await st.json();render();capUI()}}
  catch(e){$("statusText").textContent="Программа не отвечает"}}
 setInterval(poll,2000);
 function render(){
@@ -1836,11 +1946,13 @@ $("scanbtn").onclick=async()=>{
    <td class="${x.change>0?"b":x.change<0?"s":""}">${x.change>0?"+":""}${fmt(x.change)}%</td>
    <td>×${fmt(x.chop,1)}</td><td>${money(x.turn30)}</td>
    <td><span class="kind ${k}" title="${tip}">${x.kind}</span></td>
-   <td><button class="take" data-i="${i}">${S&&S.running?"В новую сетку":"Взять"}</button></td></tr>`}).join("");
+   <td style="white-space:nowrap"><button class="take" data-i="${i}">${S&&S.running?"В новую сетку":"Взять"}</button><button class="take add" data-add="${i}">+ В список</button></td></tr>`}).join("");
  }catch(e){info.textContent="Не получилось найти: "+e.message}
  b.disabled=false;b.textContent="Найти самые волатильные за 30 минут";
 };
 $("scanbody").addEventListener("click",async e=>{
+ const ad=e.target.closest(".take.add");
+ if(ad){const x=SCAN[+ad.dataset.add];spAdd(x.symbol,{range:x.sugg_range,levels:x.sugg_levels});ad.textContent="✓ В списке";return}
  const btn=e.target.closest(".take");if(!btn)return;const x=SCAN[+btn.dataset.i];
  if(S&&(S.running||S.busy))await newGrid();          // текущая сетка работает — монета пойдёт в новую сетку
  $("symbol").value=x.symbol;$("range_pct").value=x.sugg_range;$("levels").value=x.sugg_levels;saveSoon();
@@ -1849,6 +1961,52 @@ $("scanbody").addEventListener("click",async e=>{
   (x.grid_ok?"":x.kind==="пила"?" Осторожно: монета сейчас почти не двигается.":" Осторожно: монета сейчас в "+x.kind+"е.");
  $("go").scrollIntoView({behavior:"smooth",block:"center"});
 });
+// ---------- сетки на весь депозит ----------
+let SP={list:[],sugg:{}},SPFREE=null,SPERR="";
+try{const v=JSON.parse(localStorage.getItem("split")||"null");if(v&&Array.isArray(v.list))SP=v}catch(e){}
+const spSave=()=>{try{localStorage.setItem("split",JSON.stringify(SP))}catch(e){}};
+function spAdd(sym,sg){
+ String(sym).split(/[\s,;]+/).forEach(t=>{t=t.toUpperCase().replace("/","").trim();if(!t)return;if(!t.endsWith("USDT"))t+="USDT";
+  if(!SP.list.includes(t))SP.list.push(t);if(sg)SP.sugg[t]=sg});
+ spSave();spUI()}
+function spUI(){
+ const fut=$("spmk").value==="futures",n=SP.list.length,lv=fut?Math.max(1,Math.min(100,Number($("splev").value)||3)):1;
+ $("splevbox").hidden=!fut;
+ $("spchips").innerHTML=SP.list.map((x,i)=>`<span class="chip">${esc(x.replace("USDT",""))}<button type="button" data-rm="${i}" aria-label="Убрать ${esc(x)}">×</button></span>`).join("");
+ const run=GRIDS.filter(g=>g.running||g.busy).map(g=>g.symbol);
+ let t="";
+ if(SPERR)t=SPERR;
+ else if(SPFREE==null)t="Узнаю свободный депозит…";
+ else{const k=fut?0.95:0.97,per=n?Math.floor(SPFREE*k/n*100)/100:0;
+  t=`Свободно ${fmt(SPFREE)} USDT`+(fut?" маржи":"")+`. Берём ${fut?95:97}% (запас на комиссии)`+
+   (n?` → ${n} ${n===1?"сетка":n<5?"сетки":"сеток"} по ${fmt(per)} USDT`+(fut?`, объём каждой ${fmt(per*lv)} USDT при ${lv}x`:"")+".":".")+
+   (fut&&lv>3?` При ${lv}x ликвидация примерно при движении на ${(100/lv).toFixed(0)}%.`:"")}
+ const dup=SP.list.filter(x=>run.includes(x));
+ if(dup.length)t+=` Уже торгуются: ${dup.map(x=>x.replace("USDT","")).join(", ")} — уберите их из списка.`;
+ $("spinfo").textContent=t;
+ const b=$("spgo");b.disabled=!n||!!dup.length||!!LOCK;
+ b.textContent=n?`Поделить депозит поровну и запустить ${n} ${n===1?"сетку":n<5?"сетки":"сеток"}`:"Выберите монеты";
+}
+async function spFunds(){SPFREE=null;SPERR="";spUI();
+ try{const r=await fetch("/api/funds?market="+$("spmk").value),d=await r.json();if(!r.ok)throw new Error(d.error||r.status);SPFREE=d.free}
+ catch(e){SPERR="Не удалось узнать баланс: "+e.message}
+ spUI()}
+$("spaddbtn").onclick=()=>{spAdd($("spadd").value);$("spadd").value="";$("spadd").focus()};
+$("spadd").addEventListener("keydown",e=>{if(e.key==="Enter"){e.preventDefault();$("spaddbtn").click()}});
+$("spchips").addEventListener("click",e=>{const b=e.target.closest("button[data-rm]");if(!b)return;SP.list.splice(+b.dataset.rm,1);spSave();spUI()});
+$("spmk").onchange=()=>{SP.mk=$("spmk").value;spSave();spFunds()};
+$("splev").addEventListener("input",()=>{SP.lev=$("splev").value;spSave();spUI()});
+if(SP.mk)$("spmk").value=SP.mk;if(SP.lev)$("splev").value=SP.lev;
+$("spgo").onclick=async()=>{
+ const b=$("spgo");b.disabled=true;b.textContent="Запускаю…";await saveNow();
+ try{const r=await fetch("/api/split",{method:"POST",headers:{"Content-Type":"application/json"},
+   body:JSON.stringify({symbols:SP.list,market:$("spmk").value,leverage:Number($("splev").value)||3,sugg:SP.sugg,copy_from:CUR})});
+  const d=await r.json();if(!r.ok)throw new Error(d.error||r.status);
+  SPERR="";$("spinfo").textContent=`Запущено ${d.ids.length} сеток по ${fmt(d.per)} USDT`+(d.leverage>1?` с плечом ${d.leverage}x`:"")+". Вкладки сверху — по одной на монету.";
+  SP.list=[];SP.sugg={};spSave();
+  await selectGrid(d.ids[0]);setTimeout(spFunds,8000);
+ }catch(e){$("spinfo").textContent="Не запустилось: "+e.message;b.disabled=false;b.textContent="Попробовать ещё раз"}
+};
 function esc(s){return String(s).replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"})[c])}
 const cv=$("cv"),ctx=cv.getContext("2d");
 function draw(){
