@@ -1551,6 +1551,13 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, split_start(body))
             except BybitError as e:
                 self._send(400, {"error": str(e)})
+        elif self.path == "/api/stop_all":
+            n = 0
+            for b in list(BOTS.values()):
+                if b.running:
+                    b.stop()
+                    n += 1
+            self._send(200, {"ok": True, "stopped": n})
         elif self.path == "/api/stop":
             gid = str(body.get("id") or "1")
             if gid in BOTS:
@@ -1683,6 +1690,11 @@ input[type=range]{padding:0;border:0;background:none;accent-color:var(--fg)}
 .tabs .total b{font-family:var(--mono);color:var(--fg)}
 .delrow{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-top:14px}
 #delbtn{font:inherit;font-size:13px;padding:7px 12px;border-radius:4px;border:0;background:transparent;color:var(--sell);box-shadow:inset 0 0 0 1px var(--sell);cursor:pointer}
+.killrow{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:-6px}
+#killall{font:inherit;font-weight:600;font-size:14px;padding:10px 16px;border-radius:6px;border:0;background:transparent;color:var(--sell);box-shadow:inset 0 0 0 2px var(--sell);cursor:pointer}
+#killall.sure{background:var(--sell);color:#fff}
+#killall:disabled{opacity:.5;cursor:wait}
+#killall:focus-visible{outline:3px solid var(--sell);outline-offset:2px}
 #delbtn.sure{background:var(--sell);color:var(--ink-fg)}
 #delbtn:disabled{opacity:.4;cursor:not-allowed}
 .scan{display:grid;gap:12px}
@@ -1707,6 +1719,7 @@ input[type=range]{padding:0;border:0;background:none;accent-color:var(--fg)}
 </style></head><body>
 <div class="wrap">
 <nav class="tabs" id="tabs" aria-label="Сетки"></nav>
+<div class="killrow" id="killrow" hidden><button type="button" id="killall">Закрыть все сетки</button><span class="note" id="killnote"></span></div>
 <header><div><div class="pair" id="pair">—</div><div class="tag" id="net">—</div></div>
 <div class="status" id="status"><span class="dot"></span><span id="statusText">Остановлен</span></div></header>
 <section class="hero"><div><div class="lbl">Итог сетки</div><div class="pnl" id="pnl">+0.00</div>
@@ -1900,6 +1913,20 @@ function renderTabs(){
   `<button type="button" class="tab add" id="addtab">+ Новая сетка</button>`+
   `<span class="total" title="зафиксировано ${sg(real)} · в позициях ${sg(un)}">Работает ${run} из ${GRIDS.length} · всего <b class="${tot>=0?"b":"s"}">${sg(tot)} USDT</b> <span class="i">(зафикс. ${sg(real)} · в позициях ${sg(un)})</span></span>`;
 }
+let KILLT=null;
+function killUI(){const run=GRIDS.filter(g=>g.running).length,b=$("killall");
+ $("killrow").hidden=!run&&!b.disabled;if(b.classList.contains("sure")||b.disabled)return;
+ b.textContent=`Закрыть все сетки (${run})`}
+$("killall").onclick=async()=>{const b=$("killall"),run=GRIDS.filter(g=>g.running).length;
+ if(!b.classList.contains("sure")){b.classList.add("sure");b.textContent=`Точно закрыть все ${run}? Нажмите ещё раз`;
+  $("killnote").textContent="Снимутся все ордера, позиции на фьючерсах закроются по рынку";
+  clearTimeout(KILLT);KILLT=setTimeout(()=>{b.classList.remove("sure");$("killnote").textContent="";killUI()},5000);return}
+ clearTimeout(KILLT);b.classList.remove("sure");b.disabled=true;b.textContent="Закрываю все сетки…";
+ try{const r=await fetch("/api/stop_all",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"}),d=await r.json();
+  if(!r.ok)throw new Error(d.error||r.status);
+  $("killnote").textContent=`Остановлено сеток: ${d.stopped}. Ордера снимаются, позиции закрываются — смотрите вкладки.`}
+ catch(e){$("killnote").textContent="Не получилось: "+e.message}
+ setTimeout(()=>{b.disabled=false;killUI()},4000);poll()};
 $("tabs").addEventListener("click",e=>{const b=e.target.closest(".tab");if(!b)return;
  if(b.id==="addtab")newGrid();else if(b.dataset.id!==CUR)selectGrid(b.dataset.id)});
 $("delbtn").onclick=async()=>{const b=$("delbtn");
@@ -1925,7 +1952,7 @@ $("go").onclick=async()=>{
 };
 async function poll(){if(!CUR)return;
  try{const [st,gr]=await Promise.all([fetch("/api/state?id="+CUR),fetch("/api/grids")]);
-  GRIDS=await gr.json();renderTabs();spUI();if(st.ok){S=await st.json();render();capUI()}}
+  GRIDS=await gr.json();renderTabs();spUI();killUI();if(st.ok){S=await st.json();render();capUI()}}
  catch(e){$("statusText").textContent="Программа не отвечает"}}
 setInterval(poll,2000);
 function render(){
