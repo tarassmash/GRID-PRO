@@ -412,6 +412,7 @@ class Bot:
         self.trail_pnl = 0.0
         self.per_min, self.geo = Decimal(0), False
         self.short = False
+        self.neutral = False
         self.trail_up = self.trail_down = False
         self.up_limit = self.dn_limit = Decimal(0)
         self.radar, self.radar_mode, self.radar_sens = None, "off", "mid"
@@ -463,7 +464,7 @@ class Bot:
                     "fills": self.fills[-100:], "log": self.log[:60], "profit": self.profit,
                     "upnl": upnl, "total": self.profit + upnl,
                     "trades": self.trades, "open": len(self.orders), "bal": b,
-                    "market": self.cat, "leverage": self.lev, "pos": pos, "direction": "sell" if self.short else "both",
+                    "market": self.cat, "leverage": self.lev, "pos": pos, "direction": "sell" if self.short else "neutral" if self.neutral else "both",
                     "trail": {"up": self.trail_up, "down": self.trail_down,
                               "nup": self.shift_up, "ndn": self.shift_dn, "pnl": self.trail_pnl,
                               "wait": self.trail_wait, "pct": float(self.trail_pct * 100),
@@ -583,9 +584,14 @@ class Bot:
             raise BybitError("Уровней должно быть от 3 до 50")
         rng = float(cfg["range_pct"]) / 100
         self.short = cfg.get("direction") == "sell"
-        if self.short and self.cat != "linear":
-            raise BybitError("«Только Sell» работает на фьючерсах: на споте нельзя продать то, чего нет. "
+        self.neutral = cfg.get("direction") == "neutral"
+        if (self.short or self.neutral) and self.cat != "linear":
+            what = "«Только Sell»" if self.short else "«Нейтральная»"
+            raise BybitError(f"{what} работает на фьючерсах: на споте нельзя продать то, чего нет. "
                              "Выберите рынок «Фьючерсы USDT».")
+        if self.neutral and n % 2 == 0:   # цена ровно на среднем уровне: поровну линий Buy ниже и Sell выше
+            n += 1
+            self.say("info", f"нейтральная сетка: уровней {n} (нечётное число — цена на среднем уровне)")
         if self.short:   # шорт-сетка: цена у низа диапазона, почти все линии выше цены
             lo, hi = float(p) * (1 - 0.2 * rng), float(p) * (1 + 1.8 * rng)
         else:
@@ -629,11 +635,20 @@ class Bot:
         mult = Decimal(1)
         if cfg.get("lot_mode") == "geo":
             mult = min(max(Decimal(str(cfg.get("lot_mult") or "1.3")), Decimal("1.01")), Decimal(3))
-        m = max([i for i in range(n - 1) if L[i] <= p], default=-1)      # ячейка, в которой сейчас цена
+        if self.neutral:   # средний уровень = цена: ячейки ниже — Buy, выше — Sell, деньги ровно пополам
+            mid = (n - 1) // 2
+            m = mid - 1
+        else:
+            m = max([i for i in range(n - 1) if L[i] <= p], default=-1)      # ячейка, в которой сейчас цена
         dist = {i: (m - i) if i <= m else (i - m - 1) for i in range(n - 1)}
         w = {i: mult ** dist[i] for i in dist}
-        sw = sum(w.values())
-        per = {i: total * w[i] / sw for i in w}
+        if self.neutral:
+            wb = sum(w[i] for i in w if i <= m)
+            ws = sum(w[i] for i in w if i > m)
+            per = {i: (total / 2) * w[i] / (wb if i <= m else ws) for i in w}
+        else:
+            sw = sum(w.values())
+            per = {i: total * w[i] / sw for i in w}
         self.per_min, self.geo = min(per.values()), mult > 1
         if self.per_min < min_amt * Decimal("1.05"):
             hint = " или множитель лота" if self.geo else ""
@@ -652,8 +667,14 @@ class Bot:
                                  f"({min_qty} {self.base_coin} ≈ {need:.2f} {self.quote_coin}). Увеличьте капитал{hint}.")
             self.cells[i] = {"i": i, "qty": qty, "cost": qty * L[i] * (1 + self.fee)}
 
-        sell_cells = [c for c in self.cells.values() if L[c["i"]] > p]
-        buy_cells = [c for c in self.cells.values() if L[c["i"]] <= p]
+        if self.neutral:
+            sell_cells = [c for c in self.cells.values() if c["i"] > m]
+            buy_cells = [c for c in self.cells.values() if c["i"] <= m]
+            for c in sell_cells:
+                c["mode"] = "short"
+        else:
+            sell_cells = [c for c in self.cells.values() if L[c["i"]] > p]
+            buy_cells = [c for c in self.cells.values() if L[c["i"]] <= p]
         need_base = sum(c["qty"] for c in sell_cells)
         need_quote = sum(c["qty"] * L[c["i"]] for c in buy_cells)
 
@@ -707,6 +728,18 @@ class Bot:
         if liq_move < rng * 1.2:
             self.say("err", f"плечо {self.lev}x: ликвидация примерно при движении на {liq_move:.1f}%, "
                             f"а диапазон ±{rng}%. Бот закроет позицию раньше ликвидации.")
+        if self.neutral:
+            sb = sum(c["qty"] * L[c["i"]] for c in buy_cells)
+            ss = sum(c["qty"] * L[c["i"] + 1] for c in sell_cells)
+            self.say("info", f"нейтральная сетка без начальной позиции: Buy {len(buy_cells)} шт. на {sb:.0f} USDT ниже цены, "
+                             f"Sell {len(sell_cells)} шт. на {ss:.0f} USDT выше. Зарабатывает на колебаниях в обе стороны")
+            _, self.bid, self.ask = api.bbo(sym)
+            for c in buy_cells:
+                self._put(api, c, "Buy", c["qty"])
+            for c in sell_cells:
+                self._put(api, c, "Sell", c["qty"])
+            self.say("info", f"выставлено ордеров: {len(self.orders)}")
+            return
         if self.short:
             self.say("info", f"режим «Только Sell»: шорт-лимитки на линиях выше цены, тейки reduce-only, "
                              f"сетка {self.levels[0]} – {self.levels[-1]}")
@@ -866,6 +899,9 @@ class Bot:
     def _trail(self, api, p):
         if self.short:
             return self._trail_short(api, p)
+        if self.neutral:   # нейтральная сетка стоит на месте, за диапазоном срабатывает стоп
+            self.up_at = self.dn_at = None
+            return
         """Сдвиг сетки, когда цена ушла за границу на trail_pct %. Сдвигаем столько шагов, сколько нужно,
         чтобы цена снова оказалась внутри сетки."""
         top, bot = self.lv(self.kmin + self.n - 1), self.lv(self.kmin)
@@ -1047,6 +1083,12 @@ class Bot:
                               f"Позиция закрыта, бот остановлен для защиты.")
                 self.running = False
                 return
+        elif self.neutral and (p > self.lv(self.kmin + self.n - 1) * (1 + self.stop_pct)
+                               or p < self.lv(self.kmin) * (1 - self.stop_pct)):
+            self.error = (f"Цена {p} ушла за нейтральную сетку более чем на {float(self.stop_pct*100):g}%. "
+                          f"Позиция закрыта, бот остановлен для защиты.")
+            self.running = False
+            return
         elif not self._can_trail_down() and p < self.lv(self.kmin) * (1 - self.stop_pct):
             why = "достигнут предел трейлинга вниз, " if self.trail_down else ""
             self.error = (f"Цена {p}: {why}ушла ниже сетки более чем на {float(self.stop_pct*100):g}%. "
@@ -1187,6 +1229,19 @@ class Bot:
                 self.say("buy", f"тейк {filled} {self.base_coin} по {avg}", round(pr, 4))
                 if c["i"] in self.cells and (self.ask is None or self.lv(c["i"] + 1) > self.ask):
                     self._put(api, c, "Sell", c["qty"])
+            return
+        if c.get("mode") == "short":     # нейтральная сетка, верхняя ячейка: Sell открывает шорт, Buy закрывает
+            if o["side"] == "Sell":
+                c["entry"] = filled * avg * (1 - self.fee)
+                self.fills.append({"t": t, "p": float(avg), "k": "sell"})
+                self.say("sell", f"шорт {filled} {self.base_coin} по {avg}")
+                self._put(api, c, "Buy", filled)
+            else:
+                pr = float(c.get("entry", filled * avg) - filled * avg * (1 + self.fee))
+                self.profit += pr
+                self.fills.append({"t": t, "p": float(avg), "k": "buy"})
+                self.say("buy", f"тейк шорта {filled} {self.base_coin} по {avg}", round(pr, 4))
+                self._put(api, c, "Sell", c["qty"])
             return
         if o["side"] == "Buy":
             c["cost"] = filled * avg * (1 + self.fee)
@@ -1360,8 +1415,7 @@ def split_start(body):
                                         **{k2: v for k2, v in tpl.items() if k2 in GRID_KEYS}, was_running=False)
             g = st["grids"][gid]
             g.update(symbol=x, market=market, leverage=lev, capital=float(per), cap_max=False)
-            if market == "spot" and g.get("direction") == "sell":
-                g["direction"] = "both"
+            g["direction"] = "neutral" if market == "futures" else "both"
             sg = sugg.get(x) or {}
             if sg.get("range"):
                 g["range_pct"] = sg["range"]
@@ -1593,10 +1647,11 @@ input[type=range]{padding:0;border:0;background:none;accent-color:var(--fg)}
 .presetrow{display:flex;gap:12px;align-items:center;flex-wrap:wrap}
 #presetbtn{font:inherit;font-size:13px;font-weight:600;padding:8px 12px;border-radius:4px;border:0;background:var(--ink);color:var(--ink-fg);cursor:pointer}
 .pnlsub{font-family:var(--mono);font-size:13px;color:var(--muted);margin-top:6px;font-variant-numeric:tabular-nums}
-.seg{display:grid;grid-template-columns:1fr 1fr;gap:0;border-radius:6px;box-shadow:inset 0 0 0 1px var(--line);background:var(--panel);padding:3px}
+.seg{display:grid;grid-template-columns:1fr 1fr 1fr;gap:0;border-radius:6px;box-shadow:inset 0 0 0 1px var(--line);background:var(--panel);padding:3px}
 .seg button{font:inherit;font-weight:600;font-size:14px;padding:10px;border:0;border-radius:4px;background:transparent;color:var(--muted);cursor:pointer}
 .seg button[aria-checked="true"]{background:var(--ink);color:var(--ink-fg)}
 .seg button[data-dir="sell"][aria-checked="true"]{background:var(--sell);color:#fff}
+.seg button[data-dir="neutral"][aria-checked="true"]{background:var(--buy);color:#fff}
 .seg button:disabled{cursor:not-allowed;opacity:.6}
 .seg button:focus-visible{outline:3px solid var(--buy);outline-offset:2px}
 .split{display:grid;gap:10px;padding:16px;border-radius:8px;background:var(--panel);box-shadow:inset 0 0 0 1px var(--line)}
@@ -1677,9 +1732,10 @@ input[type=range]{padding:0;border:0;background:none;accent-color:var(--fg)}
 </section>
 <div class="err" id="err" hidden></div>
 <div class="seg" role="radiogroup" aria-label="Какие лимитки ставить">
-<button type="button" role="radio" data-dir="both">Обе стороны</button>
+<button type="button" role="radio" data-dir="neutral">Нейтральная ½ Buy · ½ Sell</button>
+<button type="button" role="radio" data-dir="both">Обе стороны (лонг)</button>
 <button type="button" role="radio" data-dir="sell">Только Sell</button>
-<select id="direction" hidden><option value="both">both</option><option value="sell">sell</option></select>
+<select id="direction" hidden><option value="neutral">neutral</option><option value="both">both</option><option value="sell">sell</option></select>
 </div>
 <div class="note" id="dirnote"></div>
 <button id="maxbtn" type="button" aria-pressed="false">Брать по максимуму на весь депозит</button>
@@ -1732,7 +1788,7 @@ input[type=range]{padding:0;border:0;background:none;accent-color:var(--fg)}
 </details>
 <section class="split" id="split">
 <div class="lbl">Сетки на весь депозит</div>
-<div class="note" style="margin:0">1. Выберите монеты: впишите или добавьте из поиска волатильных ниже кнопкой «+ В список». 2. Нажмите кнопку — свободный депозит поделится поровну, на каждую монету запустится своя сетка.</div>
+<div class="note" style="margin:0">Каждая сетка нейтральная: половина капитала на Buy ниже цены, половина на Sell выше — заработок, куда бы рынок ни пошёл (на фьючерсах). 1. Выберите монеты: впишите или добавьте из поиска волатильных ниже кнопкой «+ В список». 2. Нажмите кнопку — свободный депозит поделится поровну, на каждую монету запустится своя сетка.</div>
 <div class="row"><input id="spadd" placeholder="Монета, например SOL или BTC, ETH" autocomplete="off"><button type="button" class="btn2" id="spaddbtn">Добавить</button></div>
 <div class="chips" id="spchips"></div>
 <div class="row"><select id="spmk"><option value="futures">Фьючерсы USDT</option><option value="spot">Спот (без плеча)</option></select>
@@ -1797,11 +1853,11 @@ function dirUI(){
  document.querySelectorAll(".seg button").forEach(b=>b.setAttribute("aria-checked",String(b.dataset.dir===d)));
  $("tul").textContent=sell?"Трейлинг за ценой вниз (без убытка)":"Трейлинг вверх";
  $("tdl").textContent=sell?"Трейлинг вверх против шорта (фиксирует убыток)":"Трейлинг вниз";
- $("dirnote").textContent=sell?"Только Sell: шорт-лимитки на линиях выше цены, тейки на линию ниже только закрывают шорт и никогда не откроют лонг. Работает на фьючерсах. Стоп: цена ушла выше сетки на 5%.":"";
+ $("dirnote").textContent=d==="neutral"?"Нейтральная: старт без позиции, половина капитала на Buy-лимитки ниже цены, половина на Sell-лимитки выше. Купил — продаёт линией выше, продал (шорт) — откупает линией ниже: прибыль на колебаниях в обе стороны. Работает на фьючерсах. Без трейлинга: если цена ушла за сетку на «Стоп» %, позиция закрывается.":sell?"Только Sell: шорт-лимитки на линиях выше цены, тейки на линию ниже только закрывают шорт и никогда не откроют лонг. Работает на фьючерсах. Стоп: цена ушла выше сетки на 5%.":"";
 }
 document.querySelector(".seg").addEventListener("click",e=>{const b=e.target.closest("button[data-dir]");if(!b||b.disabled)return;
  $("direction").value=b.dataset.dir;
- if(b.dataset.dir==="sell"&&$("market").value!=="futures"){$("market").value="futures";levUI();lotUI();netTag($("network").value)}
+ if(b.dataset.dir!=="both"&&$("market").value!=="futures"){$("market").value="futures";levUI();lotUI();netTag($("network").value)}
  dirUI();saveSoon()});
 function fillForm(){
  const g=CFG.grids[CUR]||{};
@@ -1838,7 +1894,7 @@ let GRIDS=[];
 function renderTabs(){
  const t=$("tabs"),tot=GRIDS.reduce((a,g)=>a+(g.total||0),0),real=GRIDS.reduce((a,g)=>a+(g.profit||0),0),
   un=GRIDS.reduce((a,g)=>a+(g.upnl||0),0),run=GRIDS.filter(g=>g.running).length,sg=v=>(v>=0?"+":"−")+fmt(Math.abs(v));
- t.innerHTML=GRIDS.map(g=>{const sym=(g.symbol||"—").replace("USDT",""),mk=(g.market==="futures"?` ${g.leverage}x`:" спот")+(g.direction==="sell"?" sell":"");
+ t.innerHTML=GRIDS.map(g=>{const sym=(g.symbol||"—").replace("USDT",""),mk=(g.market==="futures"?` ${g.leverage}x`:" спот")+(g.direction==="sell"?" sell":g.direction==="neutral"&&g.market==="futures"?" ½/½":"");
   const v=g.total||0,p=g.running||g.trades||v?` <b class="${v>=0?"b":"s"}">${v>=0?"+":"−"}${fmt(Math.abs(v))}</b>`:"";
   return `<button type="button" class="tab${g.running?" on":""}${g.error?" err":""}" data-id="${g.id}" aria-current="${g.id===CUR}"><span class="d"></span>${esc(sym)}<span class="i">${mk}</span>${p}</button>`}).join("")+
   `<button type="button" class="tab add" id="addtab">+ Новая сетка</button>`+
@@ -1856,7 +1912,7 @@ loadCfg().then(()=>{poll();spFunds()});
 function netTag(n,m,lv){const t=$("net");m=m||$("market").value;lv=lv||$("leverage").value;
  const mk=m==="futures"||m==="linear"?`фьючерсы ${lv}x`:"спот";
  t.textContent={testnet:"Bybit testnet",demo:"Bybit demo",mainnet:"Bybit · реальные деньги"}[n]+" · "+mk;t.className="tag"+(n==="mainnet"?" live":"")}
-$("market").addEventListener("input",()=>{netTag($("network").value);if($("market").value!=="futures"&&$("direction").value==="sell"){$("direction").value="both";dirUI()}});$("leverage").addEventListener("input",()=>netTag($("network").value));
+$("market").addEventListener("input",()=>{netTag($("network").value);if($("market").value!=="futures"&&$("direction").value!=="both"){$("direction").value="both";dirUI()}});$("leverage").addEventListener("input",()=>netTag($("network").value));
 $("network").onchange=e=>netTag(e.target.value);
 let STARTERR="";
 $("go").onclick=async()=>{
