@@ -1511,6 +1511,10 @@ input[type=range]{padding:0;border:0;background:none;accent-color:var(--fg)}
 .seg button[data-dir="sell"][aria-checked="true"]{background:var(--sell);color:#fff}
 .seg button:disabled{cursor:not-allowed;opacity:.6}
 .seg button:focus-visible{outline:3px solid var(--buy);outline-offset:2px}
+#maxbtn{font:inherit;font-weight:600;font-size:15px;padding:14px;border:0;border-radius:6px;background:var(--panel);color:var(--fg);box-shadow:inset 0 0 0 1px var(--line);cursor:pointer}
+#maxbtn[aria-pressed="true"]{background:var(--buy);color:#fff;box-shadow:none}
+#maxbtn:disabled{cursor:not-allowed;opacity:.6}
+#maxbtn:focus-visible{outline:3px solid var(--buy);outline-offset:2px}
 #dirnote{margin-top:-14px}
 .tabs{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
 .tab{font:inherit;font-size:13px;display:inline-flex;align-items:center;gap:8px;padding:8px 12px;border-radius:6px;border:0;background:var(--panel);color:var(--fg);box-shadow:inset 0 0 0 1px var(--line);cursor:pointer}
@@ -1578,6 +1582,8 @@ input[type=range]{padding:0;border:0;background:none;accent-color:var(--fg)}
 <select id="direction" hidden><option value="both">both</option><option value="sell">sell</option></select>
 </div>
 <div class="note" id="dirnote"></div>
+<button id="maxbtn" type="button" aria-pressed="false">Брать по максимуму на весь депозит</button>
+<div class="note" id="maxnote"></div>
 <button id="go" type="button">Запустить бота</button>
 <section class="stats">
 <div class="stat"><span>Сделок</span><b id="tc">0</b></div>
@@ -1645,14 +1651,20 @@ function levUI(){const fut=$("market").value==="futures",lv=Number($("leverage")
 ["market","leverage","range_pct","capital"].forEach(k=>$(k).addEventListener("input",levUI));
 function capUI(){
  const on=$("cap_max").checked,fut=$("market").value==="futures";$("capital").disabled=on;$("capnote").hidden=!on;
+ const mb=$("maxbtn");mb.setAttribute("aria-pressed",String(on));mb.disabled=!!(S&&(S.running||S.busy));
+ mb.textContent=on?"✓ Весь депозит: включено":"Брать по максимуму на весь депозит";
+ $("maxnote").textContent=on?"":`Сейчас капитал ${fmt(Number($("capital").value)||0)} USDT из настроек.`;
  if(!on)return;
  const free=S&&S.bal?(fut?S.bal._margin:S.bal[S.quote||"USDT"]):null,k=fut?0.95:0.97;
  if(free!=null&&!(S&&S.running)){$("capital").value=Math.floor(free*k*100)/100;levUI();lotUI()}
  $("capnote").textContent=`При запуске капитал = ${fut?"95% свободной маржи":"97% свободных USDT"} на счёте (запас на комиссии`+
   (fut?" и просадку). С плечом объём сетки = капитал × плечо.":" и докупку монеты).")+
   (free!=null?` Сейчас свободно ${fmt(free)} USDT.`:" Сумма определится при запуске.");
+ $("maxnote").textContent=$("capnote").textContent;
 }
 ["cap_max","market"].forEach(k=>$(k).addEventListener("change",capUI));
+$("maxbtn").onclick=()=>{$("cap_max").checked=!$("cap_max").checked;capUI();saveSoon()};
+$("capital").addEventListener("input",capUI);
 function lotUI(){
  const geo=$("lot_mode").value==="geo";$("multbox").hidden=!geo;
  const n=Number($("levels").value)||12,fut=$("market").value==="futures",lv=fut?Number($("leverage").value)||1:1;
@@ -1747,7 +1759,7 @@ $("go").onclick=async()=>{
 };
 async function poll(){if(!CUR)return;
  try{const [st,gr]=await Promise.all([fetch("/api/state?id="+CUR),fetch("/api/grids")]);
-  GRIDS=await gr.json();renderTabs();if(st.ok){S=await st.json();render();if($("cap_max").checked)capUI()}}
+  GRIDS=await gr.json();renderTabs();if(st.ok){S=await st.json();render();capUI()}}
  catch(e){$("statusText").textContent="Программа не отвечает"}}
 setInterval(poll,2000);
 function render(){
