@@ -29,7 +29,9 @@ DEFAULT_CFG = {"api_key": "", "api_secret": "", "network": "testnet", "market": 
                "trail_up": True, "trail_down": False, "trail_up_limit": 0, "trail_down_limit": 0,
                "trail_pct": 0.5, "trail_down_cap": 5, "stop_pct": 2,
                "radar": "pause", "radar_sens": "mid", "lot_mode": "geo", "lot_mult": 1.4,
-               "direction": "both"}
+               "direction": "both", "cap_max": False}
+CAP_MAX_SPOT = Decimal("0.97")   # «весь депозит» на споте: запас на комиссию и докупку монеты быстрой лимиткой
+CAP_MAX_FUT = Decimal("0.95")    # «весь депозит» на фьючерсах: запас маржи на комиссии и просадку
 SPOT_FEE = Decimal("0.001")      # комиссия спота Bybit 0.1%
 SPOT_FEE_BUF = Decimal("0.0015") # запас: комиссия покупки на споте списывается монетой
 FUT_FEE = Decimal("0.0002")      # мейкерская комиссия фьючерсов (бот торгует лимитками Post-Only)
@@ -604,7 +606,19 @@ class Bot:
                 self.say("err", "радар не запустился: " + str(e))
                 self.radar = None
 
-        cap = Decimal(str(cfg["capital"]))
+        self.bal = api.balances()
+        if cfg.get("cap_max"):     # «весь депозит»: капитал = свободные средства на момент запуска
+            if self.cat == "linear":
+                free = self.bal.get("_margin", Decimal(0))
+                cap = (free * CAP_MAX_FUT).quantize(Decimal("0.01"), ROUND_DOWN)
+            else:
+                free = self.bal.get(self.quote_coin, {}).get("free", Decimal(0))
+                cap = (free * CAP_MAX_SPOT).quantize(Decimal("0.01"), ROUND_DOWN)
+            if cap <= 0:
+                raise BybitError(f"Свободных {self.quote_coin} на счёте нет — «весь депозит» не из чего взять.")
+            self.say("info", f"весь депозит: свободно {free:.2f} {self.quote_coin}, капитал бота {cap} {self.quote_coin}")
+        else:
+            cap = Decimal(str(cfg["capital"]))
         self.cap = cap
         self.trail_pct = min(max(Decimal(str(cfg.get("trail_pct") if cfg.get("trail_pct") is not None else 2)), Decimal(0)), Decimal(50)) / 100
         self.down_cap = max(Decimal(str(cfg.get("trail_down_cap") if cfg.get("trail_down_cap") is not None else 5)), Decimal(0)) / 100
@@ -643,7 +657,6 @@ class Bot:
         need_base = sum(c["qty"] for c in sell_cells)
         need_quote = sum(c["qty"] * L[c["i"]] for c in buy_cells)
 
-        self.bal = api.balances()
         if self.cat == "linear":
             self._setup_futures(api, cfg, p, cap, sell_cells, buy_cells, need_base)
             return
@@ -1600,6 +1613,8 @@ input[type=range]{padding:0;border:0;background:none;accent-color:var(--fg)}
 <label>Предел вниз, цена (0 = без предела)<input id="trail_down_limit" type="number" min="0" step="any"></label>
 <p class="full note" style="margin:0">Сетка сдвигается, когда цена ушла за её границу на заданный процент, сразу, без ожидания по времени. Сдвигается столько шагов, сколько нужно, чтобы цена снова оказалась внутри. Вверх: бот снимает нижнюю покупку, докупает монету и ставит продажу выше. Вниз: продаёт монету верхней ячейки и ставит покупку ниже — <b>каждый сдвиг вниз фиксирует убыток</b>, поэтому он выключен по умолчанию.</p>
 <label>Капитал (маржа), USDT<input id="capital" type="number" min="10"></label>
+<label class="chk"><input type="checkbox" id="cap_max"> Брать по максимуму на весь депозит</label>
+<div class="full note" id="capnote" style="margin:0" hidden></div>
 <label>Диапазон ± %<input id="range_pct" type="number" min="1" max="50" step="0.5"></label>
 <label>Уровней<input id="levels" type="number" min="3" max="50"></label>
 <label>Лоты<select id="lot_mode"><option value="equal">Одинаковые</option><option value="geo">Геометрические (растут к краям)</option></select></label>
@@ -1618,8 +1633,8 @@ input[type=range]{padding:0;border:0;background:none;accent-color:var(--fg)}
 </div>
 <script>
 const $=id=>document.getElementById(id);
-const F=["api_key","api_secret","network","market","leverage","symbol","capital","range_pct","levels","trail_up","trail_down","trail_up_limit","trail_down_limit","radar","radar_sens","lot_mode","lot_mult","trail_pct","trail_down_cap","direction","stop_pct"];
-const CHK=["trail_up","trail_down"];
+const F=["api_key","api_secret","network","market","leverage","symbol","capital","range_pct","levels","trail_up","trail_down","trail_up_limit","trail_down_limit","radar","radar_sens","lot_mode","lot_mult","trail_pct","trail_down_cap","direction","stop_pct","cap_max"];
+const CHK=["trail_up","trail_down","cap_max"];
 function levUI(){const fut=$("market").value==="futures",lv=Number($("leverage").value)||1,rng=Number($("range_pct").value)||8;
  $("levbox").hidden=!fut;$("levval").textContent=lv+"x";const w=$("levwarn");
  if(!fut){w.hidden=true;return}
@@ -1628,6 +1643,16 @@ function levUI(){const fut=$("market").value==="futures",lv=Number($("leverage")
   (liq<rng*1.2?`, это внутри диапазона ±${rng}%. Бот закроет позицию раньше, но убыток будет почти весь капитал. Уменьшите плечо или диапазон.`:". Комиссии и просадки умножаются на плечо.")+
   (lv>3?` По тесту на истории худший день внутридневной сетки без плеча −4.5…−5.8%, при ${lv}x это −${(4.5*lv).toFixed(0)}…−${Math.min(5.8*lv,100).toFixed(0)}% капитала.`:"");}
 ["market","leverage","range_pct","capital"].forEach(k=>$(k).addEventListener("input",levUI));
+function capUI(){
+ const on=$("cap_max").checked,fut=$("market").value==="futures";$("capital").disabled=on;$("capnote").hidden=!on;
+ if(!on)return;
+ const free=S&&S.bal?(fut?S.bal._margin:S.bal[S.quote||"USDT"]):null,k=fut?0.95:0.97;
+ if(free!=null&&!(S&&S.running)){$("capital").value=Math.floor(free*k*100)/100;levUI();lotUI()}
+ $("capnote").textContent=`При запуске капитал = ${fut?"95% свободной маржи":"97% свободных USDT"} на счёте (запас на комиссии`+
+  (fut?" и просадку). С плечом объём сетки = капитал × плечо.":" и докупку монеты).")+
+  (free!=null?` Сейчас свободно ${fmt(free)} USDT.`:" Сумма определится при запуске.");
+}
+["cap_max","market"].forEach(k=>$(k).addEventListener("change",capUI));
 function lotUI(){
  const geo=$("lot_mode").value==="geo";$("multbox").hidden=!geo;
  const n=Number($("levels").value)||12,fut=$("market").value==="futures",lv=fut?Number($("leverage").value)||1:1;
@@ -1662,7 +1687,7 @@ function fillForm(){
   if(GLOBAL.includes(k)){if(k==="api_secret")$(k).value=CFG.has_secret?"********":"";else $(k).value=CFG[k]??"";return}
   if(CHK.includes(k))$(k).checked=!!g[k];else $(k).value=g[k]??"";
  });
- $("pair").textContent=(g.symbol||"—").replace("USDT"," / USDT");netTag(CFG.network);levUI();lotUI();dirUI();
+ $("pair").textContent=(g.symbol||"—").replace("USDT"," / USDT");netTag(CFG.network);levUI();lotUI();dirUI();capUI();
 }
 async function loadCfg(){
  CFG=await (await fetch("/api/config")).json();
@@ -1722,7 +1747,7 @@ $("go").onclick=async()=>{
 };
 async function poll(){if(!CUR)return;
  try{const [st,gr]=await Promise.all([fetch("/api/state?id="+CUR),fetch("/api/grids")]);
-  GRIDS=await gr.json();renderTabs();if(st.ok){S=await st.json();render()}}
+  GRIDS=await gr.json();renderTabs();if(st.ok){S=await st.json();render();if($("cap_max").checked)capUI()}}
  catch(e){$("statusText").textContent="Программа не отвечает"}}
 setInterval(poll,2000);
 function render(){
