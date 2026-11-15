@@ -8,12 +8,16 @@ const HOSTS = {testnet: "https://api-testnet.bybit.com", demo: "https://api-demo
 const DEFAULT_CFG = {api_key: "", api_secret: "", network: "testnet", market: "spot",
   leverage: 1, symbol: "BTCUSDT", capital: 200, range_pct: 5, levels: 4,
   trail_up: true, trail_down: false, trail_up_limit: 0, trail_down_limit: 0,
-  trail_pct: 0.5, trail_down_cap: 5, stop_pct: 2,
+  trail_pct: 0.5, trail_down_cap: 5, stop_pct: 2, emerg_pct: 10,
   radar: "pause", radar_sens: "mid", lot_mode: "geo", lot_mult: 1.4,
   direction: "both", cap_max: false};
 const CAP_MAX_SPOT = 0.97, CAP_MAX_FUT = 0.95;
 const SPOT_FEE = 0.001, SPOT_FEE_BUF = 0.0015, FUT_FEE = 0.0002;
 const CHASE_TRIES = 6, CHASE_WAIT = 2500;
+// По рынку бот не входит и не выходит. Единственный выход по рынку — аварийный стоп:
+// цена ушла от цены запуска на emerg_pct % против позиции (или до ликвидации осталась треть пути).
+const SETUP_TRIES = 20;   // вход при запуске только лимитками: до 20 перестановок (~50 с), иначе бот не стартует
+const CLOSE_TRIES = 12;   // закрытие позиции при остановке лимитками: до 12 перестановок (~30 с)
 const LIQ_GUARD = 0.35, STOP_BELOW = 0.05, POLL_MS = 3000, TRAIL_MAX_STEPS = 10;
 const RADAR_SENS = {low: [75, 45], mid: [60, 35], high: [48, 28]};
 const RADAR_CALM_TICKS = 20, RADAR_MAX_PAUSE = 30 * 60, RADAR_EXIT = 90;
@@ -268,7 +272,7 @@ class Grid {
       trail_pnl: 0, per_min: 0, geo: false, short: false, neutral: false, trail_up: false, trail_down: false,
       up_limit: 0, dn_limit: 0, radar: null, radar_mode: "off", radar_sens: "mid", guard: null, guard_t: 0,
       paused: {}, calm: 0, exit_spot: false, bid: null, ask: null, maker_n: 0, taker_n: 0, fee: SPOT_FEE,
-      fee_buf: SPOT_FEE_BUF, min_amt: 0, min_qty: 0, radar_errs: 0});
+      fee_buf: SPOT_FEE_BUF, min_amt: 0, min_qty: 0, radar_errs: 0, exit_limit: false, emergency: false, ref: null, emerg: 0.10});
   }
   say(kind, text, val = null) {
     this.log.unshift({t: hhmmss(), k: kind, text, v: val}); this.log.length = Math.min(this.log.length, 120);
@@ -342,12 +346,19 @@ class Grid {
           let coins = Object.values(this.orders).filter(o => o.side === "Sell").reduce((a, o) => a + o.qty, 0);
           coins += Object.values(this.paused).filter(c => c.side === "Sell").reduce((a, c) => a + c.sell_qty, 0);
           await api.cancelAll(this.symbol);
-          if (this.exit_spot && this.cat === "spot" && coins >= this.min_qty) {
-            await api.place(this.symbol, "Sell", q(coins, this.bstep), null, {market: true});
-            this.say("sell", `аварийная продажа ${q(coins, this.bstep)} ${this.base_coin} по рынку`);
+          if (this.cat === "spot") {
+            const sell = q(coins, this.bstep);
+            if (this.emergency && sell >= this.min_qty) {
+              await api.place(this.symbol, "Sell", sell, null, {market: true}); this.taker_n++;
+              this.say("sell", `аварийный стоп: продано ${sell} ${this.base_coin} по рынку`);
+            } else if (this.exit_limit && sell >= this.min_qty) {
+              const [got] = await this._chase(api, "Sell", sell, false, CLOSE_TRIES);
+              this.say("sell", `выход по радару: продано лимитками ${got} из ${sell} ${this.base_coin}`);
+            } else this.say("info", "все ордера бота отменены, монеты остались на счёте");
+          } else {
+            this.say("info", "все ордера бота отменены");
+            if (this.emergency) await this._closePosition(api); else await this._closePositionLimit(api);
           }
-          if (this.cat === "linear") { this.say("info", "все ордера бота отменены"); await this._closePosition(api); }
-          else this.say("info", "все ордера бота отменены, монеты остались на счёте");
         } catch (e) { this.say("err", "не удалось отменить ордера или закрыть позицию: " + e.message + ". Проверьте счёт на Bybit вручную!"); }
       }
       this.orders = {}; this.running = false; this.busy = false; this.status = this.error ? "Ошибка" : "Остановлен";
@@ -428,6 +439,8 @@ class Grid {
     this.trail_pct = Math.min(Math.max(Number(cfg.trail_pct ?? 2), 0), 50) / 100;
     this.down_cap = Math.max(Number(cfg.trail_down_cap ?? 5), 0) / 100;
     this.stop_pct = Math.min(Math.max(Number(cfg.stop_pct ?? 2), 0.2), 50) / 100;
+    this.emerg = Math.min(Math.max(Number(cfg.emerg_pct ?? 10), 1), 50) / 100;
+    this.ref = p;   // цена запуска: от неё считается аварийный стоп (после сдвига сетки — от цены сдвига)
     const total = cap * this.lev;
     let mult = 1;
     if (cfg.lot_mode === "geo") mult = Math.min(Math.max(Number(cfg.lot_mult || 1.3), 1.01), 3);
@@ -476,8 +489,10 @@ class Grid {
     }
     this.say("info", `сетка ${L[0]} – ${L[L.length - 1]}, ${n} уровней, ${cap} ${this.quote_coin}, ` + this._trailText());
     if (buy_qty > 0) {
-      const [got, spent] = await this._chase(api, "Buy", buy_qty);
-      this.say("buy", `быстрой лимиткой ${got} ${this.base_coin} на ${fnum(spent)} ${this.quote_coin} для верхних ордеров`);
+      const [got, spent] = await this._chase(api, "Buy", buy_qty, false, SETUP_TRIES);
+      this.say("buy", `лимитками ${got} ${this.base_coin} на ${fnum(spent)} ${this.quote_coin} для верхних ордеров`);
+      if (got < short) throw new BybitError(`За ~50 секунд лимитками куплено ${got} из ${buy_qty} ${this.base_coin} — по рынку бот не входит. ` +
+        `Купленное осталось на счёте; запустите ещё раз, бот учтёт эти монеты.`);
       if (got > 0) p = spent / got;
     }
     [, this.bid, this.ask] = await api.bbo(sym);
@@ -515,8 +530,11 @@ class Grid {
       return;
     }
     if (need_base > 0) {
-      const [got, spent] = await this._chase(api, "Buy", q(need_base, this.bstep));
-      this.say("buy", `лонг быстрой лимиткой ${got} ${this.base_coin} для верхних ордеров`);
+      const want = q(need_base, this.bstep);
+      const [got, spent] = await this._chase(api, "Buy", want, false, SETUP_TRIES);
+      this.say("buy", `лонг лимитками ${got} ${this.base_coin} для верхних ордеров`);
+      if (got < want) throw new BybitError(`За ~50 секунд лимитками набрано ${got} из ${want} ${this.base_coin} — по рынку бот не входит. ` +
+        `Набранная позиция будет закрыта лимитками; запустите ещё раз.`);
       if (got > 0) p = spent / got;
     }
     [, this.bid, this.ask] = await api.bbo(sym);
@@ -526,9 +544,21 @@ class Grid {
     const pos = await api.position(this.symbol);
     if (!pos) { this.say("info", "открытой позиции нет"); return; }
     const side = pos.side === "Buy" ? "Sell" : "Buy";
-    await api.place(this.symbol, side, pos.size, null, {market: true, reduce_only: true});
-    this.say("info", `позиция ${pos.size} ${this.base_coin} закрыта по рынку, нереализованный PnL был ${fnum(Number(pos.unrealisedPnl || 0))} USDT`);
+    await api.place(this.symbol, side, pos.size, null, {market: true, reduce_only: true}); this.taker_n++;
+    this.say("info", `аварийный стоп: позиция ${pos.size} ${this.base_coin} закрыта по рынку, нереализованный PnL был ${fnum(Number(pos.unrealisedPnl || 0))} USDT`);
     this.pos = null;
+  }
+  // обычная остановка: позиция закрывается только лимитками, что не закрылось — остаётся открытым
+  async _closePositionLimit(api) {
+    const pos = await api.position(this.symbol);
+    if (!pos) { this.say("info", "открытой позиции нет"); return; }
+    const side = pos.side === "Buy" ? "Sell" : "Buy", size = Number(pos.size);
+    const [got] = await this._chase(api, side, size, true, CLOSE_TRIES);
+    const left = q(size - got, this.bstep);
+    if (left > 0) this.say("err", `позиция закрыта лимитками на ${got} из ${size} ${this.base_coin}; осталось ${left} — по рынку бот не закрывает. ` +
+      `Закройте вручную на Bybit или запустите сетку снова.`);
+    else this.say("info", `позиция ${size} ${this.base_coin} закрыта лимитками`);
+    this.pos = await api.position(this.symbol);
   }
   _downDayLimit(now) {
     if (!this.down_cap || !this.cap) return false;
@@ -547,7 +577,7 @@ class Grid {
       while (steps < TRAIL_MAX_STEPS && this._shortCanAgainst() && p > this.lv(this.kmin + this.n - 1)) {
         if (this._downDayLimit(Date.now() / 1000) || !(await this._shiftShortUp(api, p))) break; steps++; }
     }
-    if (steps) { this._refreshLevels(); top = this.lv(this.kmin + this.n - 1); bot = this.lv(this.kmin);
+    if (steps) { this._refreshLevels(); this.ref = p; top = this.lv(this.kmin + this.n - 1); bot = this.lv(this.kmin);
       this.dn_at = this.trail_up ? bot * (1 - this.trail_pct) : null; this.up_at = this.trail_down ? top * (1 + this.trail_pct) : null; }
   }
   async _shiftShortDown(api) {
@@ -567,15 +597,20 @@ class Grid {
     const kb = this.kmin, c = this.cells[kb];
     if (!c) return false;
     const [oid, o] = this._orderOf(kb);
-    if (o) { try { await api.cancel(this.symbol, oid); } catch (e) { return false; } }
-    if (oid) delete this.orders[oid];
-    delete this.cells[kb]; delete this.paused[kb]; this.kmin += 1;
+    if (o) { try { await api.cancel(this.symbol, oid); } catch (e) { return false; } delete this.orders[oid]; }
     let loss = 0;
     if (c.pos) {
-      const [got, money] = await this._chase(api, "Buy", c.pos, true);
-      loss = got ? (c.entry ?? money) - money * (1 + this.fee) : 0;
+      const pos0 = c.pos, [got, money] = await this._chase(api, "Buy", pos0, true);
+      loss = got ? (c.entry ?? money) * got / pos0 - money * (1 + this.fee) : 0;
       this.trail_pnl += loss; this.profit += loss; this.dn_losses.push([Date.now() / 1000, loss]);
+      const rest = q(pos0 - got, this.bstep);
+      if (rest >= this.min_qty) {   // откуплено не всё — сдвига нет, тейк на остаток возвращается
+        c.pos = rest; c.entry = (c.entry || 0) * rest / pos0; await this._put(api, c, "Buy", rest);
+        this.say("info", `сдвиг против шорта: лимиткой откуплено ${got} из ${pos0}, по рынку не откупаю — сетка осталась на месте`);
+        return false;
+      }
     }
+    delete this.cells[kb]; delete this.paused[kb]; this.kmin += 1;
     const k = this.kmin + this.n - 2, qty = this.geo ? q(this.per_min / this.lv(k), this.bstep) : c.qty;
     this.cells[k] = {i: k, qty, cost: 0};
     await this._armShort(); this.shift_up++;
@@ -594,7 +629,7 @@ class Grid {
       while (steps < TRAIL_MAX_STEPS && this._canTrailDown() && p < this.lv(this.kmin)) {
         if (this._downDayLimit(Date.now() / 1000) || !(await this._shiftDown(api, p))) break; steps++; }
     }
-    if (steps) { this._refreshLevels(); top = this.lv(this.kmin + this.n - 1); bot = this.lv(this.kmin);
+    if (steps) { this._refreshLevels(); this.ref = p; top = this.lv(this.kmin + this.n - 1); bot = this.lv(this.kmin);
       this.up_at = this.trail_up ? top * (1 + this.trail_pct) : null; this.dn_at = this.trail_down ? bot * (1 - this.trail_pct) : null; }
   }
   async _shiftUp(api, p) {
@@ -603,12 +638,17 @@ class Grid {
     if (this.cat === "spot" && q(o.qty * o.price / p * (1 - this.fee_buf), this.bstep) < this.min_qty) {
       this.say("err", "сдвиг вверх: объём ячейки меньше минимума биржи, трейлинг вверх выключен"); this.trail_up = false; return false; }
     try { await api.cancel(this.symbol, oid); } catch (e) { return false; }
+    const oldCell = this.cells[this.kmin];
     delete this.orders[oid]; delete this.cells[this.kmin]; this.kmin += 1;
     const freed = o.qty * o.price, k = this.kmin + this.n - 2;
     const want = this.geo ? q(this.per_min / p * (1 - this.fee_buf), this.bstep)
       : (this.cat === "linear" ? o.qty : q(freed / p * (1 - this.fee_buf), this.bstep));
     const [got, spent] = await this._chase(api, "Buy", want);
-    if (got <= 0) { this.say("err", "сдвиг вверх: не удалось купить, ячейка вернётся при следующем сдвиге"); return false; }
+    if (got <= 0) {   // лимитка не исполнилась — сдвига нет, нижняя покупка возвращается на место
+      this.kmin -= 1;
+      if (oldCell) { this.cells[this.kmin] = oldCell; await this._put(api, oldCell, "Buy", o.qty); }
+      this.say("info", "сдвиг вверх: лимитка не исполнилась, по рынку не покупаю — сетка осталась на месте"); return false;
+    }
     const qty = this.cat === "linear" ? got : q(got * (1 - this.fee_buf), this.bstep);
     const cell = {i: k, qty, cost: spent * (1 + this.fee)};
     this.cells[k] = cell; await this._put(api, cell, "Sell", qty); this.shift_up++;
@@ -624,10 +664,17 @@ class Grid {
       if (est < this.min_qty || o.qty * p < this.min_amt) { this.say("err", "сдвиг вниз: объём ячейки меньше минимума биржи, трейлинг вниз выключен"); this.trail_down = false; return false; }
     }
     try { await api.cancel(this.symbol, oid); } catch (e) { return false; }
-    delete this.orders[oid]; let cell = this.cells[ktop]; delete this.cells[ktop];
+    delete this.orders[oid]; let cell = this.cells[ktop];
     const [sold, money] = await this._chase(api, "Sell", o.qty, this.cat === "linear");
-    const got = money * (1 - this.fee), loss = sold ? got - cell.cost * sold / cell.qty : 0;
+    const got = money * (1 - this.fee), loss = sold ? got - cell.cost * sold / o.qty : 0;
     this.trail_pnl += loss; this.dn_losses.push([Date.now() / 1000, loss]); this.profit += loss;
+    const rest = q(o.qty - sold, this.bstep);
+    if (rest >= this.min_qty) {   // продалось не всё — сдвига нет, остаток ждёт своей продажи на месте
+      cell.cost = cell.cost * rest / o.qty; await this._put(api, cell, "Sell", rest);
+      this.say("info", `сдвиг вниз: лимиткой продано ${sold} из ${o.qty}, по рынку не продаю — сетка осталась на месте`, sold ? Math.round(loss * 1e4) / 1e4 : null);
+      return false;
+    }
+    delete this.cells[ktop];
     this.kmin -= 1; const k = this.kmin;
     const qty = this.geo ? q(this.per_min / this.lv(k), this.bstep) : (this.cat === "linear" ? cell.qty : q(got / this.lv(k), this.bstep));
     cell = {i: k, qty, cost: qty * this.lv(k) * (1 + this.fee)};
@@ -637,9 +684,9 @@ class Grid {
     return true;
   }
   // быстрая лимитка вместо маркета: Post-Only по лучшей цене, переставляется за ценой; остаток через ~15 с — маркетом
-  async _chase(api, side, qty, reduce_only = false) {
+  async _chase(api, side, qty, reduce_only = false, tries = CHASE_TRIES) {
     const sym = this.symbol; let done = 0, money = 0;
-    for (let t = 0; t < CHASE_TRIES; t++) {
+    for (let t = 0; t < tries; t++) {
       const left = q(qty - done, this.bstep);
       if (left < this.min_qty) break;
       const [, bid, ask] = await api.bbo(sym); const px = side === "Buy" ? bid : ask;
@@ -654,15 +701,8 @@ class Grid {
       if (f > 0) { done += f; money += f * (Number(h.avgPrice || 0) || px); this.maker_n++; }
     }
     const left = q(qty - done, this.bstep);
-    if (left >= this.min_qty) {
-      const [, bid, ask] = await api.bbo(sym); const px = side === "Buy" ? ask : bid;
-      if (left * px >= this.min_amt) {
-        await api.place(sym, side, left, null, {market: true, reduce_only});
-        done += left; money += left * px; this.taker_n++;
-        this.say("info", `лимитка не успела, остаток ${left} ${this.base_coin} добран маркетом`);
-      }
-    }
-    return [done, money];
+    if (left >= this.min_qty && done < qty) this.say("info", `лимитка исполнилась не вся: ${q(done, this.bstep)} из ${qty} ${this.base_coin}, по рынку не добираю`);
+    return [q(done, this.bstep), money];
   }
   async _put(api, cell, side, qty) {
     let price = side === "Sell" ? this.lv(cell.i + 1) : this.lv(cell.i);
@@ -683,17 +723,10 @@ class Grid {
     this._api = api;
     const [p, bid, ask] = await api.bbo(this.symbol); this.bid = bid; this.ask = ask;
     this.price = p; this.hist.push({t: Date.now(), p}); if (this.hist.length > 1500) this.hist.splice(0, this.hist.length - 1500);
-    const pct = x => +(x * 100).toFixed(4);
-    if (this.short) {
-      if (!this._shortCanAgainst() && p > this.lv(this.kmin + this.n - 1) * (1 + this.stop_pct)) {
-        this.error = `Цена ${p} ушла выше шорт-сетки более чем на ${pct(this.stop_pct)}%. Позиция закрыта, бот остановлен для защиты.`;
-        this.running = false; return; }
-    } else if (this.neutral && (p > this.lv(this.kmin + this.n - 1) * (1 + this.stop_pct) || p < this.lv(this.kmin) * (1 - this.stop_pct))) {
-      this.error = `Цена ${p} ушла за нейтральную сетку более чем на ${pct(this.stop_pct)}%. Позиция закрыта, бот остановлен для защиты.`;
-      this.running = false; return;
-    } else if (!this.neutral && !this._canTrailDown() && p < this.lv(this.kmin) * (1 - this.stop_pct)) {
-      const why = this.trail_down ? "достигнут предел трейлинга вниз, " : "";
-      this.error = `Цена ${p}: ${why}ушла ниже сетки более чем на ${pct(this.stop_pct)}%. Бот остановлен для защиты.`;
+    const e = this.emerg, ref = this.ref, upHit = p >= ref * (1 + e), dnHit = p <= ref * (1 - e);
+    if ((this.short && upHit) || (this.neutral && (upHit || dnHit)) || (!this.short && !this.neutral && dnHit)) {
+      this.emergency = true;
+      this.error = `Аварийный стоп: цена ${p} ушла на ${+(e * 100).toFixed(2)}% от цены запуска ${ref}. Ордера сняты, позиция закрыта по рынку.`;
       this.running = false; return;
     }
     if (this.cat === "linear") {
@@ -702,7 +735,7 @@ class Grid {
       if (liq > 0) {
         const entry = Number(this.pos.avgPrice || p), long_ = this.pos.side === "Buy";
         const left = long_ && entry !== liq ? (p - liq) / (entry - liq) : (!long_ && liq !== entry ? (liq - p) / (liq - entry) : 1);
-        if (left < LIQ_GUARD) { this.error = `Цена ${p} близко к ликвидации (${liq}). Позиция закрыта, бот остановлен.`; this.running = false; return; }
+        if (left < LIQ_GUARD) { this.emergency = true; this.error = `Цена ${p} близко к ликвидации (${liq}). Позиция закрыта по рынку, бот остановлен.`; this.running = false; return; }
       }
     }
     const open = await api.openIds(this.symbol);
@@ -739,9 +772,9 @@ class Grid {
       return;
     }
     if (this.guard === "pump" && this.short && this.radar_mode === "exit" && m.pump >= RADAR_EXIT) {
-      this.error = `Аварийный выход: сильный памп против шорта (${m.pump}). ` + why(); this.running = false; return "exit"; }
+      this.error = `Выход по радару: сильный памп против шорта (${m.pump}). Позиция закрывается лимитками. ` + why(); this.running = false; return "exit"; }
     if (this.guard === "dump" && this.radar_mode === "exit" && m.dump >= RADAR_EXIT) {
-      this.error = `Аварийный выход: сильный дамп (${m.dump}). ` + why(); this.exit_spot = true; this.running = false; return "exit"; }
+      this.error = `Выход по радару: сильный дамп (${m.dump}). Позиция закрывается лимитками. ` + why(); this.exit_limit = true; this.running = false; return "exit"; }
     const score = this.guard === "dump" ? m.dump : m.pump;
     this.calm = score < calm ? this.calm + 1 : 0;
     if (this.calm >= RADAR_CALM_TICKS) await this._resume(api, "рынок успокоился");
@@ -968,11 +1001,12 @@ window.GRIDPRO = {
       const cfg = gridCfg(g.id, st), api = new Bybit(cfg.api_key, cfg.api_secret, cfg.network, cfg.market === "futures" ? "linear" : "spot");
       try {
         await api.syncTime(); await api.cancelAll(String(cfg.symbol).toUpperCase());
+        let note = "";
         if (!restart && cfg.market === "futures") {
           const pos = await api.position(String(cfg.symbol).toUpperCase());
-          if (pos) await api.place(String(cfg.symbol).toUpperCase(), pos.side === "Buy" ? "Sell" : "Buy", pos.size, null, {market: true, reduce_only: true});
+          if (pos) note = `, позиция ${pos.side === "Buy" ? "лонг" : "шорт"} ${pos.size} осталась открытой — по рынку бот не закрывает, закройте на Bybit`;
         }
-        res.push(`${cfg.symbol}: ордера сняты` + (!restart && cfg.market === "futures" ? ", позиция закрыта" : ""));
+        res.push(`${cfg.symbol}: ордера сняты` + note);
       } catch (e) { res.push(`${cfg.symbol}: ${e.message}`); }
       if (restart) { bot(g.id).start(cfg); await sleep(800); } else setAutostart(false, g.id);
     }
