@@ -929,6 +929,7 @@ class Bot:
             loss = float(entry_part - money * (1 + self.fee)) if got else 0.0
             self.trail_pnl += loss
             self.profit += loss
+            pnl_book(self.gid, loss)
             self.dn_losses.append((time.time(), loss))
             left = q(pos0 - got, self.bstep)
             if left >= self.min_qty:   # откуплено не всё — сдвига нет, тейк на остаток возвращается
@@ -1048,6 +1049,7 @@ class Bot:
         self.trail_pnl += loss
         self.dn_losses.append((time.time(), loss))
         self.profit += loss
+        pnl_book(self.gid, loss)
         left = q(o["qty"] - sold, self.bstep)
         if left >= self.min_qty:   # продалось не всё — сдвига нет, остаток ждёт своей продажи на месте
             cell["cost"] = cell["cost"] * left / o["qty"]
@@ -1280,6 +1282,7 @@ class Bot:
                 pr = float(c.get("entry", filled * avg) - filled * avg * (1 + self.fee))
                 c["pos"] = Decimal(0)
                 self.profit += pr
+                pnl_book(self.gid, pr)
                 self.fills.append({"t": t, "p": float(avg), "k": "buy"})
                 self.say("buy", f"тейк {filled} {self.base_coin} по {avg}", round(pr, 4))
                 if c["i"] in self.cells and (self.ask is None or self.lv(c["i"] + 1) > self.ask):
@@ -1294,6 +1297,7 @@ class Bot:
             else:
                 pr = float(c.get("entry", filled * avg) - filled * avg * (1 + self.fee))
                 self.profit += pr
+                pnl_book(self.gid, pr)
                 self.fills.append({"t": t, "p": float(avg), "k": "buy"})
                 self.say("buy", f"тейк шорта {filled} {self.base_coin} по {avg}", round(pr, 4))
                 self._put(api, c, "Sell", c["qty"])
@@ -1307,6 +1311,7 @@ class Bot:
             got = filled * avg * (1 - self.fee)
             pr = float(got - c["cost"])
             self.profit += pr
+            pnl_book(self.gid, pr)
             self.fills.append({"t": t, "p": float(avg), "k": "sell"})
             self.say("sell", f"{filled} {self.base_coin} по {avg}", round(pr, 4))
             self._put(api, c, "Buy", c["qty"])
@@ -1384,6 +1389,86 @@ def scan_volatile(market="spot", minutes=30):
 BOTS = {}
 BOTS_LOCK = threading.Lock()
 
+# ---- История результата по времени: «сколько заработала сетка за последний час» ----
+# Каждая зафиксированная прибыль/убыток пишется с отметкой времени, а раз в минуту — снимок плавающего
+# результата открытых позиций. За час = зафиксировано за час + (в позиции сейчас − в позиции час назад).
+# Хранится в файле рядом с настройками, поэтому переживает перезапуск сервера.
+PNL_PATH = os.path.join(DATA_DIR, "gridbot_pnl_history.json")
+PNL_KEEP = 2 * 86400            # храним двое суток
+PNL_SNAP_SEC = 60               # снимок «в позиции» раз в минуту
+PNL_LOCK = threading.Lock()
+PNL_EV = {}                     # gid -> [[ts, сумма], …] зафиксированные результаты
+PNL_UP = {}                     # gid -> [[ts, в позиции], …] снимки раз в минуту
+
+
+def pnl_load():
+    global PNL_EV, PNL_UP
+    try:
+        with open(PNL_PATH, encoding="utf-8") as f:
+            d = json.load(f)
+        PNL_EV, PNL_UP = d.get("ev", {}) or {}, d.get("up", {}) or {}
+    except Exception:
+        PNL_EV, PNL_UP = {}, {}
+
+
+def pnl_save():
+    try:
+        with PNL_LOCK:
+            data = json.dumps({"ev": PNL_EV, "up": PNL_UP})
+        tmp = PNL_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(data)
+        os.replace(tmp, PNL_PATH)
+    except Exception as e:
+        print("не удалось сохранить историю результата:", e, flush=True)
+
+
+def pnl_book(gid, amount):
+    """Записать зафиксированный результат сетки (USDT) с текущим временем."""
+    if not amount:
+        return
+    with PNL_LOCK:
+        PNL_EV.setdefault(str(gid), []).append([round(time.time(), 1), round(float(amount), 6)])
+
+
+def pnl_snap_loop():
+    while True:
+        time.sleep(PNL_SNAP_SEC)
+        try:
+            now = time.time()
+            with BOTS_LOCK:
+                items = list(BOTS.items())
+            ups = {gid: b.unrealized() for gid, b in items}
+            with PNL_LOCK:
+                for gid, up in ups.items():
+                    PNL_UP.setdefault(str(gid), []).append([round(now, 1), round(up, 6)])
+                for d in (PNL_EV, PNL_UP):
+                    for gid in list(d):
+                        d[gid] = [x for x in d[gid] if x[0] >= now - PNL_KEEP]
+                        if not d[gid]:
+                            del d[gid]
+            pnl_save()
+        except Exception as e:
+            print("история результата:", e, flush=True)
+
+
+def pnl_window(gid, up_now, sec=3600):
+    """Результат сетки за последние sec секунд: (итог, зафиксировано, изменение в позиции)."""
+    since = time.time() - sec
+    gid = str(gid)
+    with PNL_LOCK:
+        real = sum(a for t, a in PNL_EV.get(gid, []) if t >= since)
+        snaps = PNL_UP.get(gid, [])
+        base = next((u for t, u in snaps if t >= since), None)
+        older = [u for t, u in snaps if t < since]
+    if older:                 # есть снимок старше окна — берём последний перед началом часа
+        base = older[-1]
+    if base is None:          # сетка моложе часа или снимков ещё нет — считаем от нуля
+        base = 0.0
+    dup = up_now - base
+    return real + dup, real, dup
+
+
 
 def bot(gid):
     with BOTS_LOCK:
@@ -1407,6 +1492,8 @@ def grids_summary():
                     "profit": b.profit if b else 0.0, "trades": b.trades if b else 0,
                     "upnl": up, "total": (b.profit if b else 0.0) + up,
                     "capital": float(b.cap) if b and b.cap else float(g.get("capital") or 0)})
+        h, hr, hu = pnl_window(gid, up)
+        out[-1].update(h1=h, h1_real=hr, h1_up=hu)
     return out
 
 
@@ -1752,6 +1839,15 @@ input[type=range]{padding:0;border:0;background:none;accent-color:var(--fg)}
 .sumbar .big.up{color:var(--buy)}.sumbar .big.down{color:var(--sell)}.sumbar .big.z{color:var(--fg)}
 .sumbar .parts{display:flex;gap:18px;font-size:14px}.sumbar .parts b{font-family:var(--mono);font-size:17px}
 .sumbar .run{font-size:13px;color:var(--muted)}
+.sumbar .hour{padding-left:18px;border-left:1px solid var(--line)}
+.sumbar .hour b{font-family:var(--mono);font-size:24px;font-weight:700}
+.sumbar .hour .best{font-size:12px;color:var(--muted);margin-top:4px}
+.tab .h{font-family:var(--mono);font-size:11px;padding:1px 5px;border-radius:3px}
+.tab .h.up{color:var(--buy);background:color-mix(in srgb,var(--buy) 12%,transparent)}
+.tab .h.down{color:var(--sell);background:color-mix(in srgb,var(--sell) 12%,transparent)}
+.rt td.hr{font-weight:700}
+.rt th.sort{cursor:pointer;text-decoration:underline dotted}
+.rt th.sort[aria-sort]{color:var(--fg)}
 #resbtn{margin-left:auto;font:inherit;font-weight:600;font-size:14px;padding:10px 16px;border-radius:6px;border:0;background:var(--ink);color:var(--ink-fg);cursor:pointer}
 #resbtn:focus-visible{outline:3px solid var(--buy);outline-offset:2px}
 #resdlg{border:0;border-radius:10px;padding:0;background:var(--bg);color:var(--fg);width:min(860px,96vw);max-height:90vh;box-shadow:0 20px 60px rgba(0,0,0,.35)}
@@ -1997,39 +2093,47 @@ function renderTabs(){
  const t=$("tabs"),tot=GRIDS.reduce((a,g)=>a+(g.total||0),0),real=GRIDS.reduce((a,g)=>a+(g.profit||0),0),
   un=GRIDS.reduce((a,g)=>a+(g.upnl||0),0),run=GRIDS.filter(g=>g.running).length;
  t.innerHTML=GRIDS.map(g=>{const sym=(g.symbol||"—").replace("USDT",""),mk=(g.market==="futures"?` ${g.leverage}x`:" спот")+(g.direction==="sell"?" sell":g.direction==="neutral"&&g.market==="futures"?" ½/½":"");
-  const v=g.total||0,c=cls(v),p=g.running||g.trades||v?` <b class="${c==="up"?"b":c==="down"?"s":"z"}">${sgn(v)}</b>`:"";
-  return `<button type="button" class="tab${g.running?" on":""}${g.error?" err":""}" data-id="${g.id}" aria-current="${g.id===CUR}"><span class="d"></span>${esc(sym)}<span class="i">${mk}</span>${p}</button>`}).join("")+
+  const v=g.total||0,c=cls(v),p=g.running||g.trades||v?` <b class="${c==="up"?"b":c==="down"?"s":"z"}">${sgn(v)}</b>`:"",
+   hv=g.h1||0,hc=cls(hv),hb=hc==="z"?"":` <span class="h ${hc}" title="за последний час">1ч ${sgn(hv)}</span>`;
+  return `<button type="button" class="tab${g.running?" on":""}${g.error?" err":""}" data-id="${g.id}" aria-current="${g.id===CUR}"><span class="d"></span>${esc(sym)}<span class="i">${mk}</span>${p}${hb}</button>`}).join("")+
   `<button type="button" class="tab add" id="addtab">+ Новая сетка</button>`;
  const sb=$("sumbar"),c=cls(tot);sb.className="sumbar"+(c==="z"?"":" "+c);
  sb.innerHTML=`<div><div class="lbl">Всего по всем сеткам</div><div class="big ${c}">${sgn(tot)} <span style="font-size:.5em">USDT</span></div></div>`+
   `<div class="parts"><div><div class="lbl">Зафиксировано</div><b class="${cls(real)==="up"?"b":cls(real)==="down"?"s":""}">${sgn(real)}</b></div>`+
   `<div><div class="lbl">В позициях</div><b class="${cls(un)==="up"?"b":cls(un)==="down"?"s":""}">${sgn(un)}</b></div></div>`+
+  (()=>{const h=GRIDS.reduce((a,g)=>a+(g.h1||0),0),hc=cls(h),best=[...GRIDS].sort((a,b)=>(b.h1||0)-(a.h1||0))[0];
+   const bs=best&&(best.h1||0)>0.004?`лучшая: ${esc((best.symbol||"").replace("USDT",""))} ${sgn(best.h1)}`:"за час без прибыли";
+   return `<div class="hour"><div class="lbl">За последний час</div><b class="${hc==="up"?"b":hc==="down"?"s":""}">${sgn(h)}</b><div class="best">${bs}</div></div>`})()+
   `<div class="run">Работает ${run} из ${GRIDS.length}</div>`+
   `<button type="button" id="resbtn">📊 Результаты по сеткам</button>`;
  if($("resdlg").open)renderRes();
 }
+let RSORT="total";
 function renderRes(){
- const rows=[...GRIDS].sort((a,b)=>(b.total||0)-(a.total||0)),mx=Math.max(0.01,...rows.map(g=>Math.abs(g.total||0)));
+ const rows=[...GRIDS].sort((a,b)=>(b[RSORT]||0)-(a[RSORT]||0)),mx=Math.max(0.01,...rows.map(g=>Math.abs(g.total||0)));
  const tot=GRIDS.reduce((a,g)=>a+(g.total||0),0),real=GRIDS.reduce((a,g)=>a+(g.profit||0),0),
-  un=GRIDS.reduce((a,g)=>a+(g.upnl||0),0),tr=GRIDS.reduce((a,g)=>a+(g.trades||0),0),cap=GRIDS.filter(g=>g.running).reduce((a,g)=>a+(g.capital||0),0);
+  un=GRIDS.reduce((a,g)=>a+(g.upnl||0),0),hh=GRIDS.reduce((a,g)=>a+(g.h1||0),0),tr=GRIDS.reduce((a,g)=>a+(g.trades||0),0),cap=GRIDS.filter(g=>g.running).reduce((a,g)=>a+(g.capital||0),0);
  const col=v=>{const c=cls(v);return c==="up"?"b":c==="down"?"s":"i"};
  const pct=(v,c)=>c>0?sgn(v/c*100)+"%":"—";
- $("resbody").innerHTML=rows.length?`<table class="rt"><thead><tr><th>Сетка</th><th>Статус</th><th>Сделок</th><th>Зафикс.</th><th>В позиции</th><th>Итог, USDT</th><th>% капит.</th><th></th></tr></thead><tbody>`+
+ $("resbody").innerHTML=rows.length?`<table class="rt"><thead><tr><th>Сетка</th><th>Статус</th><th>Сделок</th><th>Зафикс.</th><th>В позиции</th><th class="sort" data-s="h1"${RSORT==="h1"?' aria-sort="descending"':""}>За 1 час ▾</th><th class="sort" data-s="total"${RSORT==="total"?' aria-sort="descending"':""}>Итог, USDT ▾</th><th>% капит.</th><th></th></tr></thead><tbody>`+
   rows.map((g,i)=>{const v=g.total||0,c=cls(v),sym=(g.symbol||"—").replace("USDT",""),
    mk=g.market==="futures"?`${g.leverage}x`+(g.direction==="neutral"?" ½/½":g.direction==="sell"?" sell":""):"спот";
-   return `<tr class="row ${c}" data-id="${g.id}"><td><b>${i===0&&v>0.004?"🏆 ":""}${esc(sym)}</b> <span class="i">${mk}</span></td>`+
+   const hv=g.h1||0;
+   return `<tr class="row ${c}" data-id="${g.id}"><td><b>${i===0&&(g[RSORT]||0)>0.004?(RSORT==="h1"?"🔥 ":"🏆 "):""}${esc(sym)}</b> <span class="i">${mk}</span></td>`+
    `<td><span class="st${g.running?" on":""}${g.error?" err":""}">${g.error?"ошибка":g.running?"работает":"стоп"}</span></td>`+
    `<td>${g.trades||0}</td><td class="${col(g.profit||0)}">${sgn(g.profit||0)}</td><td class="${col(g.upnl||0)}">${sgn(g.upnl||0)}</td>`+
+   `<td class="hr ${col(hv)}" title="зафиксировано ${sgn(g.h1_real||0)} · в позиции ${sgn(g.h1_up||0)}">${sgn(hv)}</td>`+
    `<td class="tot ${col(v)}">${sgn(v)}</td><td class="${col(v)}">${pct(v,g.capital)}</td>`+
    `<td><div class="rbar"><i class="${c}" style="width:${Math.round(Math.abs(v)/mx*100)}%"></i></div></td></tr>`}).join("")+
   `</tbody><tfoot><tr><td>Всего</td><td></td><td>${tr}</td><td class="${col(real)}">${sgn(real)}</td><td class="${col(un)}">${sgn(un)}</td>`+
-  `<td class="tot ${col(tot)}">${sgn(tot)}</td><td class="${col(tot)}">${pct(tot,cap)}</td><td></td></tr></tfoot></table>`+
-  `<p class="note" style="margin:12px 8px 0">Нажмите на строку, чтобы открыть сетку. % — от капитала сетки.</p>`
+  `<td class="hr ${col(hh)}">${sgn(hh)}</td><td class="tot ${col(tot)}">${sgn(tot)}</td><td class="${col(tot)}">${pct(tot,cap)}</td><td></td></tr></tfoot></table>`+
+  `<p class="note" style="margin:12px 8px 0">Нажмите на строку, чтобы открыть сетку; на заголовок «За 1 час» или «Итог» — чтобы отсортировать. За 1 час = зафиксировано за час + изменение результата в позиции за час. % — от капитала сетки.</p>`
   :`<p class="note">Сеток пока нет.</p>`;
 }
 $("sumbar").addEventListener("click",e=>{if(e.target.closest("#resbtn")){renderRes();$("resdlg").showModal()}});
 $("resx").onclick=()=>$("resdlg").close();
 $("resdlg").addEventListener("click",e=>{if(e.target===$("resdlg")){$("resdlg").close();return}
+ const th=e.target.closest("th.sort");if(th){RSORT=th.dataset.s;renderRes();return}
  const r=e.target.closest("tr.row");if(r){$("resdlg").close();if(r.dataset.id!==CUR)selectGrid(r.dataset.id)}});
 let KILLT=null;
 function killUI(){const run=GRIDS.filter(g=>g.running).length,b=$("killall");
@@ -2238,6 +2342,7 @@ addEventListener("resize",draw);
 def shutdown(*_):
     """Railway при перезапуске шлёт SIGTERM: аккуратно снимаем ордера, флаг автозапуска сохраняем."""
     print("получен сигнал остановки, снимаю ордера…", flush=True)
+    pnl_save()
     bots = list(BOTS.values())
     for b in bots:
         b.stop(remember=False)
@@ -2259,6 +2364,8 @@ def main():
         url = f"http://127.0.0.1:{PORT}"
         print(f"Сеточный бот запущен: {url}  (Ctrl+C, чтобы выйти)")
         threading.Timer(0.8, lambda: webbrowser.open(url)).start()
+    pnl_load()
+    threading.Thread(target=pnl_snap_loop, daemon=True).start()
     st = load_store()
     save_store(st)                       # перевести старый файл настроек в формат с несколькими сетками
     if st.get("api_key") and st.get("api_secret") and not (ON_SERVER and not APP_PASSWORD):
