@@ -27,8 +27,8 @@ HOSTS = {
     "mainnet": "https://api.bybit.com",
 }
 DEFAULT_CFG = {"api_key": "", "api_secret": "", "network": "testnet", "market": "spot",
-               "leverage": 1, "symbol": "BTCUSDT", "capital": 200, "range_pct": 5, "levels": 4,
-               "trail_up": True, "trail_down": False, "trail_up_limit": 0, "trail_down_limit": 0,
+               "leverage": 2, "symbol": "BTCUSDT", "capital": 200, "range_pct": 5, "levels": 4,
+               "trail_up": True, "trail_down": True, "trail_up_limit": 0, "trail_down_limit": 0,
                "trail_pct": 0.5, "trail_down_cap": 5, "stop_pct": 2, "emerg_pct": 10,
                "radar": "pause", "radar_sens": "mid", "lot_mode": "geo", "lot_mult": 1.4,
                "direction": "both", "cap_max": False}
@@ -1426,7 +1426,7 @@ def split_start(body):
     """Поделить свободный депозит поровну между выбранными монетами и запустить по сетке на каждую."""
     market = "futures" if body.get("market") != "spot" else "spot"
     cat = "linear" if market == "futures" else "spot"
-    lev = int(body.get("leverage") or 3) if market == "futures" else 1
+    lev = int(body.get("leverage") or 2) if market == "futures" else 1
     if not 1 <= lev <= 100:
         raise BybitError("Плечо должно быть от 1 до 100")
     sugg = body.get("sugg") or {}
@@ -1469,7 +1469,8 @@ def split_start(body):
                 st["grids"][gid] = dict({k2: DEFAULT_CFG[k2] for k2 in GRID_KEYS},
                                         **{k2: v for k2, v in tpl.items() if k2 in GRID_KEYS}, was_running=False)
             g = st["grids"][gid]
-            g.update(symbol=x, market=market, leverage=lev, capital=float(per), cap_max=False)
+            g.update(symbol=x, market=market, leverage=lev, capital=float(per), cap_max=False,
+                     trail_up=True, trail_down=True)
             g["direction"] = "neutral" if market == "futures" else "both"
             sg = sugg.get(x) or {}
             if sg.get("range"):
@@ -1836,7 +1837,7 @@ input[type=range]{padding:0;border:0;background:none;accent-color:var(--fg)}
 <label class="chk"><input type="checkbox" id="trail_up"> <span id="tul">Трейлинг вверх</span></label>
 <label class="chk"><input type="checkbox" id="trail_down"> <span id="tdl">Трейлинг вниз</span></label>
 <label>Аварийный стоп по рынку: цена ушла от цены запуска на, %<input id="emerg_pct" type="number" min="1" max="50" step="0.5"></label>
-<div class="full presetrow"><button type="button" id="presetbtn">Лучшие настройки по тесту на истории</button><span class="note">±5%, 4 уровня, лоты ×1.4, трейлинг вверх 0.5%, аварийный стоп 10%, без плеча</span></div>
+<div class="full presetrow"><button type="button" id="presetbtn">Лучшие настройки по тесту на истории</button><span class="note">±5%, 4 уровня, лоты ×1.4, трейлинг вверх и вниз 0.5%, аварийный стоп 10%, плечо 2x</span></div>
 <label>Перестановка: цена ушла за границу на, %<input id="trail_pct" type="number" min="0" max="50" step="0.5"></label>
 <label>Лимит убытка сдвигов вниз, % капитала в сутки (0 = без лимита)<input id="trail_down_cap" type="number" min="0" max="100" step="1"></label>
 <label>Предел вверх, цена (0 = без предела)<input id="trail_up_limit" type="number" min="0" step="any"></label>
@@ -1860,7 +1861,7 @@ input[type=range]{padding:0;border:0;background:none;accent-color:var(--fg)}
 <div class="row"><input id="spadd" placeholder="Монета, например SOL или BTC, ETH" autocomplete="off"><button type="button" class="btn2" id="spaddbtn">Добавить</button></div>
 <div class="chips" id="spchips"></div>
 <div class="row"><select id="spmk"><option value="futures">Фьючерсы USDT</option><option value="spot">Спот (без плеча)</option></select>
-<label class="row" id="splevbox" style="gap:6px">Плечо <input id="splev" type="number" min="1" max="100" value="3">x</label></div>
+<label class="row" id="splevbox" style="gap:6px">Плечо <input id="splev" type="number" min="1" max="100" value="2">x</label></div>
 <div class="note" id="spinfo" style="margin:0"></div>
 <button id="spgo" type="button" disabled>Выберите монеты</button>
 </section>
@@ -1914,8 +1915,8 @@ let S=null,LOCK="";
 const GLOBAL=["api_key","api_secret","network"];
 let CFG=null,CUR=null;
 try{CUR=localStorage.getItem("grid")}catch(e){}
-$("presetbtn").onclick=()=>{const v={range_pct:5,levels:4,lot_mode:"geo",lot_mult:1.4,trail_pct:0.5,emerg_pct:10,leverage:1,trail_down_cap:5};
- for(const k in v)$(k).value=v[k];$("trail_up").checked=true;$("trail_down").checked=false;levUI();lotUI();netTag($("network").value);saveSoon()};
+$("presetbtn").onclick=()=>{const v={range_pct:5,levels:4,lot_mode:"geo",lot_mult:1.4,trail_pct:0.5,emerg_pct:10,leverage:2,trail_down_cap:5};
+ for(const k in v)$(k).value=v[k];$("trail_up").checked=true;$("trail_down").checked=true;levUI();lotUI();netTag($("network").value);saveSoon()};
 function dirUI(){
  const d=$("direction").value||"both",sell=d==="sell";
  document.querySelectorAll(".seg button").forEach(b=>b.setAttribute("aria-checked",String(b.dataset.dir===d)));
@@ -2108,7 +2109,7 @@ function spAdd(sym,sg){
   if(!SP.list.includes(t))SP.list.push(t);if(sg)SP.sugg[t]=sg});
  spSave();spUI()}
 function spUI(){
- const fut=$("spmk").value==="futures",n=SP.list.length,lv=fut?Math.max(1,Math.min(100,Number($("splev").value)||3)):1;
+ const fut=$("spmk").value==="futures",n=SP.list.length,lv=fut?Math.max(1,Math.min(100,Number($("splev").value)||2)):1;
  $("splevbox").hidden=!fut;
  $("spchips").innerHTML=SP.list.map((x,i)=>`<span class="chip">${esc(x.replace("USDT",""))}<button type="button" data-rm="${i}" aria-label="Убрать ${esc(x)}">×</button></span>`).join("");
  const run=GRIDS.filter(g=>g.running||g.busy).map(g=>g.symbol);
@@ -2138,7 +2139,7 @@ if(SP.mk)$("spmk").value=SP.mk;if(SP.lev)$("splev").value=SP.lev;
 $("spgo").onclick=async()=>{
  const b=$("spgo");b.disabled=true;b.textContent="Запускаю…";await saveNow();
  try{const r=await fetch("/api/split",{method:"POST",headers:{"Content-Type":"application/json"},
-   body:JSON.stringify({symbols:SP.list,market:$("spmk").value,leverage:Number($("splev").value)||3,sugg:SP.sugg,copy_from:CUR})});
+   body:JSON.stringify({symbols:SP.list,market:$("spmk").value,leverage:Number($("splev").value)||2,sugg:SP.sugg,copy_from:CUR})});
   const d=await r.json();if(!r.ok)throw new Error(d.error||r.status);
   SPERR="";$("spinfo").textContent=`Запущено ${d.ids.length} сеток по ${fmt(d.per)} USDT`+(d.leverage>1?` с плечом ${d.leverage}x`:"")+". Вкладки сверху — по одной на монету.";
   SP.list=[];SP.sugg={};spSave();
