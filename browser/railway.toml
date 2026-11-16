@@ -1,0 +1,9 @@
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+startCommand = "python serve.py"
+healthcheckPath = "/api/ping"
+healthcheckTimeout = 60
+restartPolicyType = "ALWAYS"
