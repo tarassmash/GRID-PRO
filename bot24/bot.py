@@ -1405,7 +1405,8 @@ def grids_summary():
                     "running": bool(b and b.running), "busy": bool(b and b.busy),
                     "status": b.status if b else "Остановлен", "error": b.error if b else "",
                     "profit": b.profit if b else 0.0, "trades": b.trades if b else 0,
-                    "upnl": up, "total": (b.profit if b else 0.0) + up})
+                    "upnl": up, "total": (b.profit if b else 0.0) + up,
+                    "capital": float(b.cap) if b and b.cap else float(g.get("capital") or 0)})
     return out
 
 
@@ -1742,8 +1743,36 @@ input[type=range]{padding:0;border:0;background:none;accent-color:var(--fg)}
 .tab[aria-current="true"]{box-shadow:inset 0 0 0 2px var(--fg)}
 .tab:focus-visible{outline:3px solid var(--buy);outline-offset:2px}
 .tab.add{color:var(--muted)}
-.tabs .total{margin-left:auto;font-size:13px;color:var(--muted)}
-.tabs .total b{font-family:var(--mono);color:var(--fg)}
+.tab b.b{color:var(--buy);font-weight:700}.tab b.s{color:var(--sell);font-weight:700}.tab b.z{color:var(--muted)}
+.sumbar{display:flex;flex-wrap:wrap;align-items:center;gap:10px 22px;padding:14px 18px;border-radius:8px;background:var(--panel);box-shadow:inset 0 0 0 1px var(--line)}
+.sumbar.up{box-shadow:inset 0 0 0 2px var(--buy);background:color-mix(in srgb,var(--buy) 7%,var(--panel))}
+.sumbar.down{box-shadow:inset 0 0 0 2px var(--sell);background:color-mix(in srgb,var(--sell) 7%,var(--panel))}
+.sumbar .lbl{font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted)}
+.sumbar .big{font-family:var(--mono);font-weight:700;font-size:clamp(30px,6vw,46px);line-height:1;font-variant-numeric:tabular-nums}
+.sumbar .big.up{color:var(--buy)}.sumbar .big.down{color:var(--sell)}.sumbar .big.z{color:var(--fg)}
+.sumbar .parts{display:flex;gap:18px;font-size:14px}.sumbar .parts b{font-family:var(--mono);font-size:17px}
+.sumbar .run{font-size:13px;color:var(--muted)}
+#resbtn{margin-left:auto;font:inherit;font-weight:600;font-size:14px;padding:10px 16px;border-radius:6px;border:0;background:var(--ink);color:var(--ink-fg);cursor:pointer}
+#resbtn:focus-visible{outline:3px solid var(--buy);outline-offset:2px}
+#resdlg{border:0;border-radius:10px;padding:0;background:var(--bg);color:var(--fg);width:min(860px,96vw);max-height:90vh;box-shadow:0 20px 60px rgba(0,0,0,.35)}
+#resdlg::backdrop{background:rgba(0,0,0,.45)}
+#resdlg .hd{display:flex;align-items:center;justify-content:space-between;padding:16px 20px;border-bottom:1px solid var(--line);position:sticky;top:0;background:var(--bg)}
+#resdlg .hd h2{margin:0;font-size:18px}
+#resdlg .x{font:inherit;font-size:22px;line-height:1;border:0;background:transparent;color:var(--muted);cursor:pointer;padding:4px 8px}
+#resdlg .bd{padding:8px 12px 16px;overflow:auto}
+.rt{width:100%;border-collapse:collapse;font-size:14px;font-variant-numeric:tabular-nums}
+.rt th{text-align:right;font-weight:600;font-size:12px;color:var(--muted);padding:8px;border-bottom:1px solid var(--line);white-space:nowrap}
+.rt td{text-align:right;padding:10px 8px;border-bottom:1px solid var(--line);font-family:var(--mono);white-space:nowrap}
+.rt th:first-child,.rt td:first-child{text-align:left;font-family:inherit}
+.rt td.tot{font-weight:700;font-size:16px}
+.rt tr.row{cursor:pointer}.rt tr.row:hover td{background:color-mix(in srgb,var(--fg) 5%,transparent)}
+.rt tr.row.up td.tot{background:color-mix(in srgb,var(--buy) 12%,transparent)}
+.rt tr.row.down td.tot{background:color-mix(in srgb,var(--sell) 12%,transparent)}
+.rt tfoot td{font-weight:700;border-bottom:0;border-top:2px solid var(--fg);font-size:15px}
+.rt .st{font-family:inherit;font-size:12px;color:var(--muted)}
+.rt .st.on{color:var(--buy)}.rt .st.err{color:var(--sell)}
+.rbar{height:6px;border-radius:3px;background:var(--line);overflow:hidden;min-width:60px}
+.rbar i{display:block;height:100%}.rbar i.up{background:var(--buy)}.rbar i.down{background:var(--sell)}
 .delrow{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-top:14px}
 #delbtn{font:inherit;font-size:13px;padding:7px 12px;border-radius:4px;border:0;background:transparent;color:var(--sell);box-shadow:inset 0 0 0 1px var(--sell);cursor:pointer}
 .killrow{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:-6px}
@@ -1774,7 +1803,9 @@ input[type=range]{padding:0;border:0;background:none;accent-color:var(--fg)}
 .take:disabled{opacity:.4;cursor:not-allowed}
 </style></head><body>
 <div class="wrap">
+<section class="sumbar" id="sumbar" aria-live="polite"></section>
 <nav class="tabs" id="tabs" aria-label="Сетки"></nav>
+<dialog id="resdlg" aria-labelledby="resttl"><div class="hd"><h2 id="resttl">Результаты по сеткам</h2><button type="button" class="x" id="resx" aria-label="Закрыть">×</button></div><div class="bd" id="resbody"></div></dialog>
 <div class="killrow" id="killrow" hidden><button type="button" id="killall">Закрыть все сетки</button><span class="note" id="killnote"></span></div>
 <header><div><div class="pair" id="pair">—</div><div class="tag" id="net">—</div></div>
 <div class="status" id="status"><span class="dot"></span><span id="statusText">Остановлен</span></div></header>
@@ -1960,15 +1991,46 @@ async function newGrid(prefill){await saveNow();
  const r=await (await fetch("/api/new",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(Object.assign({copy_from:CUR},prefill||{}))})).json();
  await selectGrid(r.id);$("set").open=true}
 let GRIDS=[];
+const sgn=v=>(v>0.004?"+":v<-0.004?"−":"")+fmt(Math.abs(v));
+const cls=v=>v>0.004?"up":v<-0.004?"down":"z";
 function renderTabs(){
  const t=$("tabs"),tot=GRIDS.reduce((a,g)=>a+(g.total||0),0),real=GRIDS.reduce((a,g)=>a+(g.profit||0),0),
-  un=GRIDS.reduce((a,g)=>a+(g.upnl||0),0),run=GRIDS.filter(g=>g.running).length,sg=v=>(v>=0?"+":"−")+fmt(Math.abs(v));
+  un=GRIDS.reduce((a,g)=>a+(g.upnl||0),0),run=GRIDS.filter(g=>g.running).length;
  t.innerHTML=GRIDS.map(g=>{const sym=(g.symbol||"—").replace("USDT",""),mk=(g.market==="futures"?` ${g.leverage}x`:" спот")+(g.direction==="sell"?" sell":g.direction==="neutral"&&g.market==="futures"?" ½/½":"");
-  const v=g.total||0,p=g.running||g.trades||v?` <b class="${v>=0?"b":"s"}">${v>=0?"+":"−"}${fmt(Math.abs(v))}</b>`:"";
+  const v=g.total||0,c=cls(v),p=g.running||g.trades||v?` <b class="${c==="up"?"b":c==="down"?"s":"z"}">${sgn(v)}</b>`:"";
   return `<button type="button" class="tab${g.running?" on":""}${g.error?" err":""}" data-id="${g.id}" aria-current="${g.id===CUR}"><span class="d"></span>${esc(sym)}<span class="i">${mk}</span>${p}</button>`}).join("")+
-  `<button type="button" class="tab add" id="addtab">+ Новая сетка</button>`+
-  `<span class="total" title="зафиксировано ${sg(real)} · в позициях ${sg(un)}">Работает ${run} из ${GRIDS.length} · всего <b class="${tot>=0?"b":"s"}">${sg(tot)} USDT</b> <span class="i">(зафикс. ${sg(real)} · в позициях ${sg(un)})</span></span>`;
+  `<button type="button" class="tab add" id="addtab">+ Новая сетка</button>`;
+ const sb=$("sumbar"),c=cls(tot);sb.className="sumbar"+(c==="z"?"":" "+c);
+ sb.innerHTML=`<div><div class="lbl">Всего по всем сеткам</div><div class="big ${c}">${sgn(tot)} <span style="font-size:.5em">USDT</span></div></div>`+
+  `<div class="parts"><div><div class="lbl">Зафиксировано</div><b class="${cls(real)==="up"?"b":cls(real)==="down"?"s":""}">${sgn(real)}</b></div>`+
+  `<div><div class="lbl">В позициях</div><b class="${cls(un)==="up"?"b":cls(un)==="down"?"s":""}">${sgn(un)}</b></div></div>`+
+  `<div class="run">Работает ${run} из ${GRIDS.length}</div>`+
+  `<button type="button" id="resbtn">📊 Результаты по сеткам</button>`;
+ if($("resdlg").open)renderRes();
 }
+function renderRes(){
+ const rows=[...GRIDS].sort((a,b)=>(b.total||0)-(a.total||0)),mx=Math.max(0.01,...rows.map(g=>Math.abs(g.total||0)));
+ const tot=GRIDS.reduce((a,g)=>a+(g.total||0),0),real=GRIDS.reduce((a,g)=>a+(g.profit||0),0),
+  un=GRIDS.reduce((a,g)=>a+(g.upnl||0),0),tr=GRIDS.reduce((a,g)=>a+(g.trades||0),0),cap=GRIDS.filter(g=>g.running).reduce((a,g)=>a+(g.capital||0),0);
+ const col=v=>{const c=cls(v);return c==="up"?"b":c==="down"?"s":"i"};
+ const pct=(v,c)=>c>0?sgn(v/c*100)+"%":"—";
+ $("resbody").innerHTML=rows.length?`<table class="rt"><thead><tr><th>Сетка</th><th>Статус</th><th>Сделок</th><th>Зафикс.</th><th>В позиции</th><th>Итог, USDT</th><th>% капит.</th><th></th></tr></thead><tbody>`+
+  rows.map((g,i)=>{const v=g.total||0,c=cls(v),sym=(g.symbol||"—").replace("USDT",""),
+   mk=g.market==="futures"?`${g.leverage}x`+(g.direction==="neutral"?" ½/½":g.direction==="sell"?" sell":""):"спот";
+   return `<tr class="row ${c}" data-id="${g.id}"><td><b>${i===0&&v>0.004?"🏆 ":""}${esc(sym)}</b> <span class="i">${mk}</span></td>`+
+   `<td><span class="st${g.running?" on":""}${g.error?" err":""}">${g.error?"ошибка":g.running?"работает":"стоп"}</span></td>`+
+   `<td>${g.trades||0}</td><td class="${col(g.profit||0)}">${sgn(g.profit||0)}</td><td class="${col(g.upnl||0)}">${sgn(g.upnl||0)}</td>`+
+   `<td class="tot ${col(v)}">${sgn(v)}</td><td class="${col(v)}">${pct(v,g.capital)}</td>`+
+   `<td><div class="rbar"><i class="${c}" style="width:${Math.round(Math.abs(v)/mx*100)}%"></i></div></td></tr>`}).join("")+
+  `</tbody><tfoot><tr><td>Всего</td><td></td><td>${tr}</td><td class="${col(real)}">${sgn(real)}</td><td class="${col(un)}">${sgn(un)}</td>`+
+  `<td class="tot ${col(tot)}">${sgn(tot)}</td><td class="${col(tot)}">${pct(tot,cap)}</td><td></td></tr></tfoot></table>`+
+  `<p class="note" style="margin:12px 8px 0">Нажмите на строку, чтобы открыть сетку. % — от капитала сетки.</p>`
+  :`<p class="note">Сеток пока нет.</p>`;
+}
+$("sumbar").addEventListener("click",e=>{if(e.target.closest("#resbtn")){renderRes();$("resdlg").showModal()}});
+$("resx").onclick=()=>$("resdlg").close();
+$("resdlg").addEventListener("click",e=>{if(e.target===$("resdlg")){$("resdlg").close();return}
+ const r=e.target.closest("tr.row");if(r){$("resdlg").close();if(r.dataset.id!==CUR)selectGrid(r.dataset.id)}});
 let KILLT=null;
 function killUI(){const run=GRIDS.filter(g=>g.running).length,b=$("killall");
  $("killrow").hidden=!run&&!b.disabled;if(b.classList.contains("sure")||b.disabled)return;
