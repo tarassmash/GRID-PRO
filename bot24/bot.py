@@ -2684,10 +2684,21 @@ def main():
     st = load_store()
     save_store(st)                       # перевести старый файл настроек в формат с несколькими сетками
     if st.get("api_key") and st.get("api_secret") and not (ON_SERVER and not APP_PASSWORD):
-        for gid in sorted(st["grids"], key=int):
+        # На одной паре — только одна сетка: две сетки делят одну позицию на бирже и снимают ордера друг друга.
+        # В авторежиме первыми поднимаются авто-сетки, ручная сетка на той же монете не запускается.
+        auto_on = bool((st.get("auto") or {}).get("enabled"))
+        order = sorted(st["grids"], key=lambda g: (not (auto_on and st["grids"][g].get("auto")), int(g)))
+        taken = {}
+        for gid in order:
             cfg = grid_cfg(gid, st)
             if not cfg.get("was_running"):
                 continue
+            key = (str(cfg.get("symbol", "")).upper(), cfg.get("market"))
+            if key in taken:
+                print(f"сетка {gid} ({cfg['symbol']}) не запускаю: эту монету уже торгует сетка {taken[key]}", flush=True)
+                set_autostart(False, gid)
+                continue
+            taken[key] = gid
             print(f"сетка {gid} ({cfg['symbol']}) работала до перезапуска — запускаю снова", flush=True)
             try:
                 Bybit(cfg["api_key"], cfg["api_secret"], cfg["network"],
