@@ -198,6 +198,7 @@ class Bybit:
                 locked = Decimal(c.get("locked") or "0")
                 out[c["coin"]] = {"total": bal, "free": bal - locked}
             out["_margin"] = Decimal(acc.get("totalAvailableBalance") or "0")
+            out["_equity"] = Decimal(acc.get("totalEquity") or acc.get("totalWalletBalance") or "0")
         return out
 
     def place(self, sym, side, qty, price=None, market_quote=None, market=False, reduce_only=False,
@@ -1583,7 +1584,7 @@ def split_start(body):
 # волатильные за последние `minutes` минут монеты из списка (пустой список — самые ликвидные пары биржи).
 # Монета, которую только что держали, не берётся снова, пока не пройдёт тот же срок — так монеты меняются.
 AUTO_DEFAULT = {"enabled": False, "coins": "", "slots": 3, "hold_min": 120, "minutes": 30,
-                "leverage": 2, "skip_trend": True, "market": "futures"}
+                "leverage": 2, "max_leverage": 10, "use_pct": 90, "skip_trend": True, "market": "futures"}
 AUTO_TICK = 60
 AUTO_LOCK = threading.Lock()
 AUTO_LOG = []
@@ -1597,6 +1598,8 @@ def auto_cfg(st=None):
     a["hold_min"] = max(15, min(24 * 60, int(a.get("hold_min") or 120)))
     a["minutes"] = max(5, min(240, int(a.get("minutes") or 30)))
     a["leverage"] = max(1, min(20, int(a.get("leverage") or 2)))
+    a["max_leverage"] = max(a["leverage"], min(25, int(a.get("max_leverage") or 10)))
+    a["use_pct"] = max(10, min(95, int(a.get("use_pct") or 90)))
     a["market"] = "spot" if a.get("market") == "spot" else "futures"
     return a
 
@@ -1623,7 +1626,40 @@ def auto_recent(st):
     return (st.get("auto") or {}).setdefault("recent", {})
 
 
-def auto_launch(row, per, a, now):
+def lot_share(levels, mult, neutral=True):
+    """Доля самого маленького лота от объёма сетки — та же раскладка, что в Bot._setup."""
+    n = int(levels)
+    if neutral and n % 2 == 0:
+        n += 1
+    mult = min(max(Decimal(str(mult)), Decimal("1.01")), Decimal(3))
+    if neutral:
+        m = (n - 1) // 2 - 1
+        dist = {i: (m - i) if i <= m else (i - m - 1) for i in range(n - 1)}
+        w = {i: mult ** dist[i] for i in dist}
+        wb = sum(w[i] for i in w if i <= m)
+        ws = sum(w[i] for i in w if i > m)
+        return min(Decimal(1) / 2 * w[i] / (wb if i <= m else ws) for i in w)
+    w = [mult ** abs(i) for i in range(n - 1)]
+    return min(w) / sum(w)
+
+
+def auto_fit_lev(sym, per, row, a):
+    """Плечо для авто-сетки: начинаем с a["leverage"] и поднимаем по 1x, пока самый маленький лот
+    не пройдёт минимум ордера Bybit. None — не влезает даже на максимальном плече."""
+    if a["market"] != "futures":
+        return 1
+    inst = Bybit("", "", "mainnet", "linear").instrument(sym)
+    min_amt = Decimal(inst["lotSizeFilter"].get("minNotionalValue") or "5")
+    max_lev = min(int(Decimal(inst.get("leverageFilter", {}).get("maxLeverage") or "100")), a["max_leverage"])
+    share = lot_share(row.get("sugg_levels") or 4, DEFAULT_CFG["lot_mult"])
+    need = min_amt * Decimal("1.05") * Decimal("1.03")      # запас как в сетке + округление количества
+    for lev in range(a["leverage"], max_lev + 1):
+        if per * lev * share >= need:
+            return lev
+    return None
+
+
+def auto_launch(row, per, a, now, lev=None):
     sym = row["symbol"]
     with CFG_LOCK:
         st = load_store()
@@ -1633,14 +1669,15 @@ def auto_launch(row, per, a, now):
             gid = new_grid_id(st)
         fut = a["market"] == "futures"
         g = dict({k: DEFAULT_CFG[k] for k in GRID_KEYS})
-        g.update(symbol=sym, market=a["market"], leverage=a["leverage"] if fut else 1,
+        g.update(symbol=sym, market=a["market"], leverage=(lev or a["leverage"]) if fut else 1,
                  capital=float(per), cap_max=False, direction="neutral" if fut else "both",
                  trail_up=True, trail_down=True, range_pct=row.get("sugg_range") or 5,
                  levels=row.get("sugg_levels") or 4, auto=True, auto_t=now, was_running=False)
         st["grids"][gid] = g
         save_store(st)
     auto_say(f"беру {sym[:-4]}: размах за {a['minutes']} мин {row['range']:.1f}%, {row['kind']}, "
-             f"{per:.2f} USDT, плечо {g['leverage']}x — держу до {a['hold_min'] // 60} ч {a['hold_min'] % 60:02d} мин")
+             f"{per:.2f} USDT, плечо {g['leverage']}x" + (f" (на {a['leverage']}x лоты меньше минимума Bybit — поднял)"
+             if fut and g["leverage"] > a["leverage"] else "") + f" — держу до {a['hold_min'] // 60} ч {a['hold_min'] % 60:02d} мин")
     bot(gid).start(grid_cfg(gid))
 
 
@@ -1696,17 +1733,41 @@ def auto_step(force=False):
     if not cands:
         AUTO_STATE["msg"] = "нет подходящих монет — проверю через минуту"
         return
+    # Бюджет: в работе должно быть не больше use_pct% всего депозита (остальное — запас маржи).
+    # Сейчас занято (депозит − свободно), значит на новые сетки можно ещё use_pct%·депозит − занято.
     api, free, k = free_funds(a["market"])
-    per = (free * k / free_slots).quantize(Decimal("0.01"), ROUND_DOWN)
-    if per < 10:
-        msg = f"свободно {free:.2f} USDT — на {free_slots} мест(а) мало, жду"
+    if a["market"] == "futures":
+        eq = api.balances().get("_equity") or free
+        budget = min(free * Decimal("0.98"), eq * Decimal(a["use_pct"]) / 100 - (eq - free))
+    else:
+        eq, budget = free, free * k
+    budget = max(budget, Decimal(0))
+    launched = 0
+    for slots in range(free_slots, 0, -1):     # не влезает на все места — пробуем меньше сеток, но крупнее
+        per = (budget / slots).quantize(Decimal("0.01"), ROUND_DOWN)
+        plan = []
+        for r in cands:
+            if len(plan) == slots:
+                break
+            try:
+                lev = auto_fit_lev(r["symbol"], per, r, a)
+            except BybitError:
+                continue
+            if lev:
+                plan.append((r, lev))
+        if len(plan) == slots:
+            for r, lev in plan:
+                auto_launch(r, per, a, now, lev)
+            launched = slots
+            break
+    if not launched:
+        msg = (f"депозит {eq:.2f} USDT, свободно {free:.2f}: до {a['use_pct']}% депозита осталось {budget:.2f} USDT — "
+               f"не хватает даже на одну сетку при плече до {a['max_leverage']}x, жду")
         if AUTO_STATE["msg"] != msg:
             auto_say(msg)
         AUTO_STATE["msg"] = msg
         return
-    for r in cands[:free_slots]:
-        auto_launch(r, per, a, now)
-    AUTO_STATE["msg"] = "работаю"
+    AUTO_STATE["msg"] = "работаю" if launched == free_slots else f"работаю: денег хватило на {launched} из {free_slots} мест"
 
 
 def auto_loop():
@@ -2122,11 +2183,13 @@ input[type=range]{padding:0;border:0;background:none;accent-color:var(--fg)}
 <label>Сеток одновременно<input id="a_slots" type="number" min="1" max="10" step="1"></label>
 <label>Держать монету, часов<input id="a_hold" type="number" min="0.25" max="24" step="0.25"></label>
 <label>Волатильность за, минут<input id="a_min" type="number" min="5" max="240" step="5"></label>
-<label>Плечо<input id="a_lev" type="number" min="1" max="20" step="1"></label>
+<label>Плечо (начальное)<input id="a_lev" type="number" min="1" max="20" step="1"></label>
+<label>Плечо максимум (если лоты не влезают)<input id="a_maxlev" type="number" min="1" max="25" step="1"></label>
+<label>Использовать депозита, %<input id="a_use" type="number" min="10" max="95" step="5"></label>
 <label class="chk full"><input type="checkbox" id="a_skip"> Пропускать монеты в сильном пампе/дампе (цена уходит в одну сторону — сетка там теряет)</label>
 <button type="button" id="asave">Сохранить настройки</button>
 </div>
-<div class="note" style="margin-top:8px">Авто: раз в минуту бот закрывает сетки, которые отработали заданное время, и на свободные места ставит самые волатильные монеты из списка. Только что закрытую монету не берёт снова, пока не пройдёт то же время. Капитал делится поровну между свободными местами. Ручной: авто ничего не меняет, сетки работают как есть.</div>
+<div class="note" style="margin-top:8px">Авто: раз в минуту бот закрывает сетки, которые отработали заданное время, и на свободные места ставит самые волатильные монеты из списка. Только что закрытую монету не берёт снова, пока не пройдёт то же время. В работе держит до заданного % всего депозита (по умолчанию 90%), остальное — запас маржи; деньги делятся поровну между свободными местами. Если на начальном плече самый маленький лот меньше минимума Bybit (5 USDT), плечо поднимается по 1x до максимума; не влезает и так — берёт меньше сеток, но крупнее. Ручной: авто ничего не меняет, сетки работают как есть.</div>
 <div class="alog" id="alog"></div>
 </details>
 </section>
@@ -2414,14 +2477,14 @@ function autoUI(){if(!AUTO)return;const on=!!AUTO.enabled;
  $("m_man").setAttribute("aria-pressed",String(!on));$("m_auto").setAttribute("aria-pressed",String(on));$("autobar").classList.toggle("on",on);
  $("amsg").textContent=on?`Авто: ${AUTO.msg||"…"}`+(AUTO.next_in?` · проверка через ${AUTO.next_in} с`:"")+` · ${AUTO.slots} сеток по ${hm(AUTO.hold_min*60)} ч`:"Ручной режим: сетки запускаете и останавливаете сами";
  $("achips").innerHTML=(AUTO.grids||[]).map(g=>`<span class="achip">${esc(g.symbol.replace("USDT",""))} · ещё ${hm(g.left)} · <span class="${g.total>0.004?"b":g.total<-0.004?"s":""}">${sgn(g.total)}</span></span>`).join("");
- if(!AFORM){$("a_coins").value=AUTO.coins||"";$("a_slots").value=AUTO.slots;$("a_hold").value=AUTO.hold_min/60;$("a_min").value=AUTO.minutes;$("a_lev").value=AUTO.leverage;$("a_skip").checked=!!AUTO.skip_trend}
+ if(!AFORM){$("a_coins").value=AUTO.coins||"";$("a_slots").value=AUTO.slots;$("a_hold").value=AUTO.hold_min/60;$("a_min").value=AUTO.minutes;$("a_lev").value=AUTO.leverage;$("a_maxlev").value=AUTO.max_leverage;$("a_use").value=AUTO.use_pct;$("a_skip").checked=!!AUTO.skip_trend}
  $("alog").innerHTML=(AUTO.log||[]).map(l=>`<div>${esc(l.t)} ${esc(l.text)}</div>`).join("")||"Пока пусто";}
 async function autoPoll(){try{const r=await fetch("/api/auto");if(r.ok){AUTO=await r.json();autoUI()}}catch(e){}}
 async function autoSend(b){try{const r=await fetch("/api/auto",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(b)}),d=await r.json();
  if(!r.ok)throw new Error(d.error||r.status);AUTO=d;AFORM=false;autoUI();setTimeout(autoPoll,3000)}catch(e){$("amsg").textContent="Ошибка: "+e.message}}
 function aForm(){return{coins:$("a_coins").value,slots:Number($("a_slots").value)||3,hold_min:Math.round((Number($("a_hold").value)||2)*60),
- minutes:Number($("a_min").value)||30,leverage:Number($("a_lev").value)||2,skip_trend:$("a_skip").checked}}
-["a_coins","a_slots","a_hold","a_min","a_lev","a_skip"].forEach(k=>$(k).addEventListener("input",()=>{AFORM=true}));
+ minutes:Number($("a_min").value)||30,leverage:Number($("a_lev").value)||2,max_leverage:Number($("a_maxlev").value)||10,use_pct:Number($("a_use").value)||90,skip_trend:$("a_skip").checked}}
+["a_coins","a_slots","a_hold","a_min","a_lev","a_maxlev","a_use","a_skip"].forEach(k=>$(k).addEventListener("input",()=>{AFORM=true}));
 $("asave").onclick=()=>autoSend(aForm());
 $("m_auto").onclick=()=>{if(AUTO&&AUTO.enabled)return;
  if(!confirm("Включить авторежим 24/7? Бот сам будет выбирать самые волатильные монеты, держать до заданного времени и менять их."))return;
