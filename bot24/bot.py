@@ -85,6 +85,7 @@ def load_store():
             g["was_running"] = bool(raw.get("was_running"))
             grids = {"1": g}
         st["grids"] = {gid: dict({k: DEFAULT_CFG[k] for k in GRID_KEYS}, **g) for gid, g in grids.items()}
+        st["auto"] = raw.get("auto") if isinstance(raw.get("auto"), dict) else {}
         if ENV_KEY and ENV_SECRET:          # ключи из переменных окружения главнее
             st["api_key"], st["api_secret"] = ENV_KEY, ENV_SECRET
         return st
@@ -1324,9 +1325,9 @@ SCAN_MIN_TURNOVER = 3e6    # минимум оборота за 24 часа, USD
 _scan_cache = {}
 
 
-def scan_volatile(market="spot", minutes=30):
+def scan_volatile(market="spot", minutes=30, symbols=None):
     cat = "linear" if market in ("futures", "linear") else "spot"
-    key = (cat, minutes)
+    key = (cat, minutes, tuple(symbols) if symbols else None)
     hit = _scan_cache.get(key)
     if hit and time.time() - hit[0] < 20:
         return hit[1]
@@ -1344,6 +1345,9 @@ def scan_volatile(market="spot", minutes=30):
         if turn >= SCAN_MIN_TURNOVER:
             pool.append((turn, sym))
     pool = [s_ for _, s_ in sorted(pool, reverse=True)[:SCAN_TOP]]
+    if symbols:                        # свой список монет: проверяем только его
+        have = {t.get("symbol", "") for t in tick}
+        pool = [x for x in symbols if x in have]
     turnover = {t["symbol"]: float(t.get("turnover24h") or 0) for t in tick}
 
     def one(sym):
@@ -1493,7 +1497,9 @@ def grids_summary():
                     "upnl": up, "total": (b.profit if b else 0.0) + up,
                     "capital": float(b.cap) if b and b.cap else float(g.get("capital") or 0)})
         h, hr, hu = pnl_window(gid, up)
-        out[-1].update(h1=h, h1_real=hr, h1_up=hu)
+        out[-1].update(h1=h, h1_real=hr, h1_up=hu, auto=bool(g.get("auto")),
+                       auto_left=max(0, int(float(g.get("auto_t") or 0) + auto_cfg(st)["hold_min"] * 60 - time.time()))
+                       if g.get("auto") else 0)
     return out
 
 
@@ -1572,6 +1578,184 @@ def split_start(body):
     return {"ok": True, "ids": ids, "per": float(per), "free": float(free), "leverage": lev}
 
 
+# ---------- Авторежим 24/7 ----------
+# Раз в минуту: сетки, которые отработали hold_min, закрываются; на свободные места берутся самые
+# волатильные за последние `minutes` минут монеты из списка (пустой список — самые ликвидные пары биржи).
+# Монета, которую только что держали, не берётся снова, пока не пройдёт тот же срок — так монеты меняются.
+AUTO_DEFAULT = {"enabled": False, "coins": "", "slots": 3, "hold_min": 120, "minutes": 30,
+                "leverage": 2, "skip_trend": True, "market": "futures"}
+AUTO_TICK = 60
+AUTO_LOCK = threading.Lock()
+AUTO_LOG = []
+AUTO_STATE = {"next": 0.0, "last_scan": "", "msg": ""}
+
+
+def auto_cfg(st=None):
+    st = st or load_store()
+    a = dict(AUTO_DEFAULT, **{k: v for k, v in (st.get("auto") or {}).items() if k in AUTO_DEFAULT})
+    a["slots"] = max(1, min(10, int(a.get("slots") or 3)))
+    a["hold_min"] = max(15, min(24 * 60, int(a.get("hold_min") or 120)))
+    a["minutes"] = max(5, min(240, int(a.get("minutes") or 30)))
+    a["leverage"] = max(1, min(20, int(a.get("leverage") or 2)))
+    a["market"] = "spot" if a.get("market") == "spot" else "futures"
+    return a
+
+
+def auto_coins(a):
+    out = []
+    for x in str(a.get("coins") or "").replace(";", ",").replace("\n", ",").replace(" ", ",").split(","):
+        x = x.upper().strip().replace("/", "")
+        if x and not x.endswith("USDT"):
+            x += "USDT"
+        if x and x not in out:
+            out.append(x)
+    return out
+
+
+def auto_say(text):
+    with AUTO_LOCK:
+        AUTO_LOG.insert(0, {"t": time.strftime("%H:%M"), "text": text})
+        del AUTO_LOG[60:]
+    print(time.strftime("%H:%M:%S"), "[авто]", text, flush=True)
+
+
+def auto_recent(st):
+    return (st.get("auto") or {}).setdefault("recent", {})
+
+
+def auto_launch(row, per, a, now):
+    sym = row["symbol"]
+    with CFG_LOCK:
+        st = load_store()
+        gid = next((g for g, c in sorted(st["grids"].items(), key=lambda x: int(x[0]))
+                    if c.get("auto") and not (BOTS.get(g) and (BOTS[g].running or BOTS[g].busy))), None)
+        if gid is None:
+            gid = new_grid_id(st)
+        fut = a["market"] == "futures"
+        g = dict({k: DEFAULT_CFG[k] for k in GRID_KEYS})
+        g.update(symbol=sym, market=a["market"], leverage=a["leverage"] if fut else 1,
+                 capital=float(per), cap_max=False, direction="neutral" if fut else "both",
+                 trail_up=True, trail_down=True, range_pct=row.get("sugg_range") or 5,
+                 levels=row.get("sugg_levels") or 4, auto=True, auto_t=now, was_running=False)
+        st["grids"][gid] = g
+        save_store(st)
+    auto_say(f"беру {sym[:-4]}: размах за {a['minutes']} мин {row['range']:.1f}%, {row['kind']}, "
+             f"{per:.2f} USDT, плечо {g['leverage']}x — держу до {a['hold_min'] // 60} ч {a['hold_min'] % 60:02d} мин")
+    bot(gid).start(grid_cfg(gid))
+
+
+def auto_step(force=False):
+    st = load_store()
+    a = auto_cfg(st)
+    if not a["enabled"]:
+        AUTO_STATE["msg"] = "ручной режим"
+        return
+    if not (st.get("api_key") and st.get("api_secret")) or (ON_SERVER and not APP_PASSWORD):
+        AUTO_STATE["msg"] = "нет API ключей или пароля APP_PASSWORD"
+        return
+    now = time.time()
+    hold = a["hold_min"] * 60
+    recent = auto_recent(st)
+    changed = False
+    autos = {gid: g for gid, g in st["grids"].items() if g.get("auto")}
+    for gid, g in autos.items():
+        b, sym = BOTS.get(gid), str(g.get("symbol", "")).upper()
+        if b and b.running and now - float(g.get("auto_t") or now) >= hold:
+            auto_say(f"{sym[:-4]}: отработала {a['hold_min'] // 60} ч {a['hold_min'] % 60:02d} мин, итог "
+                     f"{b.profit + b.unrealized():+.2f} USDT — закрываю и меняю монету")
+            recent[sym] = now
+            changed = True
+            b.stop()
+        elif b and not b.running and not b.busy and b.error and sym and recent.get(sym, 0) < float(g.get("auto_t") or 0):
+            auto_say(f"{sym[:-4]}: сетка остановилась с ошибкой — пропускаю эту монету")
+            recent[sym] = now
+            changed = True
+    for sym in [x for x, t in recent.items() if now - t > hold]:
+        del recent[sym]
+        changed = True
+    if changed:
+        with CFG_LOCK:
+            st2 = load_store()
+            st2.setdefault("auto", {})["recent"] = recent
+            save_store(st2)
+    if any(BOTS.get(gid) and BOTS[gid].busy for gid in autos):
+        AUTO_STATE["msg"] = "жду, пока сетки закроются или запустятся"
+        return
+    active = [gid for gid in autos if BOTS.get(gid) and BOTS[gid].running]
+    free_slots = a["slots"] - len(active)
+    if free_slots <= 0:
+        AUTO_STATE["msg"] = f"все {a['slots']} места заняты"
+        return
+    coins = auto_coins(a)
+    res = scan_volatile(a["market"], a["minutes"], symbols=coins or None)
+    AUTO_STATE["last_scan"] = res.get("t", "")
+    cat = "linear" if a["market"] == "futures" else "spot"
+    busy = {b.symbol for b in BOTS.values() if (b.running or b.busy) and b.cat == cat}
+    cands = [r for r in res["rows"] if r["symbol"] not in busy and r["symbol"] not in recent
+             and not (a["skip_trend"] and r["kind"] in ("памп", "дамп"))]
+    if not cands:
+        AUTO_STATE["msg"] = "нет подходящих монет — проверю через минуту"
+        return
+    api, free, k = free_funds(a["market"])
+    per = (free * k / free_slots).quantize(Decimal("0.01"), ROUND_DOWN)
+    if per < 10:
+        msg = f"свободно {free:.2f} USDT — на {free_slots} мест(а) мало, жду"
+        if AUTO_STATE["msg"] != msg:
+            auto_say(msg)
+        AUTO_STATE["msg"] = msg
+        return
+    for r in cands[:free_slots]:
+        auto_launch(r, per, a, now)
+    AUTO_STATE["msg"] = "работаю"
+
+
+def auto_loop():
+    while True:
+        try:
+            auto_step()
+        except Exception as e:
+            AUTO_STATE["msg"] = "ошибка: " + str(e)
+            auto_say("ошибка авторежима: " + str(e))
+        AUTO_STATE["next"] = time.time() + AUTO_TICK
+        time.sleep(AUTO_TICK)
+
+
+def auto_status():
+    st = load_store()
+    a = auto_cfg(st)
+    now = time.time()
+    grids = []
+    for gid, g in sorted(st["grids"].items(), key=lambda x: int(x[0])):
+        b = BOTS.get(gid)
+        if g.get("auto") and b and (b.running or b.busy):
+            grids.append({"id": gid, "symbol": str(g.get("symbol", "")).upper(),
+                          "left": max(0, int(float(g.get("auto_t") or now) + a["hold_min"] * 60 - now)),
+                          "total": b.profit + b.unrealized()})
+    with AUTO_LOCK:
+        log = list(AUTO_LOG[:15])
+    return dict(a, recent=list((st.get("auto") or {}).get("recent", {}).keys()), grids=grids, log=log,
+                msg=AUTO_STATE["msg"], last_scan=AUTO_STATE["last_scan"],
+                next_in=max(0, int(AUTO_STATE["next"] - now)))
+
+
+def auto_save(body):
+    with CFG_LOCK:
+        st = load_store()
+        a = st.setdefault("auto", {})
+        was = bool(a.get("enabled"))
+        for k in AUTO_DEFAULT:
+            if k in body and body[k] is not None:
+                a[k] = body[k]
+        a.update({k: v for k, v in auto_cfg(st).items() if k in AUTO_DEFAULT})
+        save_store(st)
+    if a["enabled"] != was:
+        auto_say("включён авторежим 24/7" if a["enabled"] else "включён ручной режим — авто больше не меняет сетки")
+    if a["enabled"]:
+        threading.Thread(target=lambda: (auto_step(), AUTO_STATE.update(next=time.time() + AUTO_TICK)),
+                         daemon=True).start()
+    return auto_status()
+
+
 def new_grid_id(st):
     return str(max([int(x) for x in st["grids"]] + [0]) + 1)
 
@@ -1625,6 +1809,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, bot(gid).state())
         elif self.path == "/api/grids":
             self._send(200, grids_summary())
+        elif self.path == "/api/auto":
+            self._send(200, auto_status())
         elif self.path.startswith("/api/scan"):
             qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             try:
@@ -1679,6 +1865,8 @@ class Handler(BaseHTTPRequestHandler):
                     else:
                         g[k] = v
                 if self.path == "/api/start":
+                    g.pop("auto", None)
+                    g.pop("auto_t", None)
                     sym, mk = str(g.get("symbol", "")).upper().strip(), g.get("market")
                     for og, ob in BOTS.items():
                         if og != gid and (ob.running or ob.busy) and ob.symbol == sym \
@@ -1690,6 +1878,11 @@ class Handler(BaseHTTPRequestHandler):
             if self.path == "/api/start":
                 bot(gid).start(grid_cfg(gid))
             self._send(200, {"ok": True, "id": gid})
+        elif self.path == "/api/auto":
+            try:
+                self._send(200, auto_save(body))
+            except (BybitError, ValueError) as e:
+                self._send(400, {"error": str(e)})
         elif self.path == "/api/split":
             try:
                 self._send(200, split_start(body))
@@ -1848,6 +2041,26 @@ input[type=range]{padding:0;border:0;background:none;accent-color:var(--fg)}
 .rt td.hr{font-weight:700}
 .rt th.sort{cursor:pointer;text-decoration:underline dotted}
 .rt th.sort[aria-sort]{color:var(--fg)}
+.autobar{display:flex;flex-wrap:wrap;align-items:center;gap:10px 16px;padding:12px 16px;border-radius:8px;background:var(--panel);box-shadow:inset 0 0 0 1px var(--line)}
+.autobar.on{box-shadow:inset 0 0 0 2px var(--buy)}
+.mode{display:inline-flex;border-radius:6px;box-shadow:inset 0 0 0 1px var(--line);overflow:hidden}
+.mode button{font:inherit;font-weight:600;font-size:14px;padding:10px 16px;border:0;background:transparent;color:var(--muted);cursor:pointer}
+.mode button[aria-pressed="true"]{background:var(--ink);color:var(--ink-fg)}
+.mode button.auto[aria-pressed="true"]{background:var(--buy);color:#fff}
+.mode button:focus-visible{outline:3px solid var(--buy);outline-offset:-3px}
+.autobar .amsg{font-size:13px;color:var(--muted)}
+.autobar .achips{display:flex;flex-wrap:wrap;gap:6px}
+.achip{font-family:var(--mono);font-size:12px;padding:4px 8px;border-radius:4px;background:color-mix(in srgb,var(--buy) 10%,transparent)}
+#autoset{width:100%}
+#autoset summary{cursor:pointer;font-size:13px;color:var(--muted)}
+.aform{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin-top:12px}
+.aform label{display:flex;flex-direction:column;gap:4px;font-size:13px}
+.aform .full{grid-column:1/-1}
+.aform textarea,.aform input[type=number]{font:inherit;font-family:var(--mono);font-size:13px;padding:8px;border-radius:4px;border:1px solid var(--line);background:var(--bg);color:var(--fg)}
+.aform .chk{flex-direction:row;align-items:center}
+#asave{font:inherit;font-weight:600;white-space:nowrap;padding:10px 16px;border:0;border-radius:6px;background:var(--ink);color:var(--ink-fg);cursor:pointer;justify-self:start}
+.alog{margin-top:10px;font-size:12px;color:var(--muted);max-height:140px;overflow:auto;font-family:var(--mono)}
+.tab .h.auto{color:var(--ink-fg);background:var(--buy)}
 #resbtn{margin-left:auto;font:inherit;font-weight:600;font-size:14px;padding:10px 16px;border-radius:6px;border:0;background:var(--ink);color:var(--ink-fg);cursor:pointer}
 #resbtn:focus-visible{outline:3px solid var(--buy);outline-offset:2px}
 #resdlg{border:0;border-radius:10px;padding:0;background:var(--bg);color:var(--fg);width:min(860px,96vw);max-height:90vh;box-shadow:0 20px 60px rgba(0,0,0,.35)}
@@ -1900,6 +2113,23 @@ input[type=range]{padding:0;border:0;background:none;accent-color:var(--fg)}
 </style></head><body>
 <div class="wrap">
 <section class="sumbar" id="sumbar" aria-live="polite"></section>
+<section class="autobar" id="autobar">
+<div class="mode" role="group" aria-label="Режим"><button type="button" id="m_man" aria-pressed="true">✋ Ручной</button><button type="button" class="auto" id="m_auto" aria-pressed="false">🤖 Авто 24/7</button></div>
+<span class="amsg" id="amsg">—</span><div class="achips" id="achips"></div>
+<details id="autoset"><summary>Настройки авторежима</summary>
+<div class="aform">
+<label class="full">Монеты для выбора (через запятую). Пусто — 80 самых ликвидных пар Bybit<textarea id="a_coins" rows="2" placeholder="SOL, DOGE, PEPE, WIF, SUI"></textarea></label>
+<label>Сеток одновременно<input id="a_slots" type="number" min="1" max="10" step="1"></label>
+<label>Держать монету, часов<input id="a_hold" type="number" min="0.25" max="24" step="0.25"></label>
+<label>Волатильность за, минут<input id="a_min" type="number" min="5" max="240" step="5"></label>
+<label>Плечо<input id="a_lev" type="number" min="1" max="20" step="1"></label>
+<label class="chk full"><input type="checkbox" id="a_skip"> Пропускать монеты в сильном пампе/дампе (цена уходит в одну сторону — сетка там теряет)</label>
+<button type="button" id="asave">Сохранить настройки</button>
+</div>
+<div class="note" style="margin-top:8px">Авто: раз в минуту бот закрывает сетки, которые отработали заданное время, и на свободные места ставит самые волатильные монеты из списка. Только что закрытую монету не берёт снова, пока не пройдёт то же время. Капитал делится поровну между свободными местами. Ручной: авто ничего не меняет, сетки работают как есть.</div>
+<div class="alog" id="alog"></div>
+</details>
+</section>
 <nav class="tabs" id="tabs" aria-label="Сетки"></nav>
 <dialog id="resdlg" aria-labelledby="resttl"><div class="hd"><h2 id="resttl">Результаты по сеткам</h2><button type="button" class="x" id="resx" aria-label="Закрыть">×</button></div><div class="bd" id="resbody"></div></dialog>
 <div class="killrow" id="killrow" hidden><button type="button" id="killall">Закрыть все сетки</button><span class="note" id="killnote"></span></div>
@@ -2087,6 +2317,7 @@ async function newGrid(prefill){await saveNow();
  const r=await (await fetch("/api/new",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(Object.assign({copy_from:CUR},prefill||{}))})).json();
  await selectGrid(r.id);$("set").open=true}
 let GRIDS=[];
+const hm=sec=>{sec=Math.max(0,sec|0);return `${Math.floor(sec/3600)}:${String(Math.floor(sec%3600/60)).padStart(2,"0")}`};
 const sgn=v=>(v>0.004?"+":v<-0.004?"−":"")+fmt(Math.abs(v));
 const cls=v=>v>0.004?"up":v<-0.004?"down":"z";
 function renderTabs(){
@@ -2094,7 +2325,8 @@ function renderTabs(){
   un=GRIDS.reduce((a,g)=>a+(g.upnl||0),0),run=GRIDS.filter(g=>g.running).length;
  t.innerHTML=GRIDS.map(g=>{const sym=(g.symbol||"—").replace("USDT",""),mk=(g.market==="futures"?` ${g.leverage}x`:" спот")+(g.direction==="sell"?" sell":g.direction==="neutral"&&g.market==="futures"?" ½/½":"");
   const v=g.total||0,c=cls(v),p=g.running||g.trades||v?` <b class="${c==="up"?"b":c==="down"?"s":"z"}">${sgn(v)}</b>`:"",
-   hv=g.h1||0,hc=cls(hv),hb=hc==="z"?"":` <span class="h ${hc}" title="за последний час">1ч ${sgn(hv)}</span>`;
+   hv=g.h1||0,hc=cls(hv),hb=(hc==="z"?"":` <span class="h ${hc}" title="за последний час">1ч ${sgn(hv)}</span>`)+
+    (g.auto&&g.running?` <span class="h auto" title="авторежим: осталось держать">🤖 ${hm(g.auto_left)}</span>`:"");
   return `<button type="button" class="tab${g.running?" on":""}${g.error?" err":""}" data-id="${g.id}" aria-current="${g.id===CUR}"><span class="d"></span>${esc(sym)}<span class="i">${mk}</span>${p}${hb}</button>`}).join("")+
   `<button type="button" class="tab add" id="addtab">+ Новая сетка</button>`;
  const sb=$("sumbar"),c=cls(tot);sb.className="sumbar"+(c==="z"?"":" "+c);
@@ -2177,6 +2409,25 @@ async function poll(){if(!CUR)return;
   GRIDS=await gr.json();renderTabs();spUI();killUI();if(st.ok){S=await st.json();render();capUI()}}
  catch(e){$("statusText").textContent="Программа не отвечает"}}
 setInterval(poll,2000);
+let AUTO=null,AFORM=false;
+function autoUI(){if(!AUTO)return;const on=!!AUTO.enabled;
+ $("m_man").setAttribute("aria-pressed",String(!on));$("m_auto").setAttribute("aria-pressed",String(on));$("autobar").classList.toggle("on",on);
+ $("amsg").textContent=on?`Авто: ${AUTO.msg||"…"}`+(AUTO.next_in?` · проверка через ${AUTO.next_in} с`:"")+` · ${AUTO.slots} сеток по ${hm(AUTO.hold_min*60)} ч`:"Ручной режим: сетки запускаете и останавливаете сами";
+ $("achips").innerHTML=(AUTO.grids||[]).map(g=>`<span class="achip">${esc(g.symbol.replace("USDT",""))} · ещё ${hm(g.left)} · <span class="${g.total>0.004?"b":g.total<-0.004?"s":""}">${sgn(g.total)}</span></span>`).join("");
+ if(!AFORM){$("a_coins").value=AUTO.coins||"";$("a_slots").value=AUTO.slots;$("a_hold").value=AUTO.hold_min/60;$("a_min").value=AUTO.minutes;$("a_lev").value=AUTO.leverage;$("a_skip").checked=!!AUTO.skip_trend}
+ $("alog").innerHTML=(AUTO.log||[]).map(l=>`<div>${esc(l.t)} ${esc(l.text)}</div>`).join("")||"Пока пусто";}
+async function autoPoll(){try{const r=await fetch("/api/auto");if(r.ok){AUTO=await r.json();autoUI()}}catch(e){}}
+async function autoSend(b){try{const r=await fetch("/api/auto",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(b)}),d=await r.json();
+ if(!r.ok)throw new Error(d.error||r.status);AUTO=d;AFORM=false;autoUI();setTimeout(autoPoll,3000)}catch(e){$("amsg").textContent="Ошибка: "+e.message}}
+function aForm(){return{coins:$("a_coins").value,slots:Number($("a_slots").value)||3,hold_min:Math.round((Number($("a_hold").value)||2)*60),
+ minutes:Number($("a_min").value)||30,leverage:Number($("a_lev").value)||2,skip_trend:$("a_skip").checked}}
+["a_coins","a_slots","a_hold","a_min","a_lev","a_skip"].forEach(k=>$(k).addEventListener("input",()=>{AFORM=true}));
+$("asave").onclick=()=>autoSend(aForm());
+$("m_auto").onclick=()=>{if(AUTO&&AUTO.enabled)return;
+ if(!confirm("Включить авторежим 24/7? Бот сам будет выбирать самые волатильные монеты, держать до заданного времени и менять их."))return;
+ autoSend(Object.assign(AFORM?aForm():{},{enabled:true}))};
+$("m_man").onclick=()=>{if(AUTO&&!AUTO.enabled)return;autoSend({enabled:false})};
+autoPoll();setInterval(autoPoll,5000);
 function render(){
  const g=$("go");g.disabled=S.busy||!!LOCK;g.textContent=S.running?(S.busy?"Запускаю…":"Остановить"):(S.busy?"Останавливаю…":"Запустить бота");
  g.classList.toggle("stop",S.running&&!S.busy);
@@ -2366,6 +2617,7 @@ def main():
         threading.Timer(0.8, lambda: webbrowser.open(url)).start()
     pnl_load()
     threading.Thread(target=pnl_snap_loop, daemon=True).start()
+    threading.Thread(target=lambda: (time.sleep(20), auto_loop()), daemon=True).start()
     st = load_store()
     save_store(st)                       # перевести старый файл настроек в формат с несколькими сетками
     if st.get("api_key") and st.get("api_secret") and not (ON_SERVER and not APP_PASSWORD):
