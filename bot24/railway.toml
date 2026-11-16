@@ -1,0 +1,11 @@
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+startCommand = "python bot.py"
+healthcheckPath = "/api/ping"
+healthcheckTimeout = 120
+restartPolicyType = "ALWAYS"
+sleepApplication = false
+numReplicas = 1
