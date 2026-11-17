@@ -1732,6 +1732,8 @@ def auto_launch(row, per, a, now, lev=None):
     sym = row["symbol"]
     with CFG_LOCK:
         st = load_store()
+        if not (st.get("auto") or {}).get("enabled"):
+            return False
         gid = next((g for g, c in sorted(st["grids"].items(), key=lambda x: int(x[0]))
                     if c.get("auto") and not (BOTS.get(g) and (BOTS[g].running or BOTS[g].busy))), None)
         if gid is None:
@@ -1748,6 +1750,7 @@ def auto_launch(row, per, a, now, lev=None):
              f"{per:.2f} USDT, плечо {g['leverage']}x" + (f" (на {a['leverage']}x лоты меньше минимума Bybit — поднял)"
              if fut and g["leverage"] > a["leverage"] else "") + f" — держу до {a['hold_min'] // 60} ч {a['hold_min'] % 60:02d} мин")
     bot(gid).start(grid_cfg(gid))
+    return True
 
 
 def auto_step(force=False):
@@ -1825,9 +1828,10 @@ def auto_step(force=False):
             if lev:
                 plan.append((r, lev))
         if len(plan) == slots:
-            for r, lev in plan:
-                auto_launch(r, per, a, now, lev)
-            launched = slots
+            launched = sum(1 for r, lev in plan if auto_launch(r, per, a, now, lev))
+            if not launched:
+                AUTO_STATE["msg"] = "ручной режим"
+                return
             break
     if not launched:
         msg = (f"депозит {eq:.2f} USDT, свободно {free:.2f}: до {a['use_pct']}% депозита осталось {budget:.2f} USDT — "
@@ -1884,6 +1888,32 @@ def auto_save(body):
         threading.Thread(target=lambda: (auto_step(), AUTO_STATE.update(next=time.time() + AUTO_TICK)),
                          daemon=True).start()
     return auto_status()
+
+
+def auto_off(why):
+    """Выключить авторежим (ручной режим), чтобы после ручного снятия сеток авто не ставило новые."""
+    with CFG_LOCK:
+        st = load_store()
+        a = st.setdefault("auto", {})
+        if not a.get("enabled"):
+            return
+        a["enabled"] = False
+        save_store(st)
+    AUTO_STATE["msg"] = "ручной режим"
+    auto_say(why)
+
+
+def auto_forget(gid):
+    """Сетку авторежима остановили руками — эту монету авто не берёт снова, пока не пройдёт время удержания."""
+    with CFG_LOCK:
+        st = load_store()
+        g = st["grids"].get(gid) or {}
+        sym = str(g.get("symbol", "")).upper()
+        if not (g.get("auto") and sym and (st.get("auto") or {}).get("enabled")):
+            return
+        auto_recent(st)[sym] = time.time()
+        save_store(st)
+    auto_say(f"{sym[:-4]}: сетку остановили вручную — эту монету пока не беру")
 
 
 def new_grid_id(st):
@@ -2020,6 +2050,7 @@ class Handler(BaseHTTPRequestHandler):
             except BybitError as e:
                 self._send(400, {"error": str(e)})
         elif self.path == "/api/stop_all":
+            auto_off("закрыты все сетки — авторежим выключен, новые сетки не ставлю")
             n = 0
             for b in list(BOTS.values()):
                 if b.running:
@@ -2029,6 +2060,7 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/api/stop":
             gid = str(body.get("id") or "1")
             if gid in BOTS:
+                auto_forget(gid)
                 BOTS[gid].stop()
             self._send(200, {"ok": True})
         elif self.path == "/api/delete":
@@ -2518,7 +2550,7 @@ $("killall").onclick=async()=>{const b=$("killall"),run=GRIDS.filter(g=>g.runnin
  clearTimeout(KILLT);b.classList.remove("sure");b.disabled=true;b.textContent="Закрываю все сетки…";
  try{const r=await fetch("/api/stop_all",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"}),d=await r.json();
   if(!r.ok)throw new Error(d.error||r.status);
-  $("killnote").textContent=`Остановлено сеток: ${d.stopped}. Ордера снимаются, позиции закрываются — смотрите вкладки.`}
+  $("killnote").textContent=`Остановлено сеток: ${d.stopped}. Ордера снимаются, позиции закрываются. Авторежим выключен — новые сетки не ставятся.`;autoPoll()}
  catch(e){$("killnote").textContent="Не получилось: "+e.message}
  setTimeout(()=>{b.disabled=false;killUI()},4000);poll()};
 $("tabs").addEventListener("click",e=>{const b=e.target.closest(".tab");if(!b)return;
