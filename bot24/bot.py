@@ -255,6 +255,30 @@ class Bybit:
                 return p
         return None
 
+    def taken(self, sym=None):
+        """Монеты USDT-фьючерсов, где на счёте уже есть позиция или открытые ордера (любого бота).
+        {символ: "позиция" / "ордера"}."""
+        out, base = {}, {"category": "linear"}
+        base.update({"symbol": sym} if sym else {"settleCoin": "USDT"})
+        cursor = ""
+        while True:
+            r = self._req("GET", "/v5/position/list", dict(base, limit=200, **({"cursor": cursor} if cursor else {})), True)
+            for p in r.get("list", []):
+                if Decimal(p.get("size") or "0") > 0:
+                    out[p["symbol"]] = "позиция"
+            cursor = r.get("nextPageCursor") or ""
+            if not cursor or not r.get("list"):
+                break
+        cursor = ""
+        while True:
+            r = self._req("GET", "/v5/order/realtime", dict(base, limit=50, **({"cursor": cursor} if cursor else {})), True)
+            for o in r.get("list", []):
+                out.setdefault(o["symbol"], "ордера")
+            cursor = r.get("nextPageCursor") or ""
+            if not cursor or not r.get("list"):
+                break
+        return out
+
     def cancel(self, sym, oid):
         self._req("POST", "/v5/order/cancel", {"category": self.cat, "symbol": sym, "orderId": oid}, True)
 
@@ -511,6 +535,12 @@ class Bot:
             cat = "linear" if cfg.get("market") == "futures" else "spot"
             api = Bybit(cfg["api_key"], cfg["api_secret"], cfg["network"], cat)
             api.sync_time()
+            if cat == "linear":
+                sym = str(cfg.get("symbol") or "").upper().strip()
+                what = api.taken(sym).get(sym) if sym else None
+                if what:
+                    raise BybitError(f"на {sym} на счёте уже есть {what} (другой бот или ручная сделка) — "
+                                     "не запускаю, чтобы не смешать позиции. Выберите другую монету")
             self._setup(api, cfg)
             self.busy = False
             self.status = "Работает"
@@ -1657,7 +1687,7 @@ AUTO_DEFAULT = {"enabled": False, "coins": "", "slots": 3, "hold_min": 120, "min
 AUTO_TICK = 60
 AUTO_LOCK = threading.Lock()
 AUTO_LOG = []
-AUTO_STATE = {"next": 0.0, "last_scan": "", "msg": ""}
+AUTO_STATE = {"next": 0.0, "last_scan": "", "msg": "", "foreign": []}
 
 
 def auto_cfg(st=None):
@@ -1809,6 +1839,14 @@ def auto_step(force=False):
     # Сейчас занято (депозит − свободно), значит на новые сетки можно ещё use_pct%·депозит − занято.
     api, free, k = free_funds(a["market"])
     if a["market"] == "futures":
+        mine = {b.symbol for b in BOTS.values() if (b.running or b.busy) and b.cat == "linear"}
+        foreign = set(api.taken()) - mine
+        AUTO_STATE["foreign"] = sorted(foreign)
+        if foreign:
+            cands = [r for r in cands if r["symbol"] not in foreign]
+            if not cands:
+                AUTO_STATE["msg"] = "подходящие монеты заняты другими ботами на счёте — проверю через минуту"
+                return
         eq = api.balances().get("_equity") or free
         budget = min(free * Decimal("0.98"), eq * Decimal(a["use_pct"]) / 100 - (eq - free))
     else:
@@ -1868,7 +1906,7 @@ def auto_status():
     with AUTO_LOCK:
         log = list(AUTO_LOG[:15])
     return dict(a, recent=list((st.get("auto") or {}).get("recent", {}).keys()), grids=grids, log=log,
-                msg=AUTO_STATE["msg"], last_scan=AUTO_STATE["last_scan"],
+                msg=AUTO_STATE["msg"], last_scan=AUTO_STATE["last_scan"], foreign=AUTO_STATE["foreign"],
                 next_in=max(0, int(AUTO_STATE["next"] - now)))
 
 
@@ -2584,7 +2622,7 @@ setInterval(poll,2000);
 let AUTO=null,AFORM=false;
 function autoUI(){if(!AUTO)return;const on=!!AUTO.enabled;
  $("m_man").setAttribute("aria-pressed",String(!on));$("m_auto").setAttribute("aria-pressed",String(on));$("autobar").classList.toggle("on",on);
- $("amsg").textContent=on?`Авто: ${AUTO.msg||"…"}`+(AUTO.next_in?` · проверка через ${AUTO.next_in} с`:"")+` · ${AUTO.slots} сеток по ${hm(AUTO.hold_min*60)} ч`:"Ручной режим: сетки запускаете и останавливаете сами";
+ $("amsg").textContent=on?`Авто: ${AUTO.msg||"…"}`+(AUTO.next_in?` · проверка через ${AUTO.next_in} с`:"")+` · ${AUTO.slots} сеток по ${hm(AUTO.hold_min*60)} ч`+((AUTO.foreign||[]).length?` · не беру (заняты другими ботами): ${AUTO.foreign.map(x=>x.replace("USDT","")).join(", ")}`:""):"Ручной режим: сетки запускаете и останавливаете сами";
  $("achips").innerHTML=(AUTO.grids||[]).map(g=>`<span class="achip">${esc(g.symbol.replace("USDT",""))} · ещё ${hm(g.left)} · <span class="${g.total>0.004?"b":g.total<-0.004?"s":""}">${sgn(g.total)}</span></span>`).join("");
  if(!AFORM){$("a_coins").value=AUTO.coins||"";$("a_slots").value=AUTO.slots;$("a_hold").value=AUTO.hold_min/60;$("a_min").value=AUTO.minutes;$("a_lev").value=AUTO.leverage;$("a_maxlev").value=AUTO.max_leverage;$("a_use").value=AUTO.use_pct;$("a_skip").checked=!!AUTO.skip_trend}
  $("alog").innerHTML=(AUTO.log||[]).map(l=>`<div>${esc(l.t)} ${esc(l.text)}</div>`).join("")||"Пока пусто";}
