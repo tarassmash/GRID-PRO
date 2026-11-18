@@ -1747,7 +1747,7 @@ AUTO_STATE = {"next": 0.0, "last_scan": "", "msg": "", "foreign": []}
 def auto_cfg(st=None):
     st = st or load_store()
     a = dict(AUTO_DEFAULT, **{k: v for k, v in (st.get("auto") or {}).items() if k in AUTO_DEFAULT})
-    a["slots"] = max(1, min(10, int(a.get("slots") or 3)))
+    a["slots"] = max(1, min(20, int(a.get("slots") or 3)))
     a["hold_min"] = max(15, min(24 * 60, int(a.get("hold_min") or 120)))
     a["minutes"] = max(5, min(240, int(a.get("minutes") or 30)))
     a["leverage"] = max(1, min(20, int(a.get("leverage") or 2)))
@@ -1841,6 +1841,46 @@ def auto_launch(row, per, a, now, lev=None):
     return True
 
 
+def own_margin(api, mine):
+    """Реальная маржа этого бота на бирже: маржа позиций по его монетам + маржа его ордеров ("grid…").
+    Нейтральная сетка держит Buy ниже и Sell выше — биржа берёт маржу только под большую сторону,
+    поэтому по капиталу сетки считать нельзя: так бот занимал гораздо меньше своих 45%."""
+    total, lev = Decimal(0), {}
+    try:
+        cursor = ""
+        for _ in range(10):
+            r = api._req("GET", "/v5/position/list", dict({"category": "linear", "settleCoin": "USDT", "limit": 200},
+                                                         **({"cursor": cursor} if cursor else {})), True)
+            for p_ in r.get("list", []):
+                if p_["symbol"] in mine:
+                    lev[p_["symbol"]] = Decimal(p_.get("leverage") or "1") or Decimal(1)
+                    if Decimal(p_.get("size") or "0") > 0:
+                        total += Decimal(p_.get("positionIM") or "0")
+            cursor = r.get("nextPageCursor") or ""
+            if not cursor or not r.get("list"):
+                break
+        sides, cursor = {}, ""
+        for _ in range(20):
+            r = api._req("GET", "/v5/order/realtime", dict({"category": "linear", "settleCoin": "USDT", "limit": 50},
+                                                          **({"cursor": cursor} if cursor else {})), True)
+            for o in r.get("list", []):
+                if o["symbol"] in mine and str(o.get("orderLinkId") or "").startswith("grid") and not o.get("reduceOnly"):
+                    n = (Decimal(o.get("qty") or "0") - Decimal(o.get("cumExecQty") or "0")) * Decimal(o.get("price") or "0")
+                    d = sides.setdefault(o["symbol"], {"Buy": Decimal(0), "Sell": Decimal(0)})
+                    d[o.get("side", "Buy")] = d.get(o.get("side", "Buy"), Decimal(0)) + n
+            cursor = r.get("nextPageCursor") or ""
+            if not cursor or not r.get("list"):
+                break
+        for sym, d in sides.items():
+            total += max(d["Buy"], d["Sell"]) / lev.get(sym, Decimal(1))
+    except Exception:
+        # не получилось спросить биржу — считаем по-старому, по капиталу сеток (осторожнее)
+        st = load_store()
+        total = sum((Decimal(str(st["grids"].get(gid, {}).get("capital") or 0)) for gid, b in BOTS.items()
+                     if (b.running or b.busy) and b.cat == "linear"), Decimal(0))
+    return total
+
+
 def auto_step(force=False):
     st = load_store()
     a = auto_cfg(st)
@@ -1858,6 +1898,16 @@ def auto_step(force=False):
         st = load_store()
         a = auto_cfg(st)
         auto_say("счёт поделён со Стаканом: этот бот держит в работе до 45% депозита (считается только своя маржа)")
+    if not (st.get("auto") or {}).get("slots10"):      # чтобы занять свои 45% реальной маржой, нужно больше мест
+        with CFG_LOCK:
+            st2 = load_store()
+            au = st2.setdefault("auto", {})
+            au["slots"] = max(10, int(au.get("slots") or 3))
+            au["slots10"] = True
+            save_store(st2)
+        st = load_store()
+        a = auto_cfg(st)
+        auto_say(f"мест под сетки: {a['slots']} — доля 45% считается по реальной марже на бирже")
     now = time.time()
     hold = a["hold_min"] * 60
     recent = auto_recent(st)
@@ -1901,8 +1951,8 @@ def auto_step(force=False):
     if not cands:
         AUTO_STATE["msg"] = "нет подходящих монет — проверю через минуту"
         return
-    # Бюджет: в работе должно быть не больше use_pct% всего депозита. Считается только СВОЯ маржа
-    # (капитал запущенных сеток этого бота) — маржа других ботов на счёте (Стакан) сюда не входит.
+    # Бюджет: в работе должно быть не больше use_pct% всего депозита. Считается только СВОЯ реальная маржа
+    # на бирже (позиции и ордера этого бота) — маржа других ботов на счёте (Стакан) сюда не входит.
     api, free, k = free_funds(a["market"])
     if a["market"] == "futures":
         mine = {b.symbol for b in BOTS.values() if (b.running or b.busy) and b.cat == "linear"}
@@ -1914,8 +1964,7 @@ def auto_step(force=False):
                 AUTO_STATE["msg"] = "подходящие монеты заняты другими ботами на счёте — проверю через минуту"
                 return
         eq = api.balances().get("_equity") or free
-        own = sum((Decimal(str(st["grids"].get(gid, {}).get("capital") or 0)) for gid, b in BOTS.items()
-                   if (b.running or b.busy) and b.cat == "linear"), Decimal(0))
+        own = own_margin(api, mine)
         budget = min(free * Decimal("0.98"), eq * Decimal(a["use_pct"]) / 100 - own)
     else:
         eq, budget = free, free * k
@@ -2399,7 +2448,7 @@ tr.hot td.sym{font-weight:700}
 <details id="autoset"><summary>Настройки авторежима</summary>
 <div class="aform">
 <label class="full">Монеты для выбора (через запятую). Пусто — 80 самых ликвидных пар Bybit<textarea id="a_coins" rows="2" placeholder="SOL, DOGE, PEPE, WIF, SUI"></textarea></label>
-<label>Сеток одновременно<input id="a_slots" type="number" min="1" max="10" step="1"></label>
+<label>Сеток одновременно<input id="a_slots" type="number" min="1" max="20" step="1"></label>
 <label>Держать монету, часов<input id="a_hold" type="number" min="0.25" max="24" step="0.25"></label>
 <label>Волатильность за, минут<input id="a_min" type="number" min="5" max="240" step="5"></label>
 <label>Плечо (начальное)<input id="a_lev" type="number" min="1" max="20" step="1"></label>
