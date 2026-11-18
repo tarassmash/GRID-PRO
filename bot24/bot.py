@@ -1683,7 +1683,7 @@ def split_start(body):
 # волатильные за последние `minutes` минут монеты из списка (пустой список — самые ликвидные пары биржи).
 # Монета, которую только что держали, не берётся снова, пока не пройдёт тот же срок — так монеты меняются.
 AUTO_DEFAULT = {"enabled": False, "coins": "", "slots": 3, "hold_min": 120, "minutes": 30,
-                "leverage": 2, "max_leverage": 10, "use_pct": 90, "skip_trend": True, "market": "futures"}
+                "leverage": 2, "max_leverage": 10, "use_pct": 45, "skip_trend": True, "market": "futures"}
 AUTO_TICK = 60
 AUTO_LOCK = threading.Lock()
 AUTO_LOG = []
@@ -1698,7 +1698,7 @@ def auto_cfg(st=None):
     a["minutes"] = max(5, min(240, int(a.get("minutes") or 30)))
     a["leverage"] = max(1, min(20, int(a.get("leverage") or 2)))
     a["max_leverage"] = max(a["leverage"], min(25, int(a.get("max_leverage") or 10)))
-    a["use_pct"] = max(10, min(95, int(a.get("use_pct") or 90)))
+    a["use_pct"] = max(10, min(95, int(a.get("use_pct") or 45)))
     a["market"] = "spot" if a.get("market") == "spot" else "futures"
     return a
 
@@ -1792,6 +1792,14 @@ def auto_step(force=False):
     if not (st.get("api_key") and st.get("api_secret")) or (ON_SERVER and not APP_PASSWORD):
         AUTO_STATE["msg"] = "нет API ключей или пароля APP_PASSWORD"
         return
+    if not (st.get("auto") or {}).get("split50"):      # счёт поделён со Стаканом 50/50: этому боту 45% депозита
+        with CFG_LOCK:
+            st2 = load_store()
+            st2.setdefault("auto", {}).update(use_pct=45, split50=True)
+            save_store(st2)
+        st = load_store()
+        a = auto_cfg(st)
+        auto_say("счёт поделён со Стаканом: этот бот держит в работе до 45% депозита (считается только своя маржа)")
     now = time.time()
     hold = a["hold_min"] * 60
     recent = auto_recent(st)
@@ -1835,8 +1843,8 @@ def auto_step(force=False):
     if not cands:
         AUTO_STATE["msg"] = "нет подходящих монет — проверю через минуту"
         return
-    # Бюджет: в работе должно быть не больше use_pct% всего депозита (остальное — запас маржи).
-    # Сейчас занято (депозит − свободно), значит на новые сетки можно ещё use_pct%·депозит − занято.
+    # Бюджет: в работе должно быть не больше use_pct% всего депозита. Считается только СВОЯ маржа
+    # (капитал запущенных сеток этого бота) — маржа других ботов на счёте (Стакан) сюда не входит.
     api, free, k = free_funds(a["market"])
     if a["market"] == "futures":
         mine = {b.symbol for b in BOTS.values() if (b.running or b.busy) and b.cat == "linear"}
@@ -1848,7 +1856,9 @@ def auto_step(force=False):
                 AUTO_STATE["msg"] = "подходящие монеты заняты другими ботами на счёте — проверю через минуту"
                 return
         eq = api.balances().get("_equity") or free
-        budget = min(free * Decimal("0.98"), eq * Decimal(a["use_pct"]) / 100 - (eq - free))
+        own = sum((Decimal(str(st["grids"].get(gid, {}).get("capital") or 0)) for gid, b in BOTS.items()
+                   if (b.running or b.busy) and b.cat == "linear"), Decimal(0))
+        budget = min(free * Decimal("0.98"), eq * Decimal(a["use_pct"]) / 100 - own)
     else:
         eq, budget = free, free * k
     budget = max(budget, Decimal(0))
@@ -1872,7 +1882,7 @@ def auto_step(force=False):
                 return
             break
     if not launched:
-        msg = (f"депозит {eq:.2f} USDT, свободно {free:.2f}: до {a['use_pct']}% депозита осталось {budget:.2f} USDT — "
+        msg = (f"депозит {eq:.2f} USDT, свободно {free:.2f}: до {a['use_pct']}% депозита (своя доля) осталось {budget:.2f} USDT — "
                f"не хватает даже на одну сетку при плече до {a['max_leverage']}x, жду")
         if AUTO_STATE["msg"] != msg:
             auto_say(msg)
@@ -2336,7 +2346,7 @@ tr.hot td.sym{font-weight:700}
 <label class="chk full"><input type="checkbox" id="a_skip"> Пропускать монеты в сильном пампе/дампе (цена уходит в одну сторону — сетка там теряет)</label>
 <button type="button" id="asave">Сохранить настройки</button>
 </div>
-<div class="note" style="margin-top:8px">Авто: раз в минуту бот закрывает сетки, которые отработали заданное время, и на свободные места ставит самые волатильные монеты из списка. Только что закрытую монету не берёт снова, пока не пройдёт то же время. В работе держит до заданного % всего депозита (по умолчанию 90%), остальное — запас маржи; деньги делятся поровну между свободными местами. Если на начальном плече самый маленький лот меньше минимума Bybit (5 USDT), плечо поднимается по 1x до максимума; не влезает и так — берёт меньше сеток, но крупнее. Ручной: авто ничего не меняет, сетки работают как есть.</div>
+<div class="note" style="margin-top:8px">Авто: раз в минуту бот закрывает сетки, которые отработали заданное время, и на свободные места ставит самые волатильные монеты из списка. Только что закрытую монету не берёт снова, пока не пройдёт то же время. В работе держит до заданного % всего депозита (по умолчанию 45% — вторая половина счёта у Стакана; считается только своя маржа), остальное — запас маржи; деньги делятся поровну между свободными местами. Если на начальном плече самый маленький лот меньше минимума Bybit (5 USDT), плечо поднимается по 1x до максимума; не влезает и так — берёт меньше сеток, но крупнее. Ручной: авто ничего не меняет, сетки работают как есть.</div>
 <div class="alog" id="alog"></div>
 </details>
 </section>
@@ -2630,7 +2640,7 @@ async function autoPoll(){try{const r=await fetch("/api/auto");if(r.ok){AUTO=awa
 async function autoSend(b){try{const r=await fetch("/api/auto",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(b)}),d=await r.json();
  if(!r.ok)throw new Error(d.error||r.status);AUTO=d;AFORM=false;autoUI();setTimeout(autoPoll,3000)}catch(e){$("amsg").textContent="Ошибка: "+e.message}}
 function aForm(){return{coins:$("a_coins").value,slots:Number($("a_slots").value)||3,hold_min:Math.round((Number($("a_hold").value)||2)*60),
- minutes:Number($("a_min").value)||30,leverage:Number($("a_lev").value)||2,max_leverage:Number($("a_maxlev").value)||10,use_pct:Number($("a_use").value)||90,skip_trend:$("a_skip").checked}}
+ minutes:Number($("a_min").value)||30,leverage:Number($("a_lev").value)||2,max_leverage:Number($("a_maxlev").value)||10,use_pct:Number($("a_use").value)||45,skip_trend:$("a_skip").checked}}
 ["a_coins","a_slots","a_hold","a_min","a_lev","a_maxlev","a_use","a_skip"].forEach(k=>$(k).addEventListener("input",()=>{AFORM=true}));
 $("asave").onclick=()=>autoSend(aForm());
 $("m_auto").onclick=()=>{if(AUTO&&AUTO.enabled)return;
