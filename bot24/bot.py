@@ -1846,15 +1846,23 @@ def own_margin(api, mine):
     Нейтральная сетка держит Buy ниже и Sell выше — биржа берёт маржу только под большую сторону,
     поэтому по капиталу сетки считать нельзя: так бот занимал гораздо меньше своих 45%."""
     total, lev = Decimal(0), {}
+    st0 = load_store()
+    for gid, b in list(BOTS.items()):      # плечо каждой своей сетки — из её настроек (у монеты без позиции биржа его не отдаёт)
+        if b.symbol in mine:
+            try:
+                lev[b.symbol] = max(Decimal(1), Decimal(str(st0["grids"].get(gid, {}).get("leverage") or 1)))
+            except Exception:
+                pass
     try:
         cursor = ""
         for _ in range(10):
             r = api._req("GET", "/v5/position/list", dict({"category": "linear", "settleCoin": "USDT", "limit": 200},
                                                          **({"cursor": cursor} if cursor else {})), True)
             for p_ in r.get("list", []):
-                if p_["symbol"] in mine:
-                    lev[p_["symbol"]] = Decimal(p_.get("leverage") or "1") or Decimal(1)
-                    if Decimal(p_.get("size") or "0") > 0:
+                if p_["symbol"] in mine and Decimal(p_.get("size") or "0") > 0:
+                    if Decimal(p_.get("leverage") or "0") > 0:
+                        lev[p_["symbol"]] = Decimal(p_["leverage"])
+                    if True:
                         total += Decimal(p_.get("positionIM") or "0")
             cursor = r.get("nextPageCursor") or ""
             if not cursor or not r.get("list"):
@@ -1878,6 +1886,7 @@ def own_margin(api, mine):
         st = load_store()
         total = sum((Decimal(str(st["grids"].get(gid, {}).get("capital") or 0)) for gid, b in BOTS.items()
                      if (b.running or b.busy) and b.cat == "linear"), Decimal(0))
+    AUTO_STATE["own_margin"] = float(total)
     return total
 
 
@@ -1993,7 +2002,7 @@ def auto_step(force=False):
                 return
             break
     if not launched:
-        msg = (f"депозит {eq:.2f} USDT, свободно {free:.2f}: до {a['use_pct']}% депозита (своя доля) осталось {budget:.2f} USDT — "
+        msg = (f"депозит {eq:.2f} USDT, свободно {free:.2f}, своя маржа {AUTO_STATE.get('own_margin', 0):.2f}: до {a['use_pct']}% депозита (своя доля) осталось {budget:.2f} USDT — "
                f"не хватает даже на одну сетку при плече до {a['max_leverage']}x, жду")
         if AUTO_STATE["msg"] != msg:
             auto_say(msg)
