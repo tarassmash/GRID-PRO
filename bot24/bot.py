@@ -1736,7 +1736,7 @@ def split_start(body):
 # волатильные за последние `minutes` минут монеты из списка (пустой список — самые ликвидные пары биржи).
 # Монета, которую только что держали, не берётся снова, пока не пройдёт тот же срок — так монеты меняются.
 AUTO_DEFAULT = {"enabled": False, "coins": "", "slots": 3, "hold_min": 120, "minutes": 30,
-                "leverage": 2, "max_leverage": 10, "use_pct": 45, "skip_trend": True, "market": "futures"}
+                "leverage": 2, "max_leverage": 3, "use_pct": 45, "skip_trend": True, "market": "futures"}
 AUTO_TICK = 60
 AUTO_STAGGER = 4      # пауза между запусками авто-сеток, сек
 AUTO_LOCK = threading.Lock()
@@ -1751,7 +1751,7 @@ def auto_cfg(st=None):
     a["hold_min"] = max(15, min(24 * 60, int(a.get("hold_min") or 120)))
     a["minutes"] = max(5, min(240, int(a.get("minutes") or 30)))
     a["leverage"] = max(1, min(20, int(a.get("leverage") or 2)))
-    a["max_leverage"] = max(a["leverage"], min(25, int(a.get("max_leverage") or 10)))
+    a["max_leverage"] = max(a["leverage"], min(25, int(a.get("max_leverage") or 3)))
     a["use_pct"] = max(10, min(95, int(a.get("use_pct") or 45)))
     a["market"] = "spot" if a.get("market") == "spot" else "futures"
     return a
@@ -1907,6 +1907,17 @@ def auto_step(force=False):
         st = load_store()
         a = auto_cfg(st)
         auto_say("счёт поделён со Стаканом: этот бот держит в работе до 45% депозита (считается только своя маржа)")
+    if not (st.get("auto") or {}).get("lev3"):          # плечо не больше 3x — запас маржи для манёвра
+        with CFG_LOCK:
+            st2 = load_store()
+            au = st2.setdefault("auto", {})
+            au["max_leverage"] = 3
+            au["leverage"] = min(int(au.get("leverage") or 2), 3)
+            au["lev3"] = True
+            save_store(st2)
+        st = load_store()
+        a = auto_cfg(st)
+        auto_say("плечо авто-сеток: от {}x до 3x максимум — запас маржи для манёвра".format(a["leverage"]))
     if not (st.get("auto") or {}).get("slots10"):      # чтобы занять свои 45% реальной маржой, нужно больше мест
         with CFG_LOCK:
             st2 = load_store()
@@ -2760,7 +2771,7 @@ async function autoPoll(){try{const r=await fetch("/api/auto");if(r.ok){AUTO=awa
 async function autoSend(b){try{const r=await fetch("/api/auto",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(b)}),d=await r.json();
  if(!r.ok)throw new Error(d.error||r.status);AUTO=d;AFORM=false;autoUI();setTimeout(autoPoll,3000)}catch(e){$("amsg").textContent="Ошибка: "+e.message}}
 function aForm(){return{coins:$("a_coins").value,slots:Number($("a_slots").value)||3,hold_min:Math.round((Number($("a_hold").value)||2)*60),
- minutes:Number($("a_min").value)||30,leverage:Number($("a_lev").value)||2,max_leverage:Number($("a_maxlev").value)||10,use_pct:Number($("a_use").value)||45,skip_trend:$("a_skip").checked}}
+ minutes:Number($("a_min").value)||30,leverage:Number($("a_lev").value)||2,max_leverage:Number($("a_maxlev").value)||3,use_pct:Number($("a_use").value)||45,skip_trend:$("a_skip").checked}}
 ["a_coins","a_slots","a_hold","a_min","a_lev","a_maxlev","a_use","a_skip"].forEach(k=>$(k).addEventListener("input",()=>{AFORM=true}));
 $("asave").onclick=()=>autoSend(aForm());
 $("m_auto").onclick=()=>{if(AUTO&&AUTO.enabled)return;
