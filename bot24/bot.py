@@ -41,6 +41,7 @@ CHASE_TRIES = 6        # быстрая лимитка: до 6 перестан�
 CHASE_WAIT = 2.5       # …по 2.5 секунды, потом остаток добирается маркетом
 LIQ_GUARD = Decimal("0.35")      # аварийный выход, когда до ликвидации осталось 35% пути
 STOP_BELOW = Decimal("0.05")  # (не используется: вместо него аварийный стоп от цены запуска)
+POS_STOP = Decimal("0.12")       # стоп как у Стакана: маркет-стоп НА БИРЖЕ в 12% от средней цены позиции против неё
 EMERG_DEFAULT = Decimal("0.10")  # аварийный стоп: цена ушла на 10% от цены запуска против позиции — единственный выход по рынку
 SETUP_TRIES = 20       # вход при запуске только лимитками: до 20 перестановок (~50 с), иначе бот не стартует
 CLOSE_TRIES = 12       # закрытие позиции при остановке лимитками: до 12 перестановок (~30 с)
@@ -895,6 +896,38 @@ class Bot:
             self.say("info", f"позиция {size} {self.base_coin} закрыта лимитками")
         self.pos = api.position(self.symbol)
 
+    def _sync_pos_stop(self, api):
+        """Стоп как у Стакана: стоп-лосс по рынку на самой бирже (сработает, даже если бот упал),
+        в POS_STOP от средней цены позиции против неё (лонг — ниже, шорт — выше). Двигается за средней."""
+        pos = self.pos
+        if not pos:
+            self._sl_key = None
+            return
+        avg = Decimal(pos.get("avgPrice") or "0")
+        if avg <= 0:
+            return
+        long_ = pos.get("side") == "Buy"
+        sl = q(avg * (1 - POS_STOP), self.tick) if long_ else q(avg * (1 + POS_STOP), self.tick) + self.tick
+        key = (pos.get("side"), str(sl))
+        if getattr(self, "_sl_key", None) == key:
+            return
+        cur = Decimal(pos.get("stopLoss") or "0")
+        if cur > 0 and abs(cur - sl) < self.tick:
+            self._sl_key = key
+            return
+        try:
+            api._req("POST", "/v5/position/trading-stop", {"category": "linear", "symbol": self.symbol, "tpslMode": "Full",
+                     "stopLoss": str(sl), "slTriggerBy": "MarkPrice", "slOrderType": "Market",
+                     "positionIdx": int(pos.get("positionIdx") or 0)}, True)
+            self._sl_key = key
+            self.say("info", f"🛑 стоп {sl} — {'лонг' if long_ else 'шорт'}, {float(POS_STOP * 100):g}% от средней {avg}, маркет на бирже")
+        except BybitError as e:
+            if "34040" in str(e):            # не изменился — уже стоит
+                self._sl_key = key
+            elif getattr(self, "_sl_err", None) != str(e):
+                self._sl_err = str(e)
+                self.say("err", f"стоп: {e}")
+
     # ---------- уровни с абсолютным номером: сетка может сдвигаться бесконечно ----------
     def lv(self, k):
         if k not in self._lv:
@@ -1249,6 +1282,7 @@ class Bot:
                     self.error = (f"Цена {p} близко к ликвидации ({liq}). Позиция закрыта по рынку, бот остановлен.")
                     self.running = False
                     return
+            self._sync_pos_stop(api)
         open_ids = api.open_ids(self.symbol)
         for oid, o in list(self.orders.items()):
             if oid in open_ids:
