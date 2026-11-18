@@ -322,7 +322,16 @@ class Bybit:
         self._req("POST", "/v5/order/cancel", {"category": self.cat, "symbol": sym, "orderId": oid}, True)
 
     def cancel_all(self, sym):
-        self._req("POST", "/v5/order/cancel-all", {"category": self.cat, "symbol": sym}, True)
+        """Снимает только СВОИ ордера (orderLinkId начинается с "grid"). Раньше снимались все ордера
+        на паре — и заодно лимитки Стакана, который торгует на том же счёте."""
+        r = self._req("GET", "/v5/order/realtime", {"category": self.cat, "symbol": sym, "limit": 50}, True)
+        for o in r.get("list", []):
+            if str(o.get("orderLinkId") or "").startswith("grid"):
+                try:
+                    self.cancel(sym, o["orderId"])
+                except BybitError as e:
+                    if "110001" not in str(e):      # уже исполнен или отменён
+                        raise
 
 
 class Radar:
@@ -631,6 +640,11 @@ class Bot:
                 except Exception as e:
                     self.say("err", "не удалось отменить ордера или закрыть позицию: " + str(e)
                              + ". Проверьте счёт на Bybit вручную!")
+            if self.error:      # сетка упала с ошибкой — после перезапуска сервера её не поднимаем
+                try:
+                    set_autostart(False, self.gid)
+                except Exception:
+                    pass
             with self.lock:
                 self.orders = {}
                 self.running = False
@@ -2908,6 +2922,11 @@ def main():
         for gid in order:
             cfg = grid_cfg(gid, st)
             if not cfg.get("was_running"):
+                continue
+            if auto_on and not cfg.get("auto"):
+                # в авторежиме ручные сетки (часто «весь депозит») съедали долю Стакана — сами не поднимаем
+                print(f"сетка {gid} ({cfg['symbol']}) ручная, включён авторежим — не запускаю после перезапуска", flush=True)
+                set_autostart(False, gid)
                 continue
             key = (str(cfg.get("symbol", "")).upper(), cfg.get("market"))
             if key in taken:
