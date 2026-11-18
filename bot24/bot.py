@@ -131,6 +131,33 @@ class BybitError(Exception):
     pass
 
 
+# Общий на весь процесс ограничитель запросов к Bybit: все сетки и авто-режим ходят с одного ключа,
+# и пачкой запросов разом ловили «Too many visits» (код 10006). Подписанные запросы — не чаще
+# раза в RATE_SIGNED сек, публичные — раз в RATE_PUBLIC сек; на 10006 ждём и повторяем.
+RATE_SIGNED = 0.15
+RATE_PUBLIC = 0.05
+RATE_RETRIES = 4
+_RATE_LOCK = threading.Lock()
+_RATE_NEXT = {"signed": 0.0, "public": 0.0}
+
+
+def _rate_wait(signed):
+    k, gap = ("signed", RATE_SIGNED) if signed else ("public", RATE_PUBLIC)
+    with _RATE_LOCK:
+        now = time.time()
+        at = max(now, _RATE_NEXT[k])
+        _RATE_NEXT[k] = at + gap
+    if at > now:
+        time.sleep(at - now)
+
+
+def _rate_backoff(signed, sec):
+    """Bybit сказал «слишком часто» — притормаживаем всех на sec секунд."""
+    with _RATE_LOCK:
+        k = "signed" if signed else "public"
+        _RATE_NEXT[k] = max(_RATE_NEXT[k], time.time() + sec)
+
+
 class Bybit:
     def __init__(self, key, secret, network, cat="spot"):
         self.cat = cat
@@ -140,6 +167,18 @@ class Bybit:
         self.recv = "10000"
 
     def _req(self, method, path, params=None, signed=False):
+        for attempt in range(RATE_RETRIES + 1):
+            try:
+                return self._req1(method, path, params, signed)
+            except BybitError as e:
+                msg = str(e)
+                limited = "10006" in msg or "HTTP 429" in msg or "HTTP 403" in msg or "Too many visits" in msg
+                if not limited or attempt == RATE_RETRIES:
+                    raise
+                _rate_backoff(signed, 1.0 * (attempt + 1))
+
+    def _req1(self, method, path, params=None, signed=False):
+        _rate_wait(signed)
         params = params or {}
         url, data = self.base + path, None
         headers = {"Content-Type": "application/json"}
@@ -1685,6 +1724,7 @@ def split_start(body):
 AUTO_DEFAULT = {"enabled": False, "coins": "", "slots": 3, "hold_min": 120, "minutes": 30,
                 "leverage": 2, "max_leverage": 10, "use_pct": 45, "skip_trend": True, "market": "futures"}
 AUTO_TICK = 60
+AUTO_STAGGER = 4      # пауза между запусками авто-сеток, сек
 AUTO_LOCK = threading.Lock()
 AUTO_LOG = []
 AUTO_STATE = {"next": 0.0, "last_scan": "", "msg": "", "foreign": []}
@@ -1748,7 +1788,11 @@ def auto_fit_lev(sym, per, row, a):
     if a["market"] != "futures":
         return 1
     inst = Bybit("", "", "mainnet", "linear").instrument(sym)
-    min_amt = Decimal(inst["lotSizeFilter"].get("minNotionalValue") or "5")
+    lf = inst["lotSizeFilter"]
+    min_amt = Decimal(lf.get("minNotionalValue") or "5")
+    px = Decimal(str(row.get("price") or 0))
+    if px > 0:      # у дорогих монет (MU, BTC…) минимум задаёт количество, а не сумма в USDT
+        min_amt = max(min_amt, Decimal(lf.get("minOrderQty") or "0") * px)
     max_lev = min(int(Decimal(inst.get("leverageFilter", {}).get("maxLeverage") or "100")), a["max_leverage"])
     share = lot_share(row.get("sugg_levels") or 4, DEFAULT_CFG["lot_mult"])
     need = min_amt * Decimal("1.05") * Decimal("1.03")      # запас как в сетке + округление количества
@@ -1876,7 +1920,11 @@ def auto_step(force=False):
             if lev:
                 plan.append((r, lev))
         if len(plan) == slots:
-            launched = sum(1 for r, lev in plan if auto_launch(r, per, a, now, lev))
+            launched = 0
+            for i, (r, lev) in enumerate(plan):
+                if i:
+                    time.sleep(AUTO_STAGGER)     # сетки по одной — иначе пачка ордеров упирается в лимит Bybit
+                launched += 1 if auto_launch(r, per, a, now, lev) else 0
             if not launched:
                 AUTO_STATE["msg"] = "ручной режим"
                 return
