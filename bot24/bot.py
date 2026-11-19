@@ -3009,6 +3009,46 @@ def shutdown(*_):
     sys.exit(0)
 
 
+STOP_ALL = os.environ.get("STOP_ALL") == "1"   # бот выключен целиком: авто выкл, сетки не поднимаются, позиции закрываются
+
+
+def stop_all_on_start(st):
+    """STOP_ALL=1: выключить авторежим, не поднимать сетки и закрыть их позиции по рынку.
+    Монеты, где стоят ордера Стакана (vg_…), не трогаем — это его позиция."""
+    time.sleep(25)                      # даём старому контейнеру доснять ордера при SIGTERM
+    auto_off("STOP_ALL=1 — бот выключен: авторежим выключен, сетки сняты, позиции закрыты")
+    syms = {}
+    for gid in list(st["grids"]):
+        cfg = grid_cfg(gid, st)
+        if cfg.get("was_running"):
+            set_autostart(False, gid)
+            if cfg.get("market") == "futures" and cfg.get("symbol"):
+                syms[str(cfg["symbol"]).upper()] = cfg
+    if not syms:
+        print("STOP_ALL: работающих сеток нет", flush=True)
+        return
+    cfg0 = next(iter(syms.values()))
+    api = Bybit(cfg0["api_key"], cfg0["api_secret"], cfg0["network"], "linear")
+    api.sync_time()
+    for sym in syms:
+        try:
+            api.cancel_all(sym)
+            pos = api.position(sym)
+            if not pos:
+                print(f"STOP_ALL {sym}: ордера сняты, позиции нет", flush=True)
+                continue
+            r = api._req("GET", "/v5/order/realtime", {"category": "linear", "symbol": sym, "limit": 50}, True)
+            if any(str(o.get("orderLinkId") or "").startswith("vg_") for o in r.get("list", [])):
+                print(f"STOP_ALL {sym}: позиция с ордерами Стакана — не трогаю", flush=True)
+                continue
+            side = "Sell" if pos["side"] == "Buy" else "Buy"
+            api.place(sym, side, pos["size"], market=True, reduce_only=True)
+            auto_say(f"STOP_ALL {sym[:-4]}: позиция {pos['size']} закрыта по рынку, PnL был {float(pos.get('unrealisedPnl') or 0):+.2f} USDT")
+        except Exception as e:
+            print(f"STOP_ALL {sym}: ошибка — {e}", flush=True)
+    print("STOP_ALL: готово, бот стоит без дела", flush=True)
+
+
 def main():
     host = "0.0.0.0" if ON_SERVER else "127.0.0.1"
     srv = ThreadingHTTPServer((host, PORT), Handler)
@@ -3026,7 +3066,10 @@ def main():
     threading.Thread(target=lambda: (time.sleep(20), auto_loop()), daemon=True).start()
     st = load_store()
     save_store(st)                       # перевести старый файл настроек в формат с несколькими сетками
-    if st.get("api_key") and st.get("api_secret") and not (ON_SERVER and not APP_PASSWORD):
+    if STOP_ALL and st.get("api_key") and st.get("api_secret"):
+        print("STOP_ALL=1 — сетки после перезапуска не поднимаю, закрываю позиции", flush=True)
+        threading.Thread(target=stop_all_on_start, args=(st,), daemon=True).start()
+    elif st.get("api_key") and st.get("api_secret") and not (ON_SERVER and not APP_PASSWORD):
         # На одной паре — только одна сетка: две сетки делят одну позицию на бирже и снимают ордера друг друга.
         # В авторежиме первыми поднимаются авто-сетки, ручная сетка на той же монете не запускается.
         auto_on = bool((st.get("auto") or {}).get("enabled"))
