@@ -1769,6 +1769,8 @@ def split_start(body):
 # Раз в минуту: сетки, которые отработали hold_min, закрываются; на свободные места берутся самые
 # волатильные за последние `minutes` минут монеты из списка (пустой список — самые ликвидные пары биржи).
 # Монета, которую только что держали, не берётся снова, пока не пройдёт тот же срок — так монеты меняются.
+AUTO_MIN_PROFIT = 0.02   # авто-ротация закрывает сетку по времени только при итоге больше этого (USDT) — в минус не закрываем
+AUTO_WAIT_NOTE = {}      # gid -> когда последний раз писали «жду плюс»
 AUTO_DEFAULT = {"enabled": False, "coins": "", "slots": 3, "hold_min": 120, "minutes": 30,
                 "leverage": 2, "max_leverage": 3, "use_pct": 45, "skip_trend": True, "market": "futures"}
 AUTO_TICK = 60
@@ -1970,8 +1972,16 @@ def auto_step(force=False):
     for gid, g in autos.items():
         b, sym = BOTS.get(gid), str(g.get("symbol", "")).upper()
         if b and b.running and now - float(g.get("auto_t") or now) >= hold:
+            total = b.profit + b.unrealized()
+            if total <= AUTO_MIN_PROFIT:
+                # в минус не закрываем: держим сетку, пока итог не станет плюсовым (защищает биржевой стоп)
+                if now - AUTO_WAIT_NOTE.get(gid, 0) > 1800:
+                    AUTO_WAIT_NOTE[gid] = now
+                    auto_say(f"{sym[:-4]}: время вышло, но итог {total:+.2f} USDT — в минус не закрываю, жду плюс")
+                continue
+            AUTO_WAIT_NOTE.pop(gid, None)
             auto_say(f"{sym[:-4]}: отработала {a['hold_min'] // 60} ч {a['hold_min'] % 60:02d} мин, итог "
-                     f"{b.profit + b.unrealized():+.2f} USDT — закрываю и меняю монету")
+                     f"{total:+.2f} USDT — закрываю и меняю монету")
             recent[sym] = now
             changed = True
             b.stop()
